@@ -1,0 +1,18 @@
+# Recommended GameUserSettings.ini settings for an Archipelago ARK run.
+# apply_server_config.bat reads the key=value lines below and writes them into your real
+# GameUserSettings.ini (under the matching [section]), updating keys in place and adding
+# missing ones - it does NOT overwrite unrelated settings you already have.
+#
+# Lines starting with # or ; are comments (ignored). These are SUGGESTED quality-of-life rates
+# for a smoother playthrough - edit the values to taste (or delete lines you don't want changed),
+# then run apply_server_config.bat.
+
+[ServerSettings]
+# taming speed (higher = faster tames)
+TamingSpeedMultiplier=15.0
+# resources gathered per harvest (higher = more)
+HarvestAmountMultiplier=20.0
+# XP gain rate
+XPMultiplier=5.0
+# how fast tamed dinos gain torpor down / heal, food drain, etc. left at default -
+# add any other [ServerSettings] keys you want managed here.
