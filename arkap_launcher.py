@@ -38,13 +38,17 @@ SteamCMD bundling (v1 install feature):
     behaviour.
 
 Per-file variable facts that matter:
-  * reset_ark_test.bat uses different variable NAMES for the same paths:
-        CLUSTER   == the GUI's CLUSTERDIR
-        MAPSAVES  == the GUI's SAVESROOT
+  * scripts/paths.cmd is the ONLY place SERVER_ROOT, SAVESROOT, CLUSTERDIR,
+    BACKUPROOT, CLUSTERID, ADMINPASS and SERVERPASS are written - start_ase_server.bat,
+    switch_map.bat, reset_ark_test.bat and start_transfer_server.bat all `call` it
+    instead of holding their own copies, which is what used to let these drift apart
+    between scripts unnoticed (see diagnose_reset.bat). See BAT_TARGETS below.
+  * reset_ark_test.bat still uses different variable NAMES for two of those paths
+    locally (CLUSTER == CLUSTERDIR, MAPSAVES == SAVESROOT) - it aliases them from
+    paths.cmd right after the `call`, so Save never targets those names directly.
   * start_transfer_server.bat deliberately runs on its own SESSION / ports /
-    MAXPLAYERS (a bridge alongside the main server), so the launcher only syncs the
-    SHARED identity fields into it (SERVER_ROOT, ADMINPASS, SERVERPASS, CLUSTERID,
-    CLUSTERDIR, SAVESROOT) and never touches its ports/session.
+    MAXPLAYERS (a bridge alongside the main server) - those stay local to the file
+    and are not synced from the GUI at all.
 """
 
 import os
@@ -116,19 +120,21 @@ GROUPS = [
 FIELD_HELP = {
     "connector_ini": (
         "The Archipelago connector's config file (read/written by ark_ap_connector.py).\n"
-        "Example: E:\\ARK\\New folder\\ArkConnector\\connector.ini"
+        "Example: C:\\ARKServer\\ArkConnector\\connector.ini"
     ),
     "SERVER_ROOT": (
         "Root folder of your ARK dedicated server install. the folder that directly "
         "contains 'ShooterGame'.\n "
-        "Example: E:\\ARK\\Server\\ARK Survival Evolved Dedicated Server\n"
+        "Example: C:\\ARKServer\n"
         "Tip: ShooterGameServer.exe lives under "
-        "ShooterGame\\Binaries\\Win64\\ inside this folder."
+        "ShooterGame\\Binaries\\Win64\\ inside this folder. If your download nested the "
+        "game one level deeper (e.g. C:\\ARKServer\\ARK Survival Evolved Dedicated "
+        "Server), point SERVER_ROOT at that nested folder instead."
     ),
     "SAVESROOT": (
         "Folder where each map's world save + player profiles are kept, in their own "
         "subfolder, physically outside ShooterGame\\Saved.\n"
-        "Example: E:\\ARK\\ServerCluster\\Saves\n"
+        "Example: C:\\ARKServer\\ClusterSaves\n"
         "Tip: a junction named Cluster-<Map> is created inside ShooterGame\\Saved "
         "pointing here automatically. don't edit that junction by hand."
     ),
@@ -136,17 +142,17 @@ FIELD_HELP = {
         "Folder where pseudo-cluster transfer data (Obelisk uploads/downloads of "
         "items, dinos, characters) is stored - shared by every map using the same "
         "CLUSTERID.\n"
-        "Example: E:\\ARK\\ServerCluster\\ClusterData"
+        "Example: C:\\ARKServer\\ClusterData"
     ),
     "BACKUPROOT": (
         "Folder switch_map.bat writes timestamped backups into (SAVESROOT + "
         "CLUSTERDIR) when you choose to back up before switching maps.\n"
-        "Example: E:\\ARK\\ServerCluster\\Backups"
+        "Example: C:\\ARKServer\\ClusterBackups"
     ),
     "PLUGINS_DIR": (
         "Your ArkApi 'Plugins' folder - the ArkAP plugin installs as a subfolder of "
         "this (Plugins\\ArkAP).\n"
-        "Example: E:\\ARK\\Server\\ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins\n"
+        "Example: C:\\ARKServer\\ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins\n"
         "Tip: only exists after ArkServerApi (https://github.com/ArkServerApi/AseApi) "
         "has been installed into Win64."
     ),
@@ -182,7 +188,7 @@ FIELD_HELP = {
     "ipc_dir": (
         "The ArkAP plugin's ipc folder on THIS PC - where the plugin and the "
         "connector exchange files.\n"
-        "Example: E:\\ARK\\Server\\ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins\\ArkAP\\ipc"
+        "Example: C:\\ARKServer\\ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins\\ArkAP\\ipc"
     ),
     "data_dir": (
         "Optional folder containing engrams/dinos/locations/crates.json used for "
@@ -194,7 +200,7 @@ FIELD_HELP = {
         "Optional full path to the ARK server's Game.ini. When randomize_dino_spawns "
         "is on in your yaml, the connector auto-patches the NPCReplacements block "
         "here (only its own marked block - other settings are left alone).\n"
-        "Example: E:\\ARK\\Server\\ShooterGame\\Saved\\Config\\WindowsServer\\Game.ini\n"
+        "Example: C:\\ARKServer\\ShooterGame\\Saved\\Config\\WindowsServer\\Game.ini\n"
         "Tip: leave blank to just get ipc\\game_ini_fragment.txt to paste in yourself. "
         "Restart the ARK server after this file changes."
     ),
@@ -240,51 +246,108 @@ DEFAULT_VALUES = {
 
 # Greyed-out example path shown (and never saved) in a path field that's still empty
 # after loading/discovery/auto-detect, so the user knows the expected format.
+#
+# Deliberately generic: a plausible fresh install root any user might create, never a
+# path from a developer's machine. These are display-only - self.get() returns "" while
+# a placeholder is showing, so they can never be saved, written to a .bat/.ini, or
+# mistaken by a Setup Status check for a configured value.
+PLACEHOLDER_EXAMPLE_ROOT = r"C:\ARKServer"
 PLACEHOLDER_EXAMPLES = {
-    "connector_ini": r"E:\ARK\ArkConnector\connector.ini",
-    "SERVER_ROOT":   r"E:\ARK\Server",
-    "SAVESROOT":     r"E:\ARK\ServerCluster\Saves",
-    "CLUSTERDIR":    r"E:\ARK\ServerCluster\ClusterData",
-    "BACKUPROOT":    r"E:\ARK\ServerCluster\Backups",
-    "PLUGINS_DIR":   r"E:\ARK\Server\ShooterGame\Binaries\Win64\ArkApi\Plugins",
-    "ipc_dir":       r"E:\ARK\Server\ShooterGame\Binaries\Win64\ArkApi\Plugins\ArkAP\ipc",
-    "game_ini":      r"E:\ARK\Server\ShooterGame\Saved\Config\WindowsServer\Game.ini",
+    "connector_ini": PLACEHOLDER_EXAMPLE_ROOT + r"\ArkConnector\connector.ini",
+    "SERVER_ROOT":   PLACEHOLDER_EXAMPLE_ROOT,
+    "SAVESROOT":     PLACEHOLDER_EXAMPLE_ROOT + r"\ClusterSaves",
+    "CLUSTERDIR":    PLACEHOLDER_EXAMPLE_ROOT + r"\ClusterData",
+    "BACKUPROOT":    PLACEHOLDER_EXAMPLE_ROOT + r"\ClusterBackups",
+    "PLUGINS_DIR":   PLACEHOLDER_EXAMPLE_ROOT + r"\ShooterGame\Binaries\Win64\ArkApi\Plugins",
+    "ipc_dir":       PLACEHOLDER_EXAMPLE_ROOT + r"\ShooterGame\Binaries\Win64\ArkApi\Plugins\ArkAP\ipc",
+    "game_ini":      PLACEHOLDER_EXAMPLE_ROOT + r"\ShooterGame\Saved\Config\WindowsServer\Game.ini",
 }
 
-# For each .bat target: { gui_key: variable_name_in_that_file }.
-# Note the deliberate name differences in reset_ark_test.bat.
+
+def is_unconfigured_example_path(key, value):
+    """True when `value` is nothing more than this field's shipped example.
+
+    The bundled .bat templates ship with the SAME example paths this module shows as
+    placeholders (set "CLUSTERDIR=C:\\ARKServer\\ClusterData" and friends). Reading
+    those back in as if the user had configured them was a real correctness bug: the
+    fake paths rendered as normal black "configured" values, were written to the
+    config JSON / profiles / .bat files on Save, and - worse - _ensure_cluster_dirs
+    then created the cluster folders at C:\\ARKServer instead of anywhere near the
+    user's actual server, which is why a fresh install ended up with no cluster
+    folder where the scan could find one.
+
+    The "and it doesn't exist on disk" half matters: a user who really did install to
+    C:\\ARKServer has a genuine value that happens to equal the example, and it must
+    be kept. An example path that exists is real configuration; one that doesn't is
+    template residue."""
+    example = PLACEHOLDER_EXAMPLES.get(key)
+    if not example or not value or not str(value).strip():
+        return False
+    value = str(value).strip()
+    if os.path.normcase(os.path.normpath(value)) != os.path.normcase(os.path.normpath(example)):
+        return False
+    return not os.path.exists(value)
+
+
+# Cluster folder layout (see default_cluster_paths for where this lands and why).
+# SteamCMD never creates any of it and the server refuses to start without CLUSTERDIR,
+# so these are created outright - by the "Create ServerCluster folders" button and
+# automatically once after a successful install - rather than searched for.
+CLUSTER_ROOT_DIRNAME = "ServerCluster"
+CLUSTER_PATH_SUBDIRS = (
+    ("CLUSTERDIR",  "ClusterData"),
+    ("SAVESROOT",   "Saves"),
+    ("BACKUPROOT",  "Backups"),
+)
+
+# For each .bat/.cmd target: { gui_key: variable_name_in_that_file }.
+#
+# paths.cmd is the single write target for SERVER_ROOT / SAVESROOT / CLUSTERDIR /
+# BACKUPROOT / CLUSTERID / ADMINPASS / SERVERPASS - start_ase_server.bat,
+# switch_map.bat, reset_ark_test.bat and start_transfer_server.bat all `call` it now
+# rather than holding their own copies of these "set" lines (see the module
+# docstring), so they no longer appear as separate entries here. Each of those files
+# keeps only its OWN per-script-only fields (ports, MAP, SESSION, TRIBUTEEXP, ...).
+# apply_server_config.bat is NOT one of paths.cmd's callers - it only ever needed
+# SERVER_ROOT and keeps its own copy, unchanged.
 BAT_TARGETS = {
-    "start_ase_server.bat": {
-        "SERVER_ROOT": "SERVER_ROOT", "MAP": "MAP", "SESSION": "SESSION",
-        "MAXPLAYERS": "MAXPLAYERS", "GAMEPORT": "GAMEPORT", "QUERYPORT": "QUERYPORT",
-        "RCONPORT": "RCONPORT", "ADMINPASS": "ADMINPASS", "SERVERPASS": "SERVERPASS",
-        "CLUSTERID": "CLUSTERID", "CLUSTERDIR": "CLUSTERDIR", "SAVESROOT": "SAVESROOT",
-        "TRIBUTEEXP": "TRIBUTEEXP",
-    },
-    "switch_map.bat": {
+    "paths.cmd": {
         "SERVER_ROOT": "SERVER_ROOT", "SAVESROOT": "SAVESROOT",
         "CLUSTERDIR": "CLUSTERDIR", "BACKUPROOT": "BACKUPROOT",
+        "CLUSTERID": "CLUSTERID", "ADMINPASS": "ADMINPASS", "SERVERPASS": "SERVERPASS",
     },
-    # Bridge server: only shared identity fields - never its own ports/session/maxplayers.
-    "start_transfer_server.bat": {
-        "SERVER_ROOT": "SERVER_ROOT", "ADMINPASS": "ADMINPASS", "SERVERPASS": "SERVERPASS",
-        "CLUSTERID": "CLUSTERID", "CLUSTERDIR": "CLUSTERDIR", "SAVESROOT": "SAVESROOT",
-    },
-    # reset uses CLUSTER / MAPSAVES for the same conceptual paths.
-    "reset_ark_test.bat": {
-        "SERVER_ROOT": "SERVER_ROOT", "CLUSTERDIR": "CLUSTER", "SAVESROOT": "MAPSAVES",
+    "start_ase_server.bat": {
+        "MAP": "MAP", "SESSION": "SESSION", "MAXPLAYERS": "MAXPLAYERS",
+        "GAMEPORT": "GAMEPORT", "QUERYPORT": "QUERYPORT", "RCONPORT": "RCONPORT",
+        "TRIBUTEEXP": "TRIBUTEEXP",
     },
     "apply_server_config.bat": {
         "SERVER_ROOT": "SERVER_ROOT",
     },
 }
 
+# GUI keys that hold filesystem paths. Save refuses to write a RELATIVE value for
+# these into any .bat: a relative CLUSTERDIR reaches ARK as a relative
+# -ClusterDirOverride, which ARK resolves against ShooterGame\Saved and silently
+# builds a second cluster folder there (observed in the wild as an orphan
+# Saved\ClusterData), and a relative SAVESROOT anchors the Cluster-<Map> junction
+# against whatever folder the .bat happens to run from.
+BAT_PATH_KEYS = {"SERVER_ROOT", "SAVESROOT", "CLUSTERDIR", "BACKUPROOT"}
+
+
+def is_full_windows_path(value):
+    """True only for a drive-qualified or UNC absolute path (C:\\... or \\\\srv\\...).
+    Rejects drive-relative forms like \\Saves too - those silently bind to whatever
+    the current drive is at run time."""
+    return bool(os.path.splitdrive(value)[0]) and os.path.isabs(value)
+
+
 # Prefill precedence when a field appears in several files (first hit wins).
+# paths.cmd first: it's the only place SERVER_ROOT/SAVESROOT/CLUSTERDIR/BACKUPROOT/
+# CLUSTERID/ADMINPASS/SERVERPASS are read from now (see BAT_TARGETS).
 PREFILL_ORDER = [
+    "paths.cmd",
     "start_ase_server.bat",
-    "switch_map.bat",
-    "start_transfer_server.bat",
-    "reset_ark_test.bat",
     "apply_server_config.bat",
 ]
 
@@ -301,6 +364,47 @@ CONFIG_FILENAME = "arkap_launcher_config.json"
 # Separate from CONFIG_FILENAME on purpose - saving/loading/deleting a named profile
 # (Profiles tab) must never read or write the single active-config JSON above.
 PROFILES_FILENAME = "arkap_launcher_profiles.json"
+
+# --- Reserved autosave profile ---------------------------------------------- #
+# One profile slot the app owns and rewrites on a timer, so a crash/mistake can never
+# cost more than the last few minutes of Configuration edits. It lives in the same
+# PROFILES_FILENAME file as user profiles but is deliberately NOT one of them:
+#   * it never counts as "the user has profiles" (see _ensure_default_profile)
+#   * it can't be created, renamed, or updated by hand (see the _on_*_profile guards)
+#   * it holds ONLY the latest snapshot - each autosave replaces the previous one,
+#     no history accumulates, so the profiles file can't grow without bound
+# It CAN be loaded (that's the whole point) and deleted, though the next autosave
+# recreates it - the delete confirmation says so.
+AUTOSAVE_PROFILE_NAME = "Autosave"
+
+# 10 minutes. Tk's after() keeps firing while the window is minimized, which is
+# intentional: a minimized launcher is exactly when an unnoticed crash would lose
+# work. The cost of a tick is a dict comparison, and the file is only rewritten when
+# something actually changed (see _autosave_tick), so an idle app does no disk I/O.
+AUTOSAVE_INTERVAL_MS = 10 * 60 * 1000
+
+AUTOSAVE_PROFILE_NOTES = (
+    "Written automatically by the launcher every 10 minutes - do not edit.\n"
+    "It always holds only the most recent snapshot of the Configuration tab; each "
+    "autosave replaces the last one. Load it to recover settings, then use \"Save as "
+    "new profile\" if you want to keep them."
+)
+
+
+def is_autosave_profile(name):
+    """True for the reserved autosave slot. Case/whitespace-insensitive so a user
+    can't sidestep the guards by typing "autosave " or "AUTOSAVE"."""
+    return (name or "").strip().lower() == AUTOSAVE_PROFILE_NAME.lower()
+
+
+# --- Pre-created first profile ------------------------------------------------ #
+# Created on first launch when the user has no profiles yet, and loaded straight
+# away, so there is always a real profile behind the Configuration tab instead of
+# only the bare config JSON. Unlike AUTOSAVE_PROFILE_NAME this is an ordinary user
+# profile in every respect - renamable, updatable, deletable, and it counts as "the
+# user has profiles" - it just happens to exist before the user made one.
+DEFAULT_PROFILE_NAME = "Profile 1"
+
 
 # JSON key that persists the "don't show again" choice for the install reminder banner.
 REMINDER_HIDE_KEY = "hide_install_reminder"
@@ -380,6 +484,7 @@ CURRENT_THEME = dict(THEMES["light"])
 # button reimplements its copy natively (see on_install_plugin), and the plugin payload
 # is kept external so future plugin updates aren't baked into this exe.
 BUNDLED_SCRIPTS = [
+    "paths.cmd",
     "start_ase_server.bat",
     "switch_map.bat",
     "start_transfer_server.bat",
@@ -392,6 +497,28 @@ BUNDLED_SCRIPTS = [
 
 # Folder name (under base_dir()) the bundled scripts are extracted into at runtime.
 WORKING_SCRIPTS_DIRNAME = "ArkServerScripts"
+
+# --- Game.ini / GameUserSettings.ini upload --------------------------------- #
+# Where ARK reads its two editable server config files from, relative to SERVER_ROOT.
+# The same folder the "Open Game.ini folder" quick-launch button opens.
+SERVER_CONFIG_RELDIR = os.path.join("ShooterGame", "Saved", "Config", "WindowsServer")
+
+# The files the Configuration tab's upload section can replace. Names are fixed:
+# ARK only reads these exact filenames, so the copy is always renamed to match
+# regardless of what the user's source file happens to be called.
+UPLOADABLE_CONFIGS = ("Game.ini", "GameUserSettings.ini")
+
+CONFIG_UPLOAD_HELP = {
+    "Game.ini": "Your own Game.ini to copy into the server's config folder, replacing "
+                "the one that's there. This is the file the connector patches "
+                "NPCReplacements into when randomize_dino_spawns is on - if you "
+                "upload over it later, re-apply that block.",
+    "GameUserSettings.ini": "Your own GameUserSettings.ini to copy into the server's "
+                            "config folder, replacing the one that's there. Note ARK "
+                            "REWRITES this file itself when the server shuts down, so "
+                            "upload it while the server is stopped or your changes will "
+                            "be overwritten.",
+}
 
 # Process image names checked before any reset - ARK rewrites its save on shutdown and
 # the connector holds the ipc files open + rewrites session.json on its next poll, so a
@@ -416,6 +543,105 @@ AP_RESET_IPC_FILES = [
     "death_out.jsonl", "death_in.jsonl", "msg_in.jsonl", "hint_out.jsonl",
     "hint_status.json", "flags.json", "game_ini_fragment.txt",
 ]
+
+# The files whose existence IS "a world / character exists": world save, character
+# profile, tribe data. The full reset counts these before it moves anything and
+# verifies none remain at a live location afterwards - a reset that reports success
+# while an .arkprofile still exists is exactly the false confidence that shipped as
+# "the backup folders were empty but my character was still there".
+ARK_SAVE_EXTS = (".ark", ".arkprofile", ".arktribe")
+
+
+def fmt_bytes(n):
+    """Human-readable byte count for reset/backup reporting."""
+    if n >= 1024 * 1024:
+        return "%.1f MB" % (n / (1024.0 * 1024.0))
+    if n >= 1024:
+        return "%.1f KB" % (n / 1024.0)
+    return "%d B" % n
+
+
+def count_dir_files(path):
+    """(file_count, total_bytes, save_file_count) for everything under path.
+
+    save_file_count is the subset matching ARK_SAVE_EXTS. Used by the full reset
+    both before a backup move (what SHOULD arrive) and after (what actually did)."""
+    files = total = saves = 0
+    for dp, _dns, fns in os.walk(path):
+        for fn in fns:
+            files += 1
+            if fn.lower().endswith(ARK_SAVE_EXTS):
+                saves += 1
+            try:
+                total += os.path.getsize(os.path.join(dp, fn))
+            except OSError:
+                pass
+    return files, total, saves
+
+
+def find_save_files(roots):
+    """Every ARK_SAVE_EXTS file under any of `roots`, skipping timestamped
+    _backup_ folders (those are already moved aside - finding them is fine).
+
+    Junction-aware dedupe: ShooterGame\\Saved\\Cluster-<Map> and SAVESROOT\\<Map>
+    are the same folder seen through two paths, so hits are deduped by realpath.
+    Anything this returns after a reset means the reset did NOT actually happen."""
+    hits, seen = [], set()
+    seen_roots = set()
+    for root in roots:
+        if not root:
+            continue
+        root = os.path.normpath(root)
+        rkey = os.path.normcase(root)
+        if rkey in seen_roots or not os.path.isdir(root):
+            continue
+        seen_roots.add(rkey)
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if not re.search(r"_backup_\d", d)]
+            for fn in fns:
+                if not fn.lower().endswith(ARK_SAVE_EXTS):
+                    continue
+                full = os.path.join(dp, fn)
+                try:
+                    key = os.path.normcase(os.path.realpath(full))
+                except OSError:
+                    key = os.path.normcase(os.path.abspath(full))
+                if key not in seen:
+                    seen.add(key)
+                    hits.append(full)
+    return hits
+
+
+def list_map_junctions(saved_dir):
+    """[(entry_path, target_or_None, resolves)] for every Cluster-* entry inside
+    ShooterGame\\Saved.
+
+    target is None when the entry is a REAL folder rather than a junction (saves
+    written there live outside SAVESROOT entirely - a reset that only clears
+    SAVESROOT misses them). resolves is False for a dangling junction, which makes
+    both ARK's saving and any later backup move silently no-op."""
+    out = []
+    if not os.path.isdir(saved_dir):
+        return out
+    try:
+        entries = list(os.scandir(saved_dir))
+    except OSError:
+        return out
+    for e in entries:
+        if not e.name.lower().startswith("cluster-"):
+            continue
+        try:
+            target = os.readlink(e.path)
+        except OSError:
+            target = None                      # real folder, not a reparse point
+        if target:
+            if target.startswith("\\\\?\\"):   # readlink returns the \\?\ form
+                target = target[4:]
+            resolves = os.path.isdir(target)
+        else:
+            resolves = os.path.isdir(e.path)
+        out.append((e.path, target, resolves))
+    return out
 
 # The plugin's actual payload filename we key auto-detection of a plugin SOURCE folder on.
 PLUGIN_PAYLOAD_MARKER = os.path.join("ArkAP", "ArkAP.dll")
@@ -442,7 +668,7 @@ GITHUB_API_USER_AGENT = "ArkAPLauncher"
 
 # --- Launcher self-update (this exe's own releases, separate repo from the plugin/
 # connector bundle above) --- #
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 UPDATE_REPO = "aSoberAvocado/ARK-Ipelago-Evolved-Launcher"
 UPDATE_RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_RELEASES_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
@@ -767,10 +993,11 @@ def ini_upsert(text, key, value):
 #   1. A broad "where might ARK be installed at all" scan (Steam libraries, then a
 #      depth-limited walk of common drive roots) - only used to seed SERVER_ROOT when
 #      nothing is known yet. Runs on a background thread; can take a few seconds.
-#   2. A scoped "given SERVER_ROOT, what else lives under/next to it" scan - only ever
-#      touches a handful of fixed subpaths plus one single-level directory listing of
-#      SERVER_ROOT's parent, so it's fast regardless of how large the ARK install/saves
-#      are and safe to run synchronously on the UI thread (see _scoped_scan).
+#   2. A scoped "given SERVER_ROOT, what else lives under/next to it" scan, at one of
+#      three user-chosen intensities (see SCAN_LEVELS / scoped_scan_paths). Quick only
+#      touches fixed subpaths plus one single-level listing, so it stays synchronous on
+#      the UI thread; Thorough/Exhaustive add a bounded recursive walk and therefore
+#      always run on a background thread (see _scoped_scan).
 
 ARK_EXE_RELPATH = os.path.join("ShooterGame", "Binaries", "Win64", "ShooterGameServer.exe")
 
@@ -895,6 +1122,318 @@ def bounded_drive_scan(log_fn, is_cancelled):
 
 
 # --------------------------------------------------------------------------- #
+#  Scoped "Scan for paths" - tiered intensity (pure functions, no Tk)
+# --------------------------------------------------------------------------- #
+
+# Chosen on the Configuration tab before running "Scan for paths". Ordered
+# cheapest-first; the combobox shows them in this order.
+SCAN_QUICK = "Quick"
+SCAN_THOROUGH = "Thorough"
+SCAN_EXHAUSTIVE = "Exhaustive"
+SCAN_LEVELS = (SCAN_QUICK, SCAN_THOROUGH, SCAN_EXHAUSTIVE)
+SCAN_LEVEL_DEFAULT = SCAN_QUICK
+
+# Per level: (max depth below each start point, max directories visited, seconds).
+# Quick does no walking at all, so it has no entry. Both budgets are hard caps -
+# hitting either stops the walk and reports what was found so far rather than
+# hanging, exactly like bounded_drive_scan above.
+SCAN_LEVEL_LIMITS = {
+    SCAN_THOROUGH:   (4, 8000, 15.0),
+    SCAN_EXHAUSTIVE: (8, 80000, 120.0),
+}
+
+SCAN_LEVEL_HELP = {
+    SCAN_QUICK: "Checks only the exact expected sub-paths of SERVER_ROOT. "
+                "Instant, and correct for a standard install.",
+    SCAN_THOROUGH: "Everything Quick does, plus a few levels of recursive search "
+                   "under SERVER_ROOT, under ShooterGame\\Saved, and in "
+                   "SERVER_ROOT's parent/sibling folders. Takes a few seconds. "
+                   "Use this when Quick misses your Plugins or cluster folders.",
+    SCAN_EXHAUSTIVE: "A much deeper recursive search of the same places, PLUS your "
+                     "Desktop, Documents and Downloads folders (in case a Plugins "
+                     "or cluster folder ended up there instead of next to "
+                     "SERVER_ROOT) - SLOW (can take a minute or more on a big/slow "
+                     "disk). Only worth it when Thorough still can't find your "
+                     "folders.",
+}
+
+# Folder names that are never one of the folders we're looking for, but can hold
+# enormous numbers of files - skipped so they don't eat the directory budget. Also
+# doubles as the "clearly a large unrelated install" skip-list for the Desktop/
+# Documents/Downloads sweep below (steamapps/steamcmd already cover Steam game
+# installs; the extra launcher names cover the same pattern for other stores). None
+# of these ever collide with an actual target pattern (ArkApi/Plugins/Cluster*/
+# Saves/Backups), so there's nothing to special-case for folders that "look like"
+# both.
+SKIP_SCOPED_SCAN_DIR_NAMES = {
+    "content", "binaries", "engine", "logs", "cache", "crashreports",
+    "steamapps", "steamcmd", "steam", "steamlibrary", "epic games",
+    "gog galaxy", "battle.net", "origin games", "riot games", "xboxgames",
+    "backup_temp", ".git", "node_modules",
+}
+
+# Desktop/Documents/Downloads sweep (Exhaustive only) - people sometimes extract an
+# ArkApi\Plugins zip or leave cluster backups in their user folders rather than next
+# to SERVER_ROOT. Capped much shallower than SCAN_LEVEL_LIMITS[SCAN_EXHAUSTIVE]'s own
+# depth: these are unrelated, unbounded personal folders, not the server's own tree,
+# so a handful of levels is enough to catch a nested folder without turning into a
+# scan of the user's entire Documents library.
+USER_SWEEP_FOLDER_NAMES = ("Desktop", "Documents", "Downloads")
+USER_SWEEP_MAX_DEPTH = 5
+
+
+def user_sweep_start_dirs():
+    """Existing, accessible Desktop/Documents/Downloads under the current user's
+    profile. A folder that doesn't exist or can't be listed (permissions) is left
+    out silently - never an error, never surfaced to the user."""
+    home = os.path.expanduser("~")
+    starts = []
+    for name in USER_SWEEP_FOLDER_NAMES:
+        path = os.path.join(home, name)
+        try:
+            if os.path.isdir(path):
+                starts.append(path)
+        except OSError:
+            continue
+    return starts
+
+# Cluster-style folders live in wildly different places between setups (beside
+# SERVER_ROOT, under it, or nested under ShooterGame\Saved), so they're matched by
+# name and always surfaced as suggestions to confirm - never filled in silently.
+def classify_cluster_folder(name):
+    """Which cluster GUI key a folder NAME looks like, or None.
+
+    "ClusterSaves"/"ClusterBackups" contain "cluster" too, so saves/backups are
+    tested first. Four kinds of name are excluded outright because they match by
+    accident and would be actively misleading to offer:
+      * "Saved" - ShooterGame's own folder, the container the world save lives IN.
+        SAVESROOT is deliberately OUTSIDE it.
+      * "SavedArks" (and "SavedArks*") - ARK's DEFAULT save folder, which is only
+        where saves land when the server is launched WITHOUT AltSaveDirectoryName.
+        start_ase_server.bat always passes AltSaveDirectoryName=Cluster-<Map>, so
+        under this launcher the live per-map save data is in SAVESROOT
+        (ServerCluster\\Saves\\<Map>) and SavedArks holds nothing current -
+        configuring SAVESROOT to it would point every path at the wrong data.
+        It's still real and worth backing up, which is why reset_ark_test.bat and
+        "Full reset for new seed" handle it separately, but it is never a
+        SAVESROOT candidate.
+      * "Cluster-<Map>" - the per-map junction start_ase_server.bat creates inside
+        ShooterGame\\Saved pointing AT SAVESROOT. It's a link the scripts manage,
+        never a folder to configure (the tooltip says not to touch it by hand).
+      * "<name>_backup_<timestamp>" - a timestamped snapshot left behind by
+        "Full reset for new seed" / switch_map.bat, not a live folder."""
+    low = name.lower()
+    if low in ("saved", "config", "windowsserver"):
+        return None
+    if low.startswith("savedarks"):
+        return None
+    if low.startswith("cluster-"):
+        return None
+    if re.search(r"_backup_\d{6,}", low):
+        return None
+    if "backup" in low:
+        return "BACKUPROOT"
+    if "save" in low:
+        return "SAVESROOT"
+    if "cluster" in low:
+        return "CLUSTERDIR"
+    return None
+
+
+def derive_plugins_dir(server_root):
+    """The ArkApi Plugins folder implied by SERVER_ROOT.
+
+    Purely positional - ArkApi always installs to
+    <SERVER_ROOT>\\ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins - so this is
+    correct whether or not the folder exists yet. Returning it for a folder that
+    doesn't exist yet is intentional and is what fixes the "PLUGINS_DIR stays empty
+    even though SERVER_ROOT scanned fine" bug: the folder only appears once ArkApi
+    is installed, but the field needs a value before that (Install Plugin creates
+    the folder it points at)."""
+    if not server_root or not server_root.strip():
+        return ""
+    return os.path.join(os.path.normpath(server_root.strip()),
+                        "ShooterGame", "Binaries", "Win64", "ArkApi", "Plugins")
+
+
+def _walk_bounded(starts, max_depth, max_dirs, budget_seconds, is_cancelled, on_dir):
+    """Depth/count/time-bounded directory walk over several start points.
+
+    Calls on_dir(path, name, depth) for every directory visited. Returns
+    (visited, stopped_reason) where stopped_reason is None if it walked to
+    completion, else a short string for the log."""
+    start_time = time.monotonic()
+    visited = 0
+    # path -> how many levels we were still allowed to descend when we visited it.
+    # Keyed that way rather than as a plain "already seen" set because start points
+    # overlap: ShooterGame\Saved is reached both as its own start point (with a full
+    # depth allowance) and part-way through the walk from SERVER_ROOT (with almost
+    # none left). A plain set would let the shallow visit block the deep one, and
+    # anything nested under Saved - exactly what Thorough exists to find - would be
+    # silently skipped.
+    seen = {}
+    for start, depth_limit in starts:
+        if not start or not os.path.isdir(start):
+            continue
+        stack = [(os.path.normpath(start), 0)]
+        while stack:
+            if is_cancelled():
+                return visited, "cancelled"
+            if time.monotonic() - start_time > budget_seconds:
+                return visited, "time budget reached"
+            if visited > max_dirs:
+                return visited, "directory limit reached"
+            path, depth = stack.pop()
+            remaining = min(depth_limit, max_depth) - depth
+            key = os.path.normcase(path)
+            if seen.get(key, -1) >= remaining:
+                continue  # already walked from here, at least this deep
+            seen[key] = remaining
+            visited += 1
+            if remaining <= 0:
+                continue
+            try:
+                with os.scandir(path) as it:
+                    for entry in it:
+                        try:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        low = entry.name.lower()
+                        if low in SKIP_SCAN_DIR_NAMES or low in SKIP_SCOPED_SCAN_DIR_NAMES:
+                            continue
+                        on_dir(entry.path, entry.name, depth + 1)
+                        stack.append((entry.path, depth + 1))
+            except OSError:
+                continue
+    return visited, None
+
+
+def scoped_scan_paths(server_root, level, is_cancelled=None, progress=None):
+    """Find everything derivable from SERVER_ROOT, at the requested intensity.
+
+    Returns a dict:
+      {"PLUGINS_DIR": str, "ipc_dir": str, "game_ini": str,
+       "plugins_exists": bool, "suggestions": {gui_key: [path, ...]},
+       "notes": [log line, ...], "stopped": str|None, "visited": int}
+
+    Values are absolute paths ("" when not determined). "suggestions" holds
+    name-matched cluster-ish folders the caller should offer rather than apply.
+    Pure filesystem work only - safe to call from a worker thread."""
+    is_cancelled = is_cancelled or (lambda: False)
+    res = {"PLUGINS_DIR": "", "ipc_dir": "", "game_ini": "", "plugins_exists": False,
+           "suggestions": {}, "notes": [], "stopped": None, "visited": 0}
+    if not server_root or not server_root.strip():
+        return res
+    root = os.path.normpath(server_root.strip())
+    win64 = os.path.join(root, "ShooterGame", "Binaries", "Win64")
+    saved = os.path.join(root, "ShooterGame", "Saved")
+
+    # --- expected-path pass (every level runs this) ------------------------- #
+    plugins = derive_plugins_dir(root)
+    res["PLUGINS_DIR"] = plugins
+    res["plugins_exists"] = os.path.isdir(plugins)
+    arkap = os.path.join(plugins, "ArkAP")
+    if os.path.isfile(os.path.join(arkap, "ArkAP.dll")):
+        res["ipc_dir"] = os.path.join(arkap, "ipc")
+
+    game_ini = os.path.join(saved, "Config", "WindowsServer", "Game.ini")
+    if os.path.isfile(game_ini):
+        res["game_ini"] = game_ini
+
+    # Single-level listing of SERVER_ROOT and its parent - the historical Quick
+    # behaviour for cluster folders.
+    suggestions = {}
+
+    def _note_suggestion(key, path):
+        bucket = suggestions.setdefault(key, [])
+        if not any(os.path.normcase(p) == os.path.normcase(path) for p in bucket):
+            bucket.append(path)
+
+    for folder in (root, os.path.dirname(root)):
+        if not folder or not os.path.isdir(folder):
+            continue
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    key = classify_cluster_folder(entry.name)
+                    if key:
+                        _note_suggestion(key, entry.path)
+        except OSError:
+            pass
+
+    if level == SCAN_QUICK:
+        res["suggestions"] = suggestions
+        return res
+
+    # --- recursive pass (Thorough / Exhaustive) ----------------------------- #
+    max_depth, max_dirs, budget = SCAN_LEVEL_LIMITS.get(
+        level, SCAN_LEVEL_LIMITS[SCAN_THOROUGH])
+    parent = os.path.dirname(root)
+    # (start point, depth limit for that start point). ShooterGame\Saved gets the
+    # deepest allowance because that's where nested cluster data hides; the parent
+    # gets a shallow one so a scan of C:\ doesn't turn into a whole-drive walk.
+    starts = [(root, max_depth), (saved, max_depth), (win64, 3)]
+    if parent and os.path.normcase(parent) != os.path.normcase(root):
+        starts.append((parent, 2 if level == SCAN_THOROUGH else 3))
+    if level == SCAN_EXHAUSTIVE:
+        for user_dir in user_sweep_start_dirs():
+            starts.append((user_dir, USER_SWEEP_MAX_DEPTH))
+
+    found_plugins = []
+    found_arkap = []
+    found_game_ini = []
+
+    def _on_dir(path, name, depth):
+        low = name.lower()
+        if progress is not None and depth <= 2:
+            progress(path)
+        if low == "plugins" and os.path.basename(os.path.dirname(path)).lower() == "arkapi":
+            found_plugins.append(path)
+        elif low == "arkap" and os.path.isfile(os.path.join(path, "ArkAP.dll")):
+            found_arkap.append(path)
+        elif low == "windowsserver":
+            candidate = os.path.join(path, "Game.ini")
+            if os.path.isfile(candidate):
+                found_game_ini.append(candidate)
+        key = classify_cluster_folder(name)
+        if key:
+            _note_suggestion(key, path)
+
+    visited, stopped = _walk_bounded(starts, max_depth, max_dirs, budget,
+                                      is_cancelled, _on_dir)
+    res["visited"] = visited
+    res["stopped"] = stopped
+
+    # A real Plugins folder on disk always beats the derived-but-missing one -
+    # this is what rescues a nested/relocated install where the expected path
+    # under SERVER_ROOT doesn't exist.
+    if not res["plugins_exists"] and found_plugins:
+        best = sorted(found_plugins, key=len)[0]
+        res["PLUGINS_DIR"] = best
+        res["plugins_exists"] = True
+        res["notes"].append("Found an ArkApi Plugins folder outside the expected "
+                            "location: %s" % best)
+    if not res["ipc_dir"] and found_arkap:
+        best = sorted(found_arkap, key=len)[0]
+        res["ipc_dir"] = os.path.join(best, "ipc")
+        res["notes"].append("Found an installed ArkAP plugin at %s." % best)
+    if not res["game_ini"] and found_game_ini:
+        best = sorted(found_game_ini, key=len)[0]
+        res["game_ini"] = best
+        res["notes"].append("Found Game.ini outside the expected location: %s" % best)
+
+    res["suggestions"] = suggestions
+    return res
+
+
+# --------------------------------------------------------------------------- #
 #  Setup Status checks (pure functions - no Tk, easy to test in isolation)
 # --------------------------------------------------------------------------- #
 
@@ -954,12 +1493,106 @@ def check_connector_filled(connector_ini_path):
     return True, "server / slot / ipc_dir set"
 
 
+def default_cluster_paths(server_root):
+    """The cluster folder layout to create alongside a fresh install, as
+    {gui_key: absolute_path}.
+
+    SteamCMD only ever lays down the game payload under SERVER_ROOT - the cluster
+    folders are not part of app 376030 at all (see the comment on
+    ArkAPLauncher.create_cluster_folders), so there is nothing inside the install tree
+    to discover them from and nothing to find by scanning harder. They have to be
+    created, and this is the layout they're created in:
+
+        <SERVER_ROOT>\\ServerCluster\\ClusterData   (CLUSTERDIR)
+        <SERVER_ROOT>\\ServerCluster\\Saves         (SAVESROOT)
+        <SERVER_ROOT>\\ServerCluster\\Backups       (BACKUPROOT)
+
+    Inside SERVER_ROOT rather than beside it, deliberately: everything belonging to
+    one server install lives under that install's own folder, so the whole thing can
+    be moved or deleted as a single unit and nothing is left scattered a level up.
+    ServerCluster sits next to the SteamCMD payload (ShooterGame\\, Engine\\, ...)
+    rather than inside it, so a re-install/verify of app 376030 still leaves the
+    world saves alone.
+
+    Derived purely from the server_root passed in at runtime: there is no hardcoded
+    drive letter or root folder name to fall back on. An empty/blank server_root
+    yields {} - the caller must then leave the fields empty rather than guess.
+    """
+    if not server_root or not server_root.strip():
+        return {}
+    root = os.path.normpath(server_root.strip())
+    cluster_root = os.path.join(root, CLUSTER_ROOT_DIRNAME)
+    return {key: os.path.join(cluster_root, sub) for key, sub in CLUSTER_PATH_SUBDIRS}
+
+
+def check_cluster_dirs(paths):
+    """(ok, detail) - ok if every configured cluster path exists on disk.
+
+    paths is {gui_key: configured_value}; empty values count as failures because
+    start_ase_server.bat passes -ClusterDirOverride unconditionally whenever
+    CLUSTERID is set, and ARK hangs on an empty/missing override instead of
+    reporting an error."""
+    missing = [key for key, _ in CLUSTER_PATH_SUBDIRS if not (paths.get(key) or "").strip()]
+    absent = [key for key, _ in CLUSTER_PATH_SUBDIRS
+              if (paths.get(key) or "").strip() and not os.path.isdir(paths[key].strip())]
+    if missing and absent:
+        return False, "not set: %s; missing on disk: %s" % (
+            ", ".join(missing), ", ".join(absent))
+    if missing:
+        return False, "not set: %s" % ", ".join(missing)
+    if absent:
+        return False, "missing on disk: %s" % ", ".join(absent)
+    return True, paths.get("CLUSTERDIR", "")
+
+
+# --------------------------------------------------------------------------- #
+#  Example / placeholder text styling
+# --------------------------------------------------------------------------- #
+
+# Every place the app SHOWS an example value (rather than a real, configured one)
+# renders it greyed out, in the same colour an empty Entry's placeholder uses
+# (theme["entry_placeholder_fg"]), so an example can never be misread as saved data.
+# There are four such places, all covered:
+#   1. Empty path Entry fields          -> _show_placeholder()      (pre-existing)
+#   2. Tooltip "Example: ..." lines     -> Tooltip._show()
+#   3. Instructions-tab sample paths    -> _tag_instruction_examples()
+#   4. Not-yet-created suggested paths  -> "Placeholder.TButton" in the suggestion dialogs
+#
+# Deliberately NOT dimmed, because they are real data the app will actually use:
+#   * DEFAULT_VALUES prefills (MAP=TheIsland, GAMEPORT=7777, ...) - these ARE written
+#     to the .bat/.ini files on Save, so they must look exactly like typed-in values.
+#   * Discovered/auto-detected/suggestion-accepted paths - real paths on this machine.
+#   * Template paths in prose that describe layout rather than offer a value
+#     (e.g. "<SERVER_ROOT>\ShooterGame\..."), which contain no concrete example value.
+
+def is_example_line(line):
+    """True for a tooltip line whose entire content is an example value, i.e. it
+    starts with "Example:" / "Examples:". Matched on the explicit prefix only -
+    a line that merely mentions a path mid-sentence still carries real
+    instructions and stays fully legible."""
+    return line.strip().lower().startswith(("example:", "examples:"))
+
+
+# Concrete sample paths written into the Instructions tab prose. Matched literally
+# (not by a "looks like a path" regex) so only these known-fake paths are ever
+# dimmed and a real path can never be caught by accident.
+INSTRUCTION_EXAMPLE_SNIPPETS = [
+    PLACEHOLDER_EXAMPLE_ROOT + r"\ARK Survival Evolved Dedicated Server\ShooterGame",
+    PLACEHOLDER_EXAMPLE_ROOT,
+]
+
+
 # --------------------------------------------------------------------------- #
 #  Hover tooltip
 # --------------------------------------------------------------------------- #
 
 class Tooltip:
-    """Simple delayed hover tooltip attached to a single widget."""
+    """Simple delayed hover tooltip attached to a single widget.
+
+    Any line of the text that is a pure example (see is_example_line) is rendered
+    in the same greyed-out colour empty Entry placeholders use, so an example path
+    can never be mistaken for a value that's actually configured. self.text always
+    keeps the full original string - the in-app search reads that directly."""
 
     def __init__(self, widget, text, wraplength=420, delay_ms=450):
         self.widget = widget
@@ -998,11 +1631,25 @@ class Tooltip:
             self._win.wm_attributes("-topmost", True)
         except tk.TclError:
             pass
-        tk.Label(self._win, text=self.text, justify="left",
-                 background=CURRENT_THEME["tooltip_bg"],
-                 foreground=CURRENT_THEME["tooltip_fg"], relief="solid", borderwidth=1,
-                 wraplength=self.wraplength, font=("Segoe UI", 9),
-                 padx=6, pady=4).pack()
+        # One bordered frame holding one Label per line, rather than a single
+        # multi-line Label: a tk.Label has exactly one foreground colour, so
+        # per-line dimming of "Example: ..." lines needs separate widgets.
+        body = tk.Frame(self._win, background=CURRENT_THEME["tooltip_bg"],
+                        relief="solid", borderwidth=1)
+        body.pack()
+        tk.Frame(body, background=CURRENT_THEME["tooltip_bg"], height=4).pack(fill="x")
+        for line in self.text.split("\n"):
+            example = is_example_line(line)
+            tk.Label(body, text=line, justify="left",
+                     background=CURRENT_THEME["tooltip_bg"],
+                     foreground=(CURRENT_THEME["entry_placeholder_fg"] if example
+                                 else CURRENT_THEME["tooltip_fg"]),
+                     wraplength=self.wraplength,
+                     font=("Segoe UI", 9, "italic") if example else ("Segoe UI", 9),
+                     padx=6, pady=0).pack(anchor="w", fill="x")
+        # Matches the padding the old single Label had, without adding a gap
+        # between every line above.
+        tk.Frame(body, background=CURRENT_THEME["tooltip_bg"], height=4).pack(fill="x")
 
     def _hide(self, _event=None):
         self._cancel()
@@ -1029,6 +1676,12 @@ class ArkAPLauncher(tk.Tk):
         self._entries = {}        # key -> the primary Entry/Checkbutton widget for it
         self._placeholder_text = {}    # key -> example text shown when the field is empty
         self._placeholder_active = {}  # key -> True while that example text is displayed
+        # key -> every Entry showing that field. SERVER_ROOT has two (Configuration and
+        # Server Install), and both must clear/recolour together or the one that isn't
+        # registered silently swallows what the user types into it.
+        self._placeholder_entries = {}
+        # Fields whose loaded value was only the shipped example (see _set_from_file).
+        self._ignored_example_values = set()
         self._last_scoped_scan_root = None
         self._last_cluster_dir_scan = None
         # Scripts folder is no longer a user field - it's the working folder next to the
@@ -1047,6 +1700,10 @@ class ArkAPLauncher(tk.Tk):
         self._loaded_profile_name = None
         self._loaded_profile_values = None  # snapshot of Configuration values as loaded
         self._loaded_profile_notes = None   # notes text as loaded
+        # Reserved autosave slot (see AUTOSAVE_PROFILE_NAME). _autosave_last_values is
+        # what was last written, so an idle app rewrites nothing.
+        self._autosave_after_id = None
+        self._autosave_last_values = None
 
         # In-app search / highlight state.
         self.search_var = tk.StringVar()
@@ -1073,6 +1730,16 @@ class ArkAPLauncher(tk.Tk):
         self._detect_queue = queue.Queue()
         self._detect_thread = None
         self._detect_cancelled = False
+        # Scan intensity requested via the merged "Scan for paths" button, carried
+        # through an auto-detect run to the scoped scan that follows it - see
+        # _on_scan_button / _on_auto_detect_done.
+        self._pending_scan_level = None
+
+        # Scoped "Scan for paths" state. Only Thorough/Exhaustive use the thread and
+        # queue - Quick still runs inline, since it's a handful of stats.
+        self._scan_queue = queue.Queue()
+        self._scan_thread = None
+        self._scan_cancelled = False
 
         # Launcher self-update state - see "Launcher self-update" section below.
         # Never touched on startup: the "Check for Updates" button is the only trigger,
@@ -1107,8 +1774,14 @@ class ArkAPLauncher(tk.Tk):
         self._refresh_setup_status()
         self._refresh_debug_log()
         self._profiles = self._load_profiles()
+        # Before the first _refresh_profile_list, so the Profiles tab comes up with
+        # the pre-created profile already selected on a fresh install.
+        self._ensure_default_profile()
         self._refresh_profile_list()
         self._update_profile_status()
+
+        # Armed last, so the first snapshot it writes is of fully-loaded values.
+        self._start_autosave()
 
         if self._is_first_launch and not self.get("SERVER_ROOT"):
             self._start_auto_detect()
@@ -1153,8 +1826,12 @@ class ArkAPLauncher(tk.Tk):
         title_row.pack(side="left", fill="x", expand=True)
         ttk.Label(title_row, text="ARKIpelago Launcher",
                   font=(header_font_family, 16, "bold")).pack(side="left")
-        ttk.Label(title_row, text="make sure to save!",
-                  foreground=self.theme["subtle_fg"]).pack(side="left", padx=12)
+        # Highlighted rather than dimmed: it's the one thing in the header the user
+        # has to act on, and as plain subtle-grey text beside a 16pt title it read as
+        # decoration. Uses the theme's warn colours (same pale yellow as the install
+        # reminder banner) via a style, so the toggle repaints it automatically.
+        ttk.Label(title_row, text="make sure to save!", style="SaveHint.TLabel",
+                  padding=(6, 2)).pack(side="left", padx=12)
 
         # Search bar - left-aligned directly below the title (not centered
         # under the logo). Enter runs the search and jumps to the first match;
@@ -1239,7 +1916,7 @@ class ArkAPLauncher(tk.Tk):
                  foreground=self.theme["warn_fg"],
                  justify="left", wraplength=520,
                  text="Install the ARK dedicated server first. Use the \"Server Install\" "
-                      "tab (SteamCMD) to install it before relying on the paths below."
+                      "tab (SteamCMD) to install it before relying on the paths below. Go to the instructions tab for a step by step guide"
                  ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
         rbtns = tk.Frame(self.reminder_banner, background=self.theme["warn_bg"])
         rbtns.pack(side="right", padx=6, pady=4)
@@ -1260,18 +1937,76 @@ class ArkAPLauncher(tk.Tk):
             if title == "Paths":
                 toolrow = ttk.Frame(lf)
                 toolrow.pack(fill="x", pady=(0, 6))
-                self.detect_btn = ttk.Button(toolrow, text="Auto-detect...",
-                                              command=self._start_auto_detect)
-                self.detect_btn.pack(side="left")
+                # Scan intensity is picked BEFORE scanning, so the user opts into the
+                # slow levels knowingly. Quick is the default and is what a focus-out
+                # of SERVER_ROOT always runs, whatever is selected here.
+                ttk.Label(toolrow, text="Scan intensity:").pack(side="left", padx=(0, 4))
+                self.scan_level_var = tk.StringVar(value=SCAN_LEVEL_DEFAULT)
+                self.scan_level_combo = ttk.Combobox(
+                    toolrow, textvariable=self.scan_level_var, values=list(SCAN_LEVELS),
+                    state="readonly", width=11)
+                self.scan_level_combo.pack(side="left")
+                Tooltip(self.scan_level_combo,
+                        "How hard \"Scan for paths\" looks:\n"
+                        "  Quick - %s\n"
+                        "  Thorough - %s\n"
+                        "  Exhaustive - %s" % (SCAN_LEVEL_HELP[SCAN_QUICK],
+                                               SCAN_LEVEL_HELP[SCAN_THOROUGH],
+                                               SCAN_LEVEL_HELP[SCAN_EXHAUSTIVE]),
+                        wraplength=520)
+                # Single entry point for path detection: if SERVER_ROOT isn't set (or
+                # doesn't look right) yet, this finds it first (Steam libraries, common
+                # drive roots - what used to be the separate "Auto-detect..." button),
+                # then automatically scans around it at the chosen intensity to fill in
+                # PLUGINS_DIR/ipc_dir/game_ini and suggest cluster folders. If SERVER_ROOT
+                # already looks right, it skips straight to that scoped scan.
+                self.scan_btn = ttk.Button(toolrow, text="Scan for paths",
+                                            command=self._on_scan_button)
+                self.scan_btn.pack(side="left", padx=(6, 0))
+                Tooltip(self.scan_btn,
+                        "Finds your Configuration paths in one click.\n"
+                        "If SERVER_ROOT isn't set yet (or doesn't look right), first finds "
+                        "it via a best-effort scan of common ARK server install locations "
+                        "(Steam libraries, common drive roots) - this part always runs in "
+                        "the background and may take a few seconds.\n"
+                        "Once SERVER_ROOT is known, fills in the ArkApi Plugins folder, "
+                        "ipc_dir and Game.ini from it, and suggests the cluster folders it "
+                        "finds, at the intensity selected above. Thorough/Exhaustive search "
+                        "recursively (including under ShooterGame\\Saved and next to "
+                        "SERVER_ROOT; Exhaustive also checks your Desktop/Documents/"
+                        "Downloads) and run in the background - the app stays usable while "
+                        "they do.\n"
+                        "Leaving the SERVER_ROOT field does a quick version of this "
+                        "automatically, so this button is mainly for picking a higher "
+                        "intensity or re-running the scan.",
+                        wraplength=520)
+                # Packed only while a background scan is running (see _set_scan_busy).
+                self.scan_progress = ttk.Progressbar(toolrow, mode="indeterminate",
+                                                      length=90)
                 self.detect_status_label = ttk.Label(toolrow, text="",
                                                        foreground=self.theme["subtle_fg"])
                 self.detect_status_label.pack(side="left", padx=8)
-                Tooltip(self.detect_btn,
-                        "Best-effort scan of common ARK server install locations (Steam "
-                        "libraries, common drive roots) to find SERVER_ROOT automatically. "
-                        "Runs in the background and may take a few seconds.\n"
-                        "Once SERVER_ROOT is found/entered, leaving that field also "
-                        "auto-scans inside it for the Plugins/ipc/Game.ini folders.")
+
+                # Sits with CLUSTERDIR / SAVESROOT / BACKUPROOT, the three fields it
+                # fills. SteamCMD creates none of this and ARK won't start without
+                # CLUSTERDIR, so the fix for a fresh install is to create the folders,
+                # not to search harder for ones that never existed (default_cluster_paths).
+                crow = ttk.Frame(lf)
+                crow.pack(fill="x", pady=(0, 6))
+                self.create_cluster_btn = ttk.Button(
+                    crow, text="Create %s folders" % CLUSTER_ROOT_DIRNAME,
+                    command=self._on_create_cluster_folders)
+                self.create_cluster_btn.pack(side="left")
+                Tooltip(self.create_cluster_btn,
+                        "Creates CLUSTERDIR / SAVESROOT / BACKUPROOT in a \"%s\" folder "
+                        "inside SERVER_ROOT and fills the three fields with them.\n"
+                        "SteamCMD never creates these, and the ARK server hangs on "
+                        "startup with no error when CLUSTERDIR is missing - this runs "
+                        "automatically after \"Install ARK Server\", and this button is "
+                        "here for installs that predate that, or if the folders get "
+                        "moved or deleted.\n"
+                        "Existing folders are left untouched." % CLUSTER_ROOT_DIRNAME,
+                        wraplength=520)
 
             for key, label, kind in fields:
                 var = tk.StringVar()
@@ -1324,6 +2059,8 @@ class ArkAPLauncher(tk.Tk):
                     copy_btn.pack(side="left")
                     Tooltip(copy_btn, "This is the command you'll type in once spawned in "
                             "the server to connect to archipelago.")
+
+        self._build_config_upload_section(inner)
 
         # Bottom action bar (fixed) --------------------------------------------
         bottom = ttk.Frame(tab_config, padding=(10, 8))
@@ -1398,6 +2135,204 @@ class ArkAPLauncher(tk.Tk):
         for var in self.vars.values():
             var.trace_add("write", lambda *_a: self._update_profile_status())
 
+    # ------------------------------------- Game.ini / GameUserSettings upload - #
+    def _build_config_upload_section(self, parent):
+        """Copy the user's own Game.ini / GameUserSettings.ini over the server's.
+
+        Deliberately separate from the Save flow above: Save does targeted
+        line-rewrites of individual settings, whereas this replaces whole files
+        wholesale, which is destructive enough to need its own confirm + backup."""
+        box = ttk.LabelFrame(parent, text="Upload server config files (Game.ini / "
+                                           "GameUserSettings.ini)", padding=(10, 6))
+        box.pack(fill="x", expand=True, pady=6)
+        ttk.Label(box, wraplength=640, justify="left", foreground=self.theme["subtle_fg"],
+                  text="Copies your own copies of these files into "
+                       "<SERVER_ROOT>\\%s, replacing the server's. The files being "
+                       "replaced are backed up first (timestamped, alongside the "
+                       "originals - nothing is deleted). Leave a row blank to leave "
+                       "that file alone." % SERVER_CONFIG_RELDIR).pack(anchor="w")
+
+        self._config_upload_vars = {}
+        for name in UPLOADABLE_CONFIGS:
+            row = ttk.Frame(box)
+            row.pack(fill="x", pady=(4, 0))
+            row.columnconfigure(0, weight=1)
+            ttk.Label(row, text="Your %s:" % name).grid(row=0, column=0, columnspan=2,
+                                                         sticky="w")
+            var = tk.StringVar()
+            self._config_upload_vars[name] = var
+            entry = ttk.Entry(row, textvariable=var)
+            entry.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+            ttk.Button(row, text="Browse...", width=10,
+                       command=lambda n=name: self._browse_config_upload(n)
+                       ).grid(row=1, column=1, sticky="e")
+            Tooltip(entry, CONFIG_UPLOAD_HELP[name], wraplength=520)
+
+        btnrow = ttk.Frame(box)
+        btnrow.pack(fill="x", pady=(6, 0))
+        self.upload_config_btn = ttk.Button(btnrow, text="Upload to server",
+                                             command=self.upload_server_configs)
+        self.upload_config_btn.pack(side="left")
+        Tooltip(self.upload_config_btn,
+                "Copy the file(s) above into the server's config folder, overwriting "
+                "what's there. You'll be asked to confirm, warned if the ARK server is "
+                "running, and the replaced files are backed up with a timestamp first.",
+                wraplength=520)
+        self.upload_config_status = ttk.Label(btnrow, text="",
+                                               foreground=self.theme["subtle_fg"])
+        self.upload_config_status.pack(side="left", padx=8)
+
+    def _browse_config_upload(self, name):
+        var = self._config_upload_vars[name]
+        current = var.get().strip()
+        initial = os.path.dirname(current) if current else base_dir()
+        path = filedialog.askopenfilename(
+            initialdir=initial, title="Select your %s" % name,
+            filetypes=[(name, name), ("INI files", "*.ini"), ("All files", "*.*")])
+        if path:
+            var.set(os.path.normpath(path))
+
+    def _server_config_dir(self):
+        """<SERVER_ROOT>\\ShooterGame\\Saved\\Config\\WindowsServer, or "" if
+        SERVER_ROOT isn't set."""
+        root = self.get("SERVER_ROOT")
+        if not root:
+            return ""
+        return os.path.join(os.path.normpath(root), SERVER_CONFIG_RELDIR)
+
+    def upload_server_configs(self):
+        dest_dir = self._server_config_dir()
+        if not dest_dir:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "Set SERVER_ROOT on this tab first - that's what says where the "
+                "server's config folder is.")
+            return
+
+        # Collect + validate the sources before touching anything on disk.
+        sources = {}
+        for name, var in self._config_upload_vars.items():
+            path = var.get().strip()
+            if not path:
+                continue
+            if not os.path.isfile(path):
+                messagebox.showerror(
+                    "ARKIpelago Launcher",
+                    "The %s you selected doesn't exist:\n\n%s" % (name, path))
+                return
+            dest = os.path.join(dest_dir, name)
+            if os.path.exists(dest) and os.path.normcase(os.path.abspath(path)) == \
+                    os.path.normcase(os.path.abspath(dest)):
+                messagebox.showwarning(
+                    "ARKIpelago Launcher",
+                    "Your %s IS the server's own copy:\n\n%s\n\nThere's nothing to "
+                    "upload - pick a file from somewhere else." % (name, path))
+                return
+            sources[name] = path
+        if not sources:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "Pick at least one file to upload (Game.ini and/or "
+                "GameUserSettings.ini).")
+            return
+
+        if not os.path.isdir(dest_dir):
+            if not messagebox.askyesno(
+                    "ARKIpelago Launcher",
+                    "The server's config folder doesn't exist yet:\n\n%s\n\nThis "
+                    "normally means the server has never been started. Create the "
+                    "folder and copy the file(s) in anyway?" % dest_dir):
+                self._log("Upload server config: cancelled.")
+                return
+
+        # Same destructive-action gate the resets use: ARK rewrites
+        # GameUserSettings.ini (and can rewrite Game.ini) when it shuts down, so
+        # anything copied in while it runs is silently lost on stop.
+        if is_process_running(ARK_SERVER_PROCESS):
+            if not messagebox.askyesno(
+                    "ARKIpelago Launcher",
+                    "%s is currently running.\n\nARK rewrites its config files (in "
+                    "particular GameUserSettings.ini) when the server shuts down, so "
+                    "files copied in now will most likely be overwritten and lost, and "
+                    "the running server won't pick them up either. Stop the server "
+                    "first.\n\nUpload anyway?" % ARK_SERVER_PROCESS):
+                self._log("Upload server config: cancelled (ARK server running).")
+                return
+            self._log("! Upload server config: proceeding while %s is running - the "
+                      "server may overwrite these files on shutdown."
+                      % ARK_SERVER_PROCESS)
+
+        existing = [n for n in sources if os.path.isfile(os.path.join(dest_dir, n))]
+        detail = "\n".join("  %s  <-  %s" % (n, sources[n]) for n in sources)
+        msg = ("Copy these file(s) into:\n\n%s\n\n%s\n\n" % (dest_dir, detail))
+        if existing:
+            msg += ("The server's current %s will be OVERWRITTEN. A timestamped backup "
+                    "of each is saved next to it first (e.g. Game.ini.20260101-120000."
+                    "bak) - nothing is deleted.\n\n" % " and ".join(existing))
+        msg += "Proceed?"
+        if not messagebox.askyesno("Upload server config files", msg):
+            self._log("Upload server config: cancelled.")
+            return
+
+        self._clear_log()
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("ARKIpelago Launcher",
+                                  "Could not create the config folder:\n\n%s" % exc)
+            self._log("! Upload server config: could not create %s: %s" % (dest_dir, exc))
+            return
+
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        copied, errors = [], []
+        for name, src in sources.items():
+            dest = os.path.join(dest_dir, name)
+            # Back up FIRST - if that fails, this file is skipped rather than
+            # overwritten with no way back.
+            if os.path.isfile(dest):
+                backup = "%s.%s.bak" % (dest, ts)
+                # Two uploads inside the same second would otherwise land on the
+                # same backup name and silently destroy the first one.
+                dupe = 2
+                while os.path.exists(backup):
+                    backup = "%s.%s-%d.bak" % (dest, ts, dupe)
+                    dupe += 1
+                try:
+                    shutil.copy2(dest, backup)
+                    self._log("Backed up %s -> %s" % (dest, os.path.basename(backup)))
+                except OSError as exc:
+                    errors.append("%s: backup failed (%s) - not overwritten" % (name, exc))
+                    continue
+            try:
+                shutil.copy2(src, dest)
+                copied.append(name)
+                self._log("Uploaded %s -> %s" % (src, dest))
+            except OSError as exc:
+                errors.append("%s: copy failed (%s)" % (name, exc))
+
+        # Point game_ini at the file just uploaded, so the connector patches the copy
+        # that's actually live rather than a stale path.
+        if "Game.ini" in copied and not self.get("game_ini"):
+            self.set("game_ini", os.path.join(dest_dir, "Game.ini"))
+            self._log("Set game_ini to the uploaded file - press Save to write it into "
+                      "connector.ini.")
+
+        for err in errors:
+            self._log("! Upload server config: %s" % err)
+        self.upload_config_status.configure(
+            text="Uploaded %s." % ", ".join(copied) if copied else "Nothing uploaded.")
+        if copied and not errors:
+            messagebox.showinfo(
+                "ARKIpelago Launcher",
+                "Uploaded %s into:\n\n%s\n\nThe previous version of each is kept "
+                "alongside as a .%s.bak file.\n\nRestart the ARK server for the new "
+                "settings to take effect." % (", ".join(copied), dest_dir, ts))
+        elif errors:
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "Some files could not be uploaded:\n\n%s\n\nSee the log for details."
+                % "\n".join(errors))
+
     def _build_install_tab(self, parent):
         wrap = ttk.Frame(parent, padding=(10, 8))
         wrap.pack(fill="both", expand=True)
@@ -1413,6 +2348,12 @@ class ArkAPLauncher(tk.Tk):
         locrow.columnconfigure(0, weight=1)
         loc_entry = ttk.Entry(locrow, textvariable=self.vars["SERVER_ROOT"])
         loc_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        # Shares SERVER_ROOT's variable with the Configuration tab, so it must share the
+        # placeholder handling too - otherwise the example text sits here as ordinary
+        # text, and anything typed into it is thrown away by get() (see the placeholder
+        # section's invariant 1).
+        self._register_placeholder("SERVER_ROOT", loc_entry,
+                                    PLACEHOLDER_EXAMPLES["SERVER_ROOT"])
         loc_entry.bind("<FocusOut>", self._on_server_root_focus_out, add="+")
         ttk.Button(locrow, text="Browse...", width=10,
                    command=lambda: self._browse("SERVER_ROOT", "folder")
@@ -1570,6 +2511,21 @@ class ArkAPLauncher(tk.Tk):
             "detail": detail,
             "hint": "Server Install -> Install ArkServerApi (needs the ARK server "
                     "installed first).",
+        })
+
+        # Cluster folders are never created by SteamCMD and ARK hangs on startup (rather
+        # than erroring) when -ClusterDirOverride points at a path that doesn't exist, so
+        # catch it here instead of letting the user find out via a silent stall.
+        cluster_paths = {key: self.get(key) for key, _ in CLUSTER_PATH_SUBDIRS}
+        ok, detail = check_cluster_dirs(cluster_paths)
+        items.append({
+            "label": "Cluster folders exist (CLUSTERDIR / SAVESROOT / BACKUPROOT)",
+            "state": "ok" if ok else "fail",
+            "detail": detail,
+            "hint": "Set the Cluster paths on the Configuration tab, then re-run Server "
+                    "Install -> Install ARK Server (it creates them), or create them by "
+                    "hand. A missing cluster folder makes the server hang on launch with "
+                    "no error.",
         })
 
         # BattlEye is only ever turned off via the -NoBattlEye launch flag inside
@@ -1740,6 +2696,28 @@ class ArkAPLauncher(tk.Tk):
         Tooltip(update_btn, "Overwrite the selected profile's saved fields and notes with "
                 "the current Configuration fields and the notes box below.")
 
+        default_note = ttk.Label(
+            wrap, foreground=self.theme["note_fg"], wraplength=640, justify="left",
+            text="On first run the launcher creates a profile named \"%s\" from "
+                 "whatever your Configuration tab starts with, and loads it, so your "
+                 "settings always belong to a profile from the start. It's an ordinary "
+                 "profile - rename, update or delete it however you like."
+                 % DEFAULT_PROFILE_NAME)
+        default_note.pack(anchor="w", pady=(6, 0))
+
+        autosave_note = ttk.Label(
+            wrap, foreground=self.theme["note_fg"], wraplength=640, justify="left",
+            text="The \"%s\" profile in this list is written by the launcher itself "
+                 "every 10 minutes while the app is open, as a safety net. It always "
+                 "holds just the latest snapshot, and it never touches the profiles you "
+                 "save yourself. You can load it like any other profile, but it can't be "
+                 "renamed or updated by hand." % AUTOSAVE_PROFILE_NAME)
+        autosave_note.pack(anchor="w", pady=(6, 0))
+        Tooltip(autosave_note,
+                "Autosave exists so a crash, a bad edit, or an update can't cost you "
+                "more than the last few minutes of Configuration changes. Load it, "
+                "check the values, then \"Save as new profile\" to keep them.")
+
         btnrow2 = ttk.Frame(wrap)
         btnrow2.pack(fill="x", pady=(4, 0))
         rename_btn = ttk.Button(btnrow2, text="Rename profile", command=self._on_rename_profile)
@@ -1775,6 +2753,14 @@ class ArkAPLauncher(tk.Tk):
         wrap = ttk.Frame(parent, padding=(10, 8))
         wrap.pack(fill="both", expand=True)
 
+        toolbar = ttk.Frame(wrap)
+        toolbar.pack(fill="x", pady=(0, 4))
+        ttk.Button(toolbar, text="Expand all steps",
+                   command=lambda: self._set_all_instruction_steps(False)).pack(side="left")
+        ttk.Button(toolbar, text="Collapse all steps",
+                   command=lambda: self._set_all_instruction_steps(True)
+                   ).pack(side="left", padx=(6, 0))
+
         txt = tk.Text(wrap, wrap="word", font=("Segoe UI", 9), borderwidth=0,
                        highlightthickness=0, padx=10, pady=8, cursor="arrow",
                        background=self.theme["text_bg"], foreground=self.theme["text_fg"],
@@ -1787,6 +2773,9 @@ class ArkAPLauncher(tk.Tk):
         txt.tag_configure("h1", font=("Segoe UI", 12, "bold"), spacing1=10, spacing3=4)
         txt.tag_configure("body", font=("Segoe UI", 9), spacing3=2, lmargin1=2, lmargin2=2)
         txt.tag_configure("bullet", font=("Segoe UI", 9), spacing1=1, lmargin1=18, lmargin2=32)
+        # Blank line between numbered steps - a small font keeps it a gap rather
+        # than a full empty body line.
+        txt.tag_configure("step_gap", font=("Segoe UI", 4))
 
         # (tag, text) pairs - kept short and skimmable, referencing this app's actual
         # tab/button/group names rather than a generic reprint of the GitHub README.
@@ -1796,6 +2785,12 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Pro tip: the Search bar (top left) searches field labels, tooltips, "
                        "and text across every tab - press Enter, then use Find Next / Find "
                        "Prev to jump between matches."),
+
+            ("bullet", "Pro tip: each numbered step below has a checkbox. Tick it and the "
+                       "step collapses to just \"Step 1\", \"Step 2\" and so on; untick it "
+                       "to get the full text back. \"Collapse all steps\" / \"Expand all "
+                       "steps\" at the top of this tab do the lot at once - handy for "
+                       "ticking off steps as you go, or for skimming back to one step."),
 
             ("h1", "Start here - install in this order"),
             ("bullet", "The three installs below must happen in order: the ARK server "
@@ -1811,13 +2806,25 @@ class ArkAPLauncher(tk.Tk):
                        "branch, or you won't be able to join."),
             ("bullet", "   If it fails with exit code 8, just click Install again - it "
                        "usually works on the second try."),
+            ("bullet", "   When it finishes, the cluster folders (CLUSTERDIR / SAVESROOT / "
+                       "BACKUPROOT) are created for you in a ServerCluster folder "
+                       "inside SERVER_ROOT, and the three fields are filled in with them - "
+                       "SteamCMD itself never creates them, and ARK hangs on launch with "
+                       "no error if CLUSTERDIR is missing. Click Save on the "
+                       "Configuration tab so the .bat scripts pick them up. Setup Status "
+                       "has a \"Cluster folders exist\" row to confirm."),
+            ("bullet", "   If they're ever missing - an older install, or you moved or "
+                       "deleted them - use \"Create ServerCluster folders\" on the "
+                       "Configuration tab (in the Paths group) to create them again. "
+                       "Folders that already exist are left untouched, and a path you "
+                       "set yourself is created where you put it rather than moved."),
 
             ("bullet", "2. Same tab -> click \"Install ArkServerApi\". This downloads the "
                        "latest ArkApi release and extracts it into "
                        "ShooterGame\\Binaries\\Win64 for you - no manual unzipping. When "
                        "it's done, Win64 contains version.dll and an ArkApi\\ folder. "
                        "Note: BattlEye must be OFF for ArkApi to work, but "
-                       "start_ase_server already disables it for you - nothing to do."),
+                       "start_ase_server already disables it for you - We gotchu fam."),
 
             ("bullet", "3. Download ArkAP_plugin.zip (see \"Manual downloads\" at the "
                        "bottom of the Server Install tab) and unzip it somewhere. Then in "
@@ -1829,15 +2836,30 @@ class ArkAPLauncher(tk.Tk):
                        "in your Downloads folder. Upgrading later keeps your existing "
                        "ArkAP.config.json."),
 
-            ("bullet", "4. Configuration tab -> click \"Auto-detect...\", or Browse to set "
-                       "paths by hand. Note: SERVER_ROOT is the folder that CONTAINS "
-                       "ShooterGame, not the folder above it. e.g. "
-                       "E:\\ARK\\Server\\ARK Survival Evolved Dedicated Server, NOT "
-                       "E:\\ARK\\Server."),
-            ("bullet", "   Leaving the SERVER_ROOT field runs a scan that fills in "
-                       "PLUGINS_DIR / ipc_dir / game_ini, and may suggest CLUSTERDIR / "
-                       "SAVESROOT / BACKUPROOT. These are typically correct - it's "
-                       "recommended to accept them."),
+            ("bullet", "4. Configuration tab -> in the Paths group, click \"Scan for "
+                       "paths\", or Browse to set paths by hand. "                      
+                       "if SERVER_ROOT isn't set yet, or "
+                       "doesn't look right, it finds it for you first (Steam libraries, "
+                       "common drive roots), then automatically scans around it for "
+                       "PLUGINS_DIR / ipc_dir / game_ini and the cluster folders. Note: "
+                       "SERVER_ROOT is the folder that CONTAINS "
+                       "ShooterGame, not the folder above it. If your download put the "
+                       "game in a nested folder (e.g. C:\\ARKServer\\ARK Survival "
+                       "Evolved Dedicated Server\\ShooterGame), SERVER_ROOT is that "
+                       "nested folder, not C:\\ARKServer."),
+            ("bullet", "   Leaving the SERVER_ROOT field (once it's set) also runs a Quick "
+                       "scan on its own, filling in PLUGINS_DIR / ipc_dir / game_ini and "
+                       "possibly suggesting CLUSTERDIR / SAVESROOT / BACKUPROOT. These are "
+                       "typically correct - it's recommended to accept them."),
+            ("bullet", "   If something wasn't found, pick a higher \"Scan intensity\" "
+                       "in the dropdown to the left of the button (it's chosen before you "
+                       "scan) and click \"Scan for paths\" again. Quick only checks the "
+                       "exact expected sub-paths and is instant; Thorough also searches a "
+                       "few levels under SERVER_ROOT, under ShooterGame\\Saved and beside "
+                       "SERVER_ROOT (a few seconds); Exhaustive searches much deeper and "
+                       "additionally sweeps your Desktop, Documents and Downloads folders "
+                       "- for servers extracted somewhere odd - and can be slow, "
+                       "the launcher stays usable while scanning."),
 
             ("bullet", "5. Setup Status tab -> click Re-check and confirm everything shows "
                        "a checkmark before going further. Anything showing an X has a hint "
@@ -1877,7 +2899,9 @@ class ArkAPLauncher(tk.Tk):
             ("h1", "What each tab does"),
             ("bullet", "Configuration - every Locations / Paths / Network / Connector / "
                        "Cluster field, the Quick Launch buttons, and Save / Reload from "
-                       "files."),
+                       "files. The Paths group also holds \"Scan intensity\" + \"Scan for "
+                       "paths\" (all path detection in one button) and \"Create "
+                       "ServerCluster folders\"."),
             ("bullet", "Server Install - the three installers, in order: \"Install ARK "
                        "Server\" (SteamCMD, ~18gb), \"Install ArkServerApi\" (downloads + "
                        "extracts the latest ArkApi into Win64), and \"Install Plugin\" "
@@ -1897,6 +2921,16 @@ class ArkAPLauncher(tk.Tk):
                        "box, stored separately from your live config. Loading a profile "
                        "only fills in the Configuration fields - it never saves/applies by "
                        "itself, so press Save on the Configuration tab afterward."),
+            ("bullet", "   On first run a profile named \"%s\" is created from your "
+                       "starting Configuration values and loaded straight away, so your "
+                       "settings are backed by a real profile from the very beginning "
+                       "instead of only the live config. It's a normal profile - rename, "
+                       "update or delete it as you like." % DEFAULT_PROFILE_NAME),
+            ("bullet", "   The list also contains an \"Autosave\" profile the launcher "
+                       "writes by itself every 10 minutes while the app is open. It "
+                       "always holds only the newest snapshot, never touches the "
+                       "profiles you save yourself, and can't be renamed or updated by "
+                       "hand - load it if you ever need to get recent settings back."),
             ("bullet", "Instructions - this tab."),
 
             ("h1", "Search (top left of the window)"),
@@ -1917,15 +2951,45 @@ class ArkAPLauncher(tk.Tk):
                        "items AND outgoing checks). Note: if the character/world isn't "
                        "also reset, level/inventory checks re-send immediately."),
             ("bullet", "Full reset for new seed - does the above AND backs up + wipes the "
-                       "world save. Use this when joining a new seed. Stop the ARK server "
-                       "(and the connector) first."),
+                       "world save (SavedArks, your per-map saves and the cluster tribute "
+                       "data). Backups are moved aside with a timestamp, never deleted. "
+                       "Use this when joining a new seed. Stop the ARK server (and the "
+                       "connector) first."),
+            ("bullet", "   It no longer just says \"done\" and hopes. Every backup is "
+                       "checked to confirm it actually received files (an empty one is "
+                       "flagged, not counted), then it re-scans every live save location "
+                       "afterwards and fails loudly if any world or character file "
+                       "survived. If nothing at all was found to reset you get a warning "
+                       "rather than a success - from your side that's a reset that didn't "
+                       "happen, and you should run tools\\diagnose_reset.bat before "
+                       "starting the server. Only a run with no problems AND at least one "
+                       "save actually wiped reports success."),
             ("bullet", "Run apply_server_config - re-applies the saved config to the "
                        "install."),
 
+            ("h1", "Uploading your own Game.ini / GameUserSettings.ini"),
+            ("bullet", "Configuration tab -> \"Upload server config files\" (below the "
+                       "field groups). Point a row at your own copy of Game.ini and/or "
+                       "GameUserSettings.ini and click \"Upload to server\" to copy it "
+                       "into <SERVER_ROOT>\\ShooterGame\\Saved\\Config\\WindowsServer, "
+                       "replacing the server's."),
+            ("bullet", "   Each file it replaces is backed up first, alongside the "
+                       "original with a timestamp in the name - nothing is deleted, so "
+                       "you can always put the old one back by renaming it."),
+            ("bullet", "   Stop the ARK server first. ARK rewrites its config files "
+                       "(GameUserSettings.ini especially) when it shuts down, so "
+                       "anything uploaded while it's running is likely to be lost - "
+                       "you'll get a warning if the server is up. Restart the server "
+                       "afterwards for the new settings to apply."),
+
             ("h1", "What the path fields feed"),
-            ("bullet", "Paths / Network / Cluster fields write into start_ase_server.bat, "
-                       "switch_map.bat, start_transfer_server.bat, reset_ark_test.bat, "
-                       "and apply_server_config.bat."),
+            ("bullet", "SERVER_ROOT / SAVESROOT / CLUSTERDIR / BACKUPROOT / CLUSTERID / "
+                       "ADMINPASS / SERVERPASS all write into a single file, paths.cmd - "
+                       "start_ase_server.bat, switch_map.bat, start_transfer_server.bat, "
+                       "and reset_ark_test.bat all read it from there, so they can never "
+                       "disagree. apply_server_config.bat keeps its own SERVER_ROOT copy. "
+                       "MAP / SESSION / MAXPLAYERS / ports / TRIBUTEEXP write only into "
+                       "start_ase_server.bat, since those are per-script settings."),
             ("bullet", "Connector fields write into connector.ini."),
             ("bullet", "Save only rewrites the one matching line for each field in each "
                        "file - everything else in the script is left untouched."),
@@ -1940,11 +3004,103 @@ class ArkAPLauncher(tk.Tk):
         
          
         ]
+
+        # The numbered install steps (1. .. 10.) each get their own collapse toggle: a
+        # step starts at a "N. " bullet and swallows any indented ("   ...") bullet
+        # lines that immediately follow it as its collapsible body. Everything else in
+        # `content` (intro text, the later h1 sections) is plain, always-visible text -
+        # grouping is inferred from the text itself so this keeps working if `content`
+        # is edited later without anyone having to maintain a separate step list.
+        # in_steps (rather than just "steps is non-empty") is what stops the LAST step
+        # swallowing every indented bullet in the later h1 sections - those continue
+        # their own preceding bullet, are nowhere near step 10, and being pulled into
+        # it both hid them on collapse and printed them out of order.
+        pre, steps, post = [], [], []
+        in_steps = False
         for tag, line in content:
+            if tag == "bullet" and re.match(r"^\d+\.\s", line):
+                steps.append([(tag, line)])
+                in_steps = True
+            elif in_steps and tag == "bullet" and line.startswith("   "):
+                steps[-1].append((tag, line))
+            else:
+                in_steps = False
+                (post if steps else pre).append((tag, line))
+
+        for tag, line in pre:
             txt.insert("end", line + "\n", tag)
 
-        txt.configure(state="disabled")
+        self._instruction_step_vars = {}
+        self._instruction_step_label_vars = {}
+        for i, step_lines in enumerate(steps):
+            body_tag = "instr_step_body_%d" % i
+            label_tag = "instr_step_label_%d" % i
+            var = tk.BooleanVar(value=False)  # False = expanded (the required default)
+            self._instruction_step_vars[body_tag] = var
+            self._instruction_step_label_vars[label_tag] = var
+
+            cb = ttk.Checkbutton(txt, variable=var)
+            Tooltip(cb, "Collapse this step down to its number, or expand it again.")
+            txt.window_create("end", window=cb, padx=4)
+            title_tag, title_text = step_lines[0]
+            # Two mutually-exclusive versions of the step's first line share the
+            # checkbox's display line: the short "Step N" stub shown while
+            # collapsed, and the real (long) title shown while expanded. Elide
+            # covers each line's trailing newline too, so the hidden one takes up
+            # no vertical space at all - which is the whole point: collapsing has
+            # to leave "Step N" and nothing else.
+            num = re.match(r"^(\d+)\.", title_text)
+            label_text = "Step %s" % num.group(1) if num else title_text.split(".")[0]
+            txt.insert("end", label_text + "\n", (title_tag, label_tag))
+            txt.insert("end", title_text + "\n", (title_tag, body_tag))
+            for body_line_tag, body_line_text in step_lines[1:]:
+                txt.insert("end", body_line_text + "\n", (body_line_tag, body_tag))
+            txt.tag_configure(body_tag, elide=False)
+            txt.tag_configure(label_tag, elide=True)
+            # Blank spacer line after every step so the steps read as separate
+            # blocks in both states - kept outside both toggled tags so the gap
+            # survives collapsing.
+            txt.insert("end", "\n", "step_gap")
+
+            def _make_toggle(v=var, bt=body_tag, lt=label_tag):
+                def _toggle(*_a):
+                    collapsed = v.get()
+                    txt.tag_configure(bt, elide=collapsed)
+                    txt.tag_configure(lt, elide=not collapsed)
+                return _toggle
+            var.trace_add("write", _make_toggle())
+
+        for tag, line in post:
+            txt.insert("end", line + "\n", tag)
+
         self.instructions_text = txt
+        self._tag_instruction_examples()
+        txt.configure(state="disabled")
+
+    def _set_all_instruction_steps(self, collapsed):
+        """Backs the toolbar's "Expand all steps" / "Collapse all steps" buttons."""
+        for var in self._instruction_step_vars.values():
+            var.set(collapsed)
+
+    def _tag_instruction_examples(self):
+        """Grey out the sample paths in the Instructions prose so they read as
+        examples, not as paths this install actually uses - same colour as an
+        empty field's placeholder. Re-run on theme toggle (see _retheme_widgets)
+        because a Text tag's colour is fixed at configure time."""
+        txt = self.instructions_text
+        txt.tag_configure("example", foreground=self.theme["entry_placeholder_fg"])
+        txt.tag_remove("example", "1.0", "end")
+        # Longest snippet first: "C:\ARKServer" is a prefix of the nested-install
+        # example, and tagging the short one first would leave the rest undimmed.
+        for snippet in sorted(INSTRUCTION_EXAMPLE_SNIPPETS, key=len, reverse=True):
+            idx = "1.0"
+            while True:
+                pos = txt.search(snippet, idx, stopindex="end", exact=True, elide=True)
+                if not pos:
+                    break
+                end = "%s+%dc" % (pos, len(snippet))
+                txt.tag_add("example", pos, end)
+                idx = end
 
     # -------------------------------------------------------- reminder ----- #
     def _read_hide_reminder_flag(self):
@@ -2050,7 +3206,25 @@ class ArkAPLauncher(tk.Tk):
         except tk.TclError:
             pass
 
+        # Suggested-but-not-yet-created paths (the SAVESROOT/BACKUPROOT dialog
+        # offers these when nothing matching exists on disk yet) are examples,
+        # not found folders - dim them like an empty field's placeholder.
+        style.configure("Placeholder.TButton", background=t["bg"],
+                        foreground=t["entry_placeholder_fg"])
+
+        # Header "make sure to save!" hint - a light yellow wash so it reads as a
+        # reminder next to the title instead of blending into it.
+        style.configure("SaveHint.TLabel", background=t["warn_bg"],
+                        foreground=t["warn_fg"])
+
         self._default_fg = style.lookup("TEntry", "foreground") or t["fg"]
+        # Placeholder text is italic as well as grey, so the two states are told apart
+        # by shape and not only by colour (colour alone is easy to miss next to a real
+        # value, and is invisible to a colour-blind user).
+        self._default_entry_font = "TkDefaultFont"
+        base_font = tkfont.nametofont("TkDefaultFont")
+        self._placeholder_font = (base_font.actual("family"), base_font.actual("size"),
+                                   "italic")
         # Re-applies the search-highlight styles under the (possibly just
         # switched) theme engine - ttk style configuration is per-engine, so
         # these need re-registering every time theme_use() changes.
@@ -2069,6 +3243,23 @@ class ArkAPLauncher(tk.Tk):
                                   insertbackground=t["text_fg"])
             except tk.TclError:
                 pass
+
+        # An Entry showing its greyed example was coloured with the OLD theme's
+        # placeholder colour (a direct widget option, which no ttk style restyles),
+        # so it has to be repainted by hand or it keeps the light-mode grey in dark
+        # mode. Fields holding a real value go back to the default entry colour.
+        for key in self._placeholder_text:
+            if self._placeholder_active.get(key):
+                self._style_field_as_placeholder(key)
+            else:
+                self._style_field_as_real(key)
+
+        # Text tag colours are baked in at tag_configure() time, so the dimmed
+        # example paths need re-tagging under the new theme's placeholder colour.
+        try:
+            self._tag_instruction_examples()
+        except tk.TclError:
+            pass
 
         try:
             self.reminder_banner.configure(background=t["warn_bg"],
@@ -2114,29 +3305,72 @@ class ArkAPLauncher(tk.Tk):
 
     def set(self, key, value):
         value = value if value is not None else ""
-        entry = self._entries.get(key)
         if key in self._placeholder_text:
             self._placeholder_active[key] = False
-            if entry is not None:
-                entry.configure(foreground=self._default_fg)
+            self._style_field_as_real(key)
         self.vars[key].set(value)
         if not value and key in self._placeholder_text:
             self._show_placeholder(key)
 
+    def _set_from_file(self, key, value):
+        """set(), for values arriving from a .bat / .ini / the config JSON rather than
+        from the user. A value that's only this field's shipped example (see
+        is_unconfigured_example_path) is dropped so the field stays genuinely empty and
+        shows its greyed placeholder, instead of masquerading as configured data."""
+        if is_unconfigured_example_path(key, value):
+            self._ignored_example_values.add(key)
+            self.set(key, "")
+            return False
+        self.set(key, value)
+        return True
+
     # ------------------------------------------------------- placeholders --- #
+    #
+    # These fields are NOT Tk placeholder text (Tk has none): the example is written
+    # into the StringVar and filtered out again by get(), which returns "" whenever
+    # _placeholder_active[key] is set. That means two invariants have to hold, or fake
+    # data becomes real data (or real data silently vanishes):
+    #   1. EVERY Entry bound to the field must clear the example on focus - hence
+    #      _placeholder_entries being a list, not a single widget. SERVER_ROOT appears
+    #      on both the Configuration and Server Install tabs, and before this was a
+    #      list, typing into the Server Install one left _placeholder_active set, so
+    #      get() reported "" and the user's typed path was silently discarded.
+    #   2. Placeholder state and appearance must always agree: showing = greyed +
+    #      italic, real = default colour + normal. _style_field_as_* are the only two
+    #      places that colour these widgets, so the two states can't drift apart.
     def _register_placeholder(self, key, entry, example_text):
-        """Wire up a path Entry to show greyed-out example text while empty."""
+        """Wire up a path Entry to show greyed-out example text while empty. May be
+        called more than once per key - every registered Entry shows the same field."""
         self._placeholder_text[key] = example_text
+        self._placeholder_entries.setdefault(key, []).append(entry)
         entry.bind("<FocusIn>", lambda _e, k=key: self._on_placeholder_focus_in(k), add="+")
         entry.bind("<FocusOut>", lambda _e, k=key: self._on_placeholder_focus_out(k), add="+")
+
+    def _placeholder_widgets(self, key):
+        return self._placeholder_entries.get(key, [])
+
+    def _style_field_as_placeholder(self, key):
+        """Greyed + italic: this field holds example text and no real value."""
+        for entry in self._placeholder_widgets(key):
+            try:
+                entry.configure(foreground=self.theme["entry_placeholder_fg"],
+                                 font=self._placeholder_font)
+            except tk.TclError:
+                pass
+
+    def _style_field_as_real(self, key):
+        """Normal colour + normal weight: this field holds a genuine value."""
+        for entry in self._placeholder_widgets(key):
+            try:
+                entry.configure(foreground=self._default_fg, font=self._default_entry_font)
+            except tk.TclError:
+                pass
 
     def _on_placeholder_focus_in(self, key):
         if self._placeholder_active.get(key):
             self._placeholder_active[key] = False
             self.vars[key].set("")
-            entry = self._entries.get(key)
-            if entry is not None:
-                entry.configure(foreground=self._default_fg)
+            self._style_field_as_real(key)
 
     def _on_placeholder_focus_out(self, key):
         if not self.vars[key].get().strip():
@@ -2148,9 +3382,7 @@ class ArkAPLauncher(tk.Tk):
             return
         self._placeholder_active[key] = True
         self.vars[key].set(text)
-        entry = self._entries.get(key)
-        if entry is not None:
-            entry.configure(foreground=self.theme["entry_placeholder_fg"])
+        self._style_field_as_placeholder(key)
 
     def _apply_path_placeholders(self):
         """Show example text in any still-empty path field, once, after initial load."""
@@ -2298,13 +3530,17 @@ class ArkAPLauncher(tk.Tk):
         # Prefill everything we recognise (files will override the mapped ones next).
         for key, value in data.items():
             if key in self.vars:
-                self.set(key, value)
+                # Older configs were saved BEFORE the template-residue bug was fixed and
+                # can contain the shipped example paths as if they were real - heal them
+                # on load rather than carrying the fake values forward forever.
+                self._set_from_file(key, value)
         return data
 
     def load_from_files(self, initial=False, saved=None):
         """Pre-fill the mapped GUI fields from whichever real files exist."""
         if not initial:
             self._clear_log()
+        self._ignored_example_values = set()
         scripts = self._scripts_dir
 
         # --- .bat files: first hit wins, in PREFILL_ORDER ---
@@ -2321,7 +3557,9 @@ class ArkAPLauncher(tk.Tk):
                     continue
                 val = bat_read_var(text, var)
                 if val is not None:
-                    self.set(gui_key, val)
+                    # The shipped templates carry example paths as their defaults, so
+                    # this is where template residue would otherwise enter the app.
+                    self._set_from_file(gui_key, val)
                     seen.add(gui_key)
 
         # --- connector.ini ---
@@ -2329,7 +3567,7 @@ class ArkAPLauncher(tk.Tk):
         ini_found = ini_path and os.path.isfile(ini_path)
         if ini_found:
             for k, v in ini_read_values(ini_path).items():
-                self.set(k, v)
+                self._set_from_file(k, v)
 
         # --- ArkApi Plugins folder: not in any .bat; derive from ipc_dir if empty ---
         if not self.get("PLUGINS_DIR"):
@@ -2352,6 +3590,11 @@ class ArkAPLauncher(tk.Tk):
         if not found_any:
             self._log("  No .bat files found there yet - fields left as-is.")
         self._log("  connector.ini: %s" % (ini_path if ini_found else "(not found)"))
+        if self._ignored_example_values:
+            self._log("  Ignored the shipped example path(s) for %s - those are the "
+                      "templates' own placeholder values, not your settings, so those "
+                      "fields are shown as empty (greyed example text) until you set "
+                      "them." % ", ".join(sorted(self._ignored_example_values)))
 
     def collect_values(self):
         values = {key: self.get(key) for key in self.vars}
@@ -2388,13 +3631,18 @@ class ArkAPLauncher(tk.Tk):
         ok, info = self._save_json(values)
         if ok:
             self._log("Saved JSON snapshot -> %s" % info)
+            # No profile is created here any more: startup already made
+            # DEFAULT_PROFILE_NAME (see _ensure_default_profile), so by the time the
+            # user gets to their first Save there is always a profile behind these
+            # values. Retried here only for the case where that startup write failed.
+            self._ensure_default_profile()
         else:
             self._log("! Could not write JSON: %s" % info)
 
-        # 2) .bat targets
+        # 2) .bat/.cmd targets
         scripts = self._scripts_dir
         if not scripts or not os.path.isdir(scripts):
-            self._log("! Scripts folder not found - skipped all .bat files.")
+            self._log("! Scripts folder not found - skipped all .bat/.cmd files.")
         else:
             for batname, field_map in BAT_TARGETS.items():
                 self._apply_bat(scripts, batname, field_map, values)
@@ -2412,15 +3660,26 @@ class ArkAPLauncher(tk.Tk):
             return
         text, enc = read_text(path)
         original = text
-        changed, missing = [], []
+        changed, missing, refused = [], [], []
         for gui_key, var in field_map.items():
-            new_text, found = bat_write_var(text, var, values.get(gui_key, ""))
+            value = values.get(gui_key, "")
+            # Never write a relative path into a .bat - it ends up on ARK's command
+            # line, resolves against some run-time folder, and quietly splits the
+            # cluster/save data across two locations (see BAT_PATH_KEYS).
+            if gui_key in BAT_PATH_KEYS and value and not is_full_windows_path(value):
+                refused.append("%s='%s'" % (var, value))
+                continue
+            new_text, found = bat_write_var(text, var, value)
             if not found:
                 missing.append(var)
                 continue
             if new_text != text:
                 changed.append(var)
             text = new_text
+        if refused:
+            self._log("  ! %s: REFUSED to write relative path value(s): %s - use a "
+                      "full path (like E:\\ARK\\...) on the Configuration tab."
+                      % (batname, ", ".join(refused)))
         if text != original:
             if self.backup_var.get():
                 try:
@@ -2483,15 +3742,117 @@ class ArkAPLauncher(tk.Tk):
         profiles = data.get("profiles", {})
         return profiles if isinstance(profiles, dict) else {}
 
-    def _save_profiles(self):
+    def _save_profiles(self, quiet=False):
+        """Write the profiles file. quiet=True logs a failure without a modal - used
+        by the 10-minute autosave, which the user didn't ask for and which would
+        otherwise pop a dialog every 10 minutes on a full/locked disk."""
         try:
             with open(self.profiles_path, "w", encoding="utf-8") as f:
                 json.dump({"profiles": self._profiles}, f, indent=2)
             return True
         except OSError as exc:
             self._log("! Could not save profiles: %s" % exc)
-            messagebox.showerror("ARKIpelago Launcher", "Could not save profiles:\n%s" % exc)
+            if not quiet:
+                messagebox.showerror("ARKIpelago Launcher",
+                                      "Could not save profiles:\n%s" % exc)
             return False
+
+    # ------------------------------------------------- reserved autosave slot - #
+    def _user_profiles(self):
+        """Every profile the USER made - i.e. everything except the reserved autosave
+        slot. Anywhere the app asks "does this user have any profiles?" it means this,
+        never the raw dict, or the autosave would masquerade as one of theirs."""
+        return {n: p for n, p in self._profiles.items() if not is_autosave_profile(n)}
+
+    def _start_autosave(self):
+        """Arm the 10-minute autosave timer. Writes an initial snapshot immediately so
+        a crash in the first ten minutes still leaves something to recover."""
+        self._autosave_tick(initial=True)
+
+    def _autosave_tick(self, initial=False):
+        try:
+            self._write_autosave_profile(initial=initial)
+        except Exception as exc:
+            # Swallowed on purpose: this runs unattended every 10 minutes, and an
+            # exception escaping a Tk callback surfaces as a traceback/error box the
+            # user never asked for. A note in the log is the right amount of noise.
+            self._log("! Autosave failed: %s" % exc)
+        finally:
+            # Rescheduled in a finally so a transient failure (locked file, full disk)
+            # can never silently kill autosaving for the rest of the session.
+            self._autosave_after_id = self.after(AUTOSAVE_INTERVAL_MS, self._autosave_tick)
+
+    def _write_autosave_profile(self, initial=False):
+        """Replace the autosave slot with the current Configuration values.
+
+        Skips the write entirely when nothing has changed since the last autosave, so
+        an app left open (or minimized) all day does no repeated disk I/O. Only ever
+        touches self._profiles[AUTOSAVE_PROFILE_NAME] - user profiles are untouched,
+        and the currently loaded-profile state is left alone so the Profiles tab's
+        "changed since loading" indicator doesn't lie."""
+        values = self._current_profile_snapshot()
+        existing = self._profiles.get(AUTOSAVE_PROFILE_NAME)
+        if (not initial and self._autosave_last_values == values
+                and existing is not None):
+            return False
+        if initial and existing is not None and existing.get("values") == values:
+            # Nothing changed since the last run of the app either.
+            self._autosave_last_values = dict(values)
+            return False
+
+        previous = existing
+        # Assignment, not append: the slot holds the latest snapshot only.
+        self._profiles[AUTOSAVE_PROFILE_NAME] = {
+            "values": values,
+            "notes": AUTOSAVE_PROFILE_NOTES,
+            "autosaved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if not self._save_profiles(quiet=True):
+            if previous is None:
+                self._profiles.pop(AUTOSAVE_PROFILE_NAME, None)
+            else:
+                self._profiles[AUTOSAVE_PROFILE_NAME] = previous
+            return False
+        self._autosave_last_values = dict(values)
+        self._refresh_profile_list()
+        self._update_profile_status()
+        return True
+
+    def _ensure_default_profile(self):
+        """Called once at startup, after the profiles file has been read. If the user
+        has no profiles yet, create DEFAULT_PROFILE_NAME from the values just loaded
+        and mark it as the loaded profile.
+
+        Earlier this waited for the user's first Save, which left the whole of a first
+        session with nothing behind the Configuration tab but the bare config JSON -
+        anything typed before that Save had no profile to fall back to. Creating it up
+        front means every value the user enters belongs to a real profile from the
+        start, and the Profiles tab has something selected instead of being empty.
+
+        It is a completely ordinary profile - the user can rename, update or delete it
+        like any other. The reserved autosave slot is excluded from the "has profiles"
+        test on purpose: it always exists, and counting it would stop this from ever
+        being created.
+
+        Setting it as loaded is what makes the Profiles tab's "changed since loading"
+        indicator meaningful from the first edit onwards. A write failure leaves the
+        app profile-less rather than pretending a profile is loaded that isn't on
+        disk; the next launch simply tries again."""
+        if self._user_profiles():
+            return
+        values = self._current_profile_snapshot()
+        self._profiles[DEFAULT_PROFILE_NAME] = {"values": values, "notes": ""}
+        if not self._save_profiles(quiet=True):
+            self._profiles.pop(DEFAULT_PROFILE_NAME, None)
+            return
+        self._loaded_profile_name = DEFAULT_PROFILE_NAME
+        self._loaded_profile_values = dict(values)
+        self._loaded_profile_notes = ""
+        self._refresh_profile_list(select_name=DEFAULT_PROFILE_NAME)
+        self._log("No profiles existed yet, so \"%s\" was created from your current "
+                   "Configuration values and loaded (see the Profiles tab). It's a "
+                   "normal profile - rename, update or delete it however you like."
+                   % DEFAULT_PROFILE_NAME)
 
     def _refresh_profile_list(self, select_name=None):
         names = sorted(self._profiles.keys(), key=str.lower)
@@ -2560,6 +3921,13 @@ class ArkAPLauncher(tk.Tk):
         name = name.strip()
         if not name:
             return
+        if is_autosave_profile(name):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "\"%s\" is reserved for the launcher's automatic 10-minute snapshot, "
+                "which would overwrite anything you saved there.\n\nPick a different "
+                "name." % AUTOSAVE_PROFILE_NAME)
+            return
         if name in self._profiles and not messagebox.askyesno(
                 "ARKIpelago Launcher",
                 "A profile named \"%s\" already exists. Overwrite it?" % name):
@@ -2581,6 +3949,14 @@ class ArkAPLauncher(tk.Tk):
         name = self.profile_select_var.get()
         if not name or name not in self._profiles:
             messagebox.showwarning("ARKIpelago Launcher", "Select a profile to update first.")
+            return
+        if is_autosave_profile(name):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "\"%s\" is maintained by the launcher - it's rewritten with your "
+                "current Configuration values every 10 minutes anyway, and the next "
+                "autosave would replace anything you put there.\n\nUse \"Save as new "
+                "profile\" to keep these values." % AUTOSAVE_PROFILE_NAME)
             return
         if not messagebox.askyesno(
                 "ARKIpelago Launcher",
@@ -2604,12 +3980,27 @@ class ArkAPLauncher(tk.Tk):
         if not name or name not in self._profiles:
             messagebox.showwarning("ARKIpelago Launcher", "Select a profile to rename first.")
             return
+        if is_autosave_profile(name):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "\"%s\" is the launcher's automatic snapshot and can't be renamed - "
+                "the next autosave would just recreate it under that name.\n\nLoad it "
+                "and use \"Save as new profile\" if you want a copy you own."
+                % AUTOSAVE_PROFILE_NAME)
+            return
         new_name = simpledialog.askstring("Rename profile", "New name:",
                                            initialvalue=name, parent=self)
         if new_name is None:
             return
         new_name = new_name.strip()
         if not new_name or new_name == name:
+            return
+        if is_autosave_profile(new_name):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "\"%s\" is reserved for the launcher's automatic snapshot - renaming a "
+                "profile to it would get it overwritten within 10 minutes.\n\nPick a "
+                "different name." % AUTOSAVE_PROFILE_NAME)
             return
         if new_name in self._profiles and not messagebox.askyesno(
                 "ARKIpelago Launcher",
@@ -2631,13 +4022,28 @@ class ArkAPLauncher(tk.Tk):
         if not name or name not in self._profiles:
             messagebox.showwarning("ARKIpelago Launcher", "Select a profile to delete first.")
             return
-        if not messagebox.askyesno("ARKIpelago Launcher",
-                                    "Delete profile \"%s\"? This cannot be undone." % name):
+        if is_autosave_profile(name):
+            # Deletable, but pointless - said plainly rather than silently re-creating it.
+            if not messagebox.askyesno(
+                    "ARKIpelago Launcher",
+                    "\"%s\" is the launcher's automatic snapshot of your Configuration "
+                    "tab, rewritten every 10 minutes while the app is open.\n\nYou can "
+                    "delete it, but the next autosave will recreate it - and until then "
+                    "you'd have no automatic backup to fall back on.\n\nDelete it "
+                    "anyway?" % AUTOSAVE_PROFILE_NAME):
+                return
+        elif not messagebox.askyesno(
+                "ARKIpelago Launcher",
+                "Delete profile \"%s\"? This cannot be undone." % name):
             return
         removed = self._profiles.pop(name)
         if not self._save_profiles():
             self._profiles[name] = removed  # roll back
             return
+        if is_autosave_profile(name):
+            # Forget what was last autosaved, so the next tick writes a fresh snapshot
+            # instead of deciding "nothing changed" and leaving the slot gone.
+            self._autosave_last_values = None
         if self._loaded_profile_name == name:
             self._loaded_profile_name = None
             self._loaded_profile_values = None
@@ -2668,7 +4074,7 @@ class ArkAPLauncher(tk.Tk):
             return
         self._detect_cancelled = False
         self._detect_queue = queue.Queue()
-        self.detect_btn.configure(state="disabled")
+        self._set_scan_busy(True)
         self.detect_status_label.configure(text="Scanning common locations...")
         self._detect_thread = threading.Thread(
             target=self._auto_detect_worker, daemon=True)
@@ -2705,17 +4111,30 @@ class ArkAPLauncher(tk.Tk):
         self.after(150, self._poll_detect_queue)
 
     def _on_auto_detect_done(self, found):
-        self.detect_btn.configure(state="normal")
         self._detect_thread = None
+        # Set only by the merged "Scan for paths" button (see _on_scan_button) so its
+        # chosen intensity carries through to the follow-up scoped scan below. Left
+        # unset (-> Quick) for every other caller of _start_auto_detect - the
+        # first-launch auto-kick and any future passive trigger - since those happen
+        # without the user asking for a specific intensity.
+        level = self._pending_scan_level
+        self._pending_scan_level = None
         if found:
             found = os.path.normpath(found)
-            self.detect_status_label.configure(text="Found: %s" % found)
             self._log("Auto-detect found SERVER_ROOT: %s" % found)
             self.set("SERVER_ROOT", found)
-            self._scoped_scan()
+            self._set_scan_status("Found: %s - scanning for the rest..." % found)
+            self._scoped_scan(level=level or SCAN_QUICK)
+            if (level or SCAN_QUICK) == SCAN_QUICK:
+                # Quick runs to completion synchronously inside _scoped_scan above, so
+                # the busy state _start_auto_detect turned on needs clearing here.
+                # Thorough/Exhaustive instead keep it on and clear it themselves when
+                # their background thread finishes (see _poll_scan_queue).
+                self._set_scan_busy(False)
         else:
-            self.detect_status_label.configure(
-                text="No ARK server install found automatically - enter SERVER_ROOT manually.")
+            self._set_scan_busy(False)
+            self._set_scan_status(
+                "No ARK server install found automatically - enter SERVER_ROOT manually.")
             self._log("Auto-detect: no ARK server install found in common locations.")
 
     # ------------------------------ SERVER_ROOT-scoped scan ("Scan for paths") - #
@@ -2723,14 +4142,48 @@ class ArkAPLauncher(tk.Tk):
         root = self.get("SERVER_ROOT")
         if not root or root == self._last_scoped_scan_root:
             return
-        self._scoped_scan()
+        # Leaving the field always runs Quick, whatever intensity is selected: a
+        # focus change must never silently kick off a minute-long walk. The
+        # explicit "Scan for paths" button is what runs Thorough/Exhaustive.
+        self._scoped_scan(level=SCAN_QUICK)
 
-    def _scoped_scan(self):
-        """Given SERVER_ROOT, fill in PLUGINS_DIR / ipc_dir / game_ini and suggest
-        CLUSTERDIR. Every check here is either a fixed-path os.path.isfile/isdir stat or a
-        single-level os.scandir of SERVER_ROOT's parent - never a recursive walk - so this
-        is fast and safe to run synchronously on the UI thread regardless of how large the
-        ARK install/saves under SERVER_ROOT are."""
+    def _on_scan_button(self):
+        """The single "Scan for paths" button: finds every Configuration path in one
+        click. If SERVER_ROOT is already set and looks right, jumps straight to the
+        scoped scan around it (what the old "Scan for paths" button did). Otherwise
+        it finds SERVER_ROOT first (what the old separate "Auto-detect..." button
+        did) and then automatically runs the scoped scan once it's found, at the
+        intensity chosen in scan_level_var - the same end result as pressing both
+        old buttons in sequence."""
+        if self._scan_running() or (self._detect_thread is not None
+                                     and self._detect_thread.is_alive()):
+            self._log("Scan for paths: a scan is already running.")
+            return
+        level = self.scan_level_var.get()
+        root = self.get("SERVER_ROOT")
+        if root and os.path.isfile(os.path.join(os.path.normpath(root), ARK_EXE_RELPATH)):
+            self._scoped_scan(level=level, force=True)
+            return
+        self._log("Scan for paths: SERVER_ROOT isn't set (or doesn't look right yet) - "
+                  "looking for the ARK server install first...")
+        self._pending_scan_level = level
+        self._start_auto_detect()
+
+    def _scan_running(self):
+        return self._scan_thread is not None and self._scan_thread.is_alive()
+
+    def _scoped_scan(self, level=None, force=False):
+        """Given SERVER_ROOT, fill in PLUGINS_DIR / ipc_dir / game_ini and suggest the
+        cluster folders, at the requested intensity (see SCAN_LEVELS).
+
+        Quick only stats fixed sub-paths plus one single-level listing, so it runs
+        inline on the UI thread as before. Thorough/Exhaustive add a bounded recursive
+        walk and always run on a worker thread with the spinner showing, so the GUI
+        never blocks - results are applied back on the UI thread in _on_scan_done."""
+        level = level or SCAN_LEVEL_DEFAULT
+        if self._scan_running():
+            self._log("Scan for paths: a scan is already running.")
+            return
         root = self.get("SERVER_ROOT")
         if not root:
             return
@@ -2747,84 +4200,146 @@ class ArkAPLauncher(tk.Tk):
                 "'ShooterGame')." % exe)
             return
 
-        found = []
-        win64 = os.path.join(root, "ShooterGame", "Binaries", "Win64")
-        arkapi = os.path.join(win64, "ArkApi")
-        plugins = os.path.join(arkapi, "Plugins")
-        arkap = os.path.join(plugins, "ArkAP")
-        if os.path.isdir(plugins):
-            self.set("PLUGINS_DIR", plugins)
-            found.append("PLUGINS_DIR")
-            # Only treat the plugin as actually installed if ArkAP.dll is present (an empty
-            # ArkAP\ folder doesn't count). ipc\ isn't created until the plugin's first run,
-            # so fill ipc_dir from the confirmed plugin folder rather than requiring ipc\.
-            if os.path.isfile(os.path.join(arkap, "ArkAP.dll")):
-                self.set("ipc_dir", os.path.join(arkap, "ipc"))
-                found.append("ipc_dir")
-                self._log("Scan for paths: ArkAP plugin detected (ArkAP.dll) at %s." % arkap)
-            elif os.path.isdir(arkap):
-                self._log("Scan for paths: found an ArkAP\\ folder at %s but no ArkAP.dll "
-                          "- plugin not fully installed (use Server Install -> Install "
-                          "Plugin)." % arkap)
-            else:
-                self._log("Scan for paths: ArkApi Plugins folder found, but the ArkAP "
-                          "plugin isn't installed yet (Server Install -> Install Plugin).")
-        elif os.path.isdir(arkapi):
-            self._log("Scan for paths: ArkApi is installed but has no Plugins folder yet "
-                      "- it will be created when you install the plugin.")
+        if level == SCAN_QUICK:
+            self._set_scan_status("Scanning expected paths...")
+            result = scoped_scan_paths(root, SCAN_QUICK)
+            self._on_scan_done(result, SCAN_QUICK)
+            return
 
-        game_ini = os.path.join(root, "ShooterGame", "Saved", "Config", "WindowsServer",
-                                 "Game.ini")
-        if os.path.isfile(game_ini):
-            self.set("game_ini", game_ini)
-            found.append("game_ini")
+        # Thorough / Exhaustive: background thread + spinner.
+        self._scan_cancelled = False
+        self._scan_queue = queue.Queue()
+        self._set_scan_busy(True)
+        self._set_scan_status("%s scan running - this can take %s..." % (
+            level, "a few seconds" if level == SCAN_THOROUGH else "a minute or more"))
+        self._log("Scan for paths (%s): searching under and around %s ..." % (level, root))
+        self._scan_thread = threading.Thread(
+            target=self._scan_worker, args=(root, level), daemon=True)
+        self._scan_thread.start()
+        self.after(150, self._poll_scan_queue)
 
-        if found:
-            self._log("Scan for paths: filled in %s from SERVER_ROOT." % ", ".join(found))
-        else:
-            self._log("Scan for paths: SERVER_ROOT is valid, but ArkApi/Game.ini weren't "
-                       "found yet (install ArkApi first, or start the server once to "
-                       "generate Game.ini).")
+    def _scan_worker(self, root, level):
+        q = self._scan_queue
+        try:
+            result = scoped_scan_paths(
+                root, level,
+                is_cancelled=lambda: self._scan_cancelled,
+                progress=lambda path: q.put(("progress", path)))
+        except Exception as exc:  # a scan must never take the app down with it
+            q.put(("error", str(exc)))
+            return
+        q.put(("result", (result, level)))
 
-        # CLUSTERDIR is a sibling of SERVER_ROOT, not under it - a guess, so surface it as
-        # a suggestion to confirm rather than silently filling it in. Skip if CLUSTERDIR
-        # is already set (from a real file or a previous pick) - nothing to suggest.
-        parent = os.path.dirname(root)
-        matches = []
-        if not self.get("CLUSTERDIR") and parent and os.path.isdir(parent):
+    def _poll_scan_queue(self):
+        try:
+            while True:
+                kind, payload = self._scan_queue.get_nowait()
+                if kind == "progress":
+                    # Tail of the path only - the full one is far too wide for the row.
+                    self._set_scan_status("Searching %s ..." % os.path.basename(payload))
+                elif kind == "error":
+                    self._set_scan_busy(False)
+                    self._scan_thread = None
+                    self._set_scan_status("Scan failed - see the log.")
+                    self._log("! Scan for paths failed: %s" % payload)
+                    return
+                elif kind == "result":
+                    result, level = payload
+                    self._set_scan_busy(False)
+                    self._scan_thread = None
+                    self._on_scan_done(result, level)
+                    return
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_scan_queue)
+
+    def _set_scan_status(self, text):
+        self.detect_status_label.configure(text=text)
+
+    def _set_scan_busy(self, busy):
+        """Show/hide the indeterminate spinner and lock the scan controls while a
+        background scan runs. Everything else in the app stays usable."""
+        for widget in (self.scan_btn, self.scan_level_combo):
             try:
-                with os.scandir(parent) as it:
-                    for entry in it:
-                        try:
-                            is_dir = entry.is_dir(follow_symlinks=False)
-                        except OSError:
-                            continue
-                        if is_dir and "cluster" in entry.name.lower():
-                            matches.append(entry.path)
-            except OSError:
+                widget.configure(state=("disabled" if busy else
+                                        ("readonly" if widget is self.scan_level_combo
+                                         else "normal")))
+            except tk.TclError:
                 pass
-        if matches:
-            self._suggest_cluster_dir(matches)
+        try:
+            if busy:
+                self.scan_progress.pack(side="left", padx=(6, 0))
+                self.scan_progress.start(60)
+            else:
+                self.scan_progress.stop()
+                self.scan_progress.pack_forget()
+        except tk.TclError:
+            pass
 
-    def _suggest_cluster_dir(self, matches):
-        win = tk.Toplevel(self)
-        win.title("CLUSTERDIR suggestion")
-        win.resizable(False, False)
-        win.transient(self)
-        ttk.Label(win, padding=10, wraplength=420, justify="left",
-                  text="Found folder(s) next to SERVER_ROOT that look like they could be "
-                       "CLUSTERDIR. Pick one to use it, or close this to leave CLUSTERDIR "
-                       "as-is.").pack()
-        for m in matches:
-            ttk.Button(win, text=m, command=lambda p=m: self._pick_cluster_dir(p, win)
-                       ).pack(fill="x", padx=10, pady=2)
-        ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=(4, 10))
+    def _on_scan_done(self, result, level):
+        """Apply a scan result to the Configuration fields (UI thread only)."""
+        filled, skipped = [], []
 
-    def _pick_cluster_dir(self, path, win):
-        self.set("CLUSTERDIR", path)
-        self._log("CLUSTERDIR set from suggestion: %s" % path)
-        win.destroy()
-        self._scan_for_saves_and_backup_root(path)
+        # PLUGINS_DIR is derived from SERVER_ROOT and is correct even before ArkApi
+        # exists, so it is ALWAYS written back - this is the fix for it staying empty
+        # after a successful SERVER_ROOT scan. Anything already set by the user is
+        # left alone.
+        for key in ("PLUGINS_DIR", "ipc_dir", "game_ini"):
+            value = result.get(key) or ""
+            if not value:
+                continue
+            current = self.get(key)
+            if current and os.path.normcase(current) != os.path.normcase(value):
+                skipped.append(key)
+                continue
+            self.set(key, value)
+            filled.append(key)
+
+        if filled:
+            self._log("Scan for paths: filled in %s from SERVER_ROOT." % ", ".join(filled))
+        if skipped:
+            self._log("Scan for paths: left %s as you had already set them."
+                      % ", ".join(skipped))
+        if not result.get("plugins_exists"):
+            self._log("Scan for paths: the ArkApi Plugins folder doesn't exist yet - "
+                      "PLUGINS_DIR has been set to where it WILL be (%s). It's created "
+                      "when you install ArkServerApi / the plugin."
+                      % (result.get("PLUGINS_DIR") or "?"))
+        if not result.get("ipc_dir"):
+            self._log("Scan for paths: the ArkAP plugin isn't installed yet, so ipc_dir "
+                      "was left alone (Server Install -> Install Plugin).")
+        if not result.get("game_ini"):
+            self._log("Scan for paths: Game.ini not found yet - start the server once to "
+                      "generate it.")
+        for note in result.get("notes", []):
+            self._log("Scan for paths: %s" % note)
+
+        stopped = result.get("stopped")
+        if stopped == "cancelled":
+            self._log("Scan for paths: cancelled.")
+        elif stopped:
+            self._log("Scan for paths: %s after %d folders - results may be incomplete. "
+                      "Try Exhaustive, or set the remaining paths with Browse."
+                      % (stopped, result.get("visited", 0)))
+
+        # Cluster folders are name-matched guesses wherever they were found, so they're
+        # always offered rather than applied. Only keys still empty are offered.
+        suggestions = {k: v for k, v in (result.get("suggestions") or {}).items()
+                       if v and not self.get(k)}
+        summary_bits = []
+        if filled:
+            summary_bits.append("filled %s" % ", ".join(filled))
+        if suggestions:
+            summary_bits.append("%d folder suggestion(s)" % sum(len(v) for v in suggestions.values()))
+        self._set_scan_status("%s scan done%s." % (
+            level, (" - " + "; ".join(summary_bits)) if summary_bits else
+            " - nothing new found"))
+
+        if suggestions:
+            self._suggest_paths(suggestions)
+        elif level != SCAN_QUICK:
+            self._log("Scan for paths (%s): visited %d folders."
+                      % (level, result.get("visited", 0)))
 
     def _on_cluster_dir_focus_out(self, _event=None):
         cluster_dir = self.get("CLUSTERDIR")
@@ -2870,36 +4385,54 @@ class ArkAPLauncher(tk.Tk):
         ):
             if self.get(key):
                 continue
-            matches = [p for p in siblings if pattern in os.path.basename(p).lower()]
+            # classify_cluster_folder() has to agree with the name pattern: it's
+            # the one place that knows which real-but-wrong ARK folders (SavedArks,
+            # the Cluster-<Map> junctions, timestamped _backup_ snapshots) must
+            # never be offered as a configured path, and CLUSTERDIR can sit close
+            # enough to ShooterGame\Saved for those to turn up as siblings.
+            matches = [p for p in siblings
+                       if pattern in os.path.basename(p).lower()
+                       and classify_cluster_folder(os.path.basename(p)) == key]
             suggestions[key] = matches if matches else [os.path.join(parent, default_name)]
 
         if suggestions:
-            self._suggest_saves_backup_roots(suggestions)
+            self._suggest_paths(suggestions)
 
-    def _suggest_saves_backup_roots(self, suggestions):
+    def _suggest_paths(self, suggestions):
+        """One dialog offering every name-matched folder the scan turned up, grouped by
+        the field it would fill. Suggestions are never applied without a click, since
+        folder-name matching is a guess. A path that doesn't exist yet is offered as a
+        greyed-out example (it's a suggested location, not a found folder)."""
         win = tk.Toplevel(self)
-        win.title("SAVESROOT / BACKUPROOT suggestion")
+        win.title("Folder suggestions")
         win.resizable(False, False)
         win.transient(self)
-        ttk.Label(win, padding=10, wraplength=420, justify="left",
-                  text="Found folder(s) next to CLUSTERDIR that look like they could be "
-                       "SAVESROOT / BACKUPROOT. Pick one for each to use it, or close "
-                       "this to leave as-is.").pack()
-        for key, matches in suggestions.items():
+        ttk.Label(win, padding=10, wraplength=520, justify="left",
+                  text="The scan found folder(s) that look like they could be your "
+                       "cluster folders. Pick one for each field to use it, or close "
+                       "this to leave those fields as they are.").pack()
+        for key in ("CLUSTERDIR", "SAVESROOT", "BACKUPROOT"):
+            matches = suggestions.get(key)
+            if not matches:
+                continue
             ttk.Label(win, text=key, font=("Segoe UI", 9, "bold")
                       ).pack(anchor="w", padx=10, pady=(6, 0))
             for m in matches:
                 exists = os.path.isdir(m)
                 label = m if exists else "%s   (not created yet - suggested path)" % m
-                btn = ttk.Button(win, text=label)
-                btn.configure(command=lambda p=m, k=key, b=btn: self._pick_saves_backup_root(k, p, b))
+                # A path that exists was really found on disk; one that doesn't is
+                # only an example of where it would go, so it's greyed out.
+                btn = ttk.Button(win, text=label,
+                                  style="TButton" if exists else "Placeholder.TButton")
+                btn.configure(command=lambda p=m, k=key, b=btn: self._pick_suggested_path(k, p, b))
                 btn.pack(fill="x", padx=10, pady=2)
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(4, 10))
 
-    def _pick_saves_backup_root(self, key, path, button):
+    def _pick_suggested_path(self, key, path, button):
         self.set(key, path)
         self._log("%s set from suggestion: %s" % (key, path))
-        button.configure(text="%s  (set)" % path, state="disabled")
+        # Once picked it's a real configured value, not an example - undim it.
+        button.configure(text="%s  (set)" % path, state="disabled", style="TButton")
 
     # ------------------------------------------------- SteamCMD install ---- #
     def _install_log(self, line):
@@ -3140,10 +4673,141 @@ class ArkAPLauncher(tk.Tk):
         else:
             self.install_status_var.set("Failed")
         if success:
+            self._ensure_cluster_dirs(self.get("SERVER_ROOT"))
             messagebox.showinfo("ARKIpelago Launcher", "ARK server install/update complete.")
         elif not self._install_cancelled:
             messagebox.showerror("ARKIpelago Launcher",
                                   "ARK server install failed. See the log for details.")
+
+    def _on_create_cluster_folders(self):
+        """Configuration tab button. Same work as the post-install hook, but explicit
+        and repeatable - for anyone whose install predates it, whose folders got moved
+        or deleted, or who cleared the fields."""
+        server_root = self.get("SERVER_ROOT")
+        if not server_root:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "Set SERVER_ROOT first - the cluster folders are created inside it "
+                "(in a \"%s\" folder within your server install)." % CLUSTER_ROOT_DIRNAME)
+            return
+        planned = default_cluster_paths(server_root)
+        targets = {key: (self.get(key) or planned.get(key, ""))
+                   for key, _ in CLUSTER_PATH_SUBDIRS}
+        already = [k for k, p in targets.items() if p and os.path.isdir(p)]
+        detail = "\n".join("  %-11s %s%s" % (k, targets[k],
+                                             "   (already exists)" if k in already else "")
+                           for k, _ in CLUSTER_PATH_SUBDIRS)
+        if not messagebox.askyesno(
+                "Create ServerCluster folders",
+                "Create these folders and put them in the Configuration fields?\n\n%s\n\n"
+                "SteamCMD never creates them, and the ARK server hangs on startup with "
+                "no error message when CLUSTERDIR is missing. Nothing existing is "
+                "modified or deleted - folders that are already there are left "
+                "alone." % detail):
+            self._log("Create cluster folders: cancelled.")
+            return
+        created, existing, failed, filled = self.create_cluster_folders(server_root)
+        self._log("Create cluster folders:")
+        for line in created:
+            self._log("  created  %s" % line)
+        for line in existing:
+            self._log("  ok       %s" % line)
+        for key, det in failed:
+            self._log("  ! FAILED %s -> %s" % (key, det))
+        if failed:
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "These folders could not be created:\n\n%s\n\nPick a location you can "
+                "write to (Browse next to each field), then try again."
+                % "\n".join("%s -> %s" % f for f in failed))
+            return
+        messagebox.showinfo(
+            "ARKIpelago Launcher",
+            "Cluster folders ready:\n\n%s\n\nThe Configuration fields now point at "
+            "them - press Save so the .bat scripts pick them up."
+            % "\n".join(created + existing))
+
+    def create_cluster_folders(self, server_root):
+        """Create CLUSTERDIR / SAVESROOT / BACKUPROOT and write them into the fields.
+
+        Returns (created, existing, failed, filled) for the caller to report however
+        suits it. Shared by the Configuration-tab button and the post-install hook so
+        both produce exactly the same layout on disk.
+
+        A path the user has really configured is used as-is; anything empty is filled
+        from default_cluster_paths(). Note "really configured" excludes a field still
+        holding the shipped example (is_unconfigured_example_path) - trusting those was
+        what previously sent a fresh install's folders to C:\\ARKServer, nowhere near
+        the actual server."""
+        defaults = default_cluster_paths(server_root)
+        created, existing, failed, filled = [], [], [], []
+        for key, _sub in CLUSTER_PATH_SUBDIRS:
+            configured = self.get(key)
+            if configured and is_unconfigured_example_path(key, configured):
+                configured = ""
+            path = configured or defaults.get(key, "")
+            if not path:
+                failed.append((key, "(not set - SERVER_ROOT is empty, nothing to "
+                                     "derive from)"))
+                continue
+            try:
+                already = os.path.isdir(path)
+                os.makedirs(path, exist_ok=True)
+            except OSError as exc:
+                failed.append((key, "%s (%s)" % (path, exc)))
+                continue
+            (existing if already else created).append("%s: %s" % (key, path))
+            # Written back as a REAL value (normal black text), not a placeholder -
+            # the folder now exists, so this is configuration, not a suggestion.
+            if self.get(key) != path:
+                self.set(key, path)
+                filled.append(key)
+        self._refresh_setup_status()
+        return created, existing, failed, filled
+
+    def _ensure_cluster_dirs(self, server_root):
+        """Post-install hook: create the cluster folders and report into the install log.
+
+        SteamCMD's `app_update 376030` never creates any cluster folder - the cluster
+        dir is purely a runtime -ClusterDirOverride argument pointing at an arbitrary
+        path of the user's choosing, so a fresh install has none of it and there is
+        nothing for any amount of scanning to find. It was left to
+        start_ase_server.bat's `mkdir` fallback, which is not enough on its own: that
+        mkdir runs *before* the server binary (verified - it isn't racing the launch),
+        but its failures are silent, so an unset or uncreatable CLUSTERDIR still ends
+        up passed as -ClusterDirOverride= (or a nonexistent path), and ARK then stalls
+        on startup instead of reporting an error.
+
+        This hook has always run after a successful install; what made it look like it
+        never did was the template-residue bug (is_unconfigured_example_path). The
+        fields arrived pre-filled with the .bat templates' own C:\\ARKServer examples,
+        this treated them as configured, and so it dutifully created the folders at
+        C:\\ARKServer - on the wrong drive, nowhere near the real install, and often
+        failing outright on a non-writable C:\\ root. The real server root was left
+        with no cluster folder at all, which is exactly what users saw."""
+        created, existing, failed, filled = self.create_cluster_folders(server_root)
+
+        self._install_log("")
+        self._install_log("Cluster folders (not created by SteamCMD - created now):")
+        for line in created:
+            self._install_log("  created  %s" % line)
+        for line in existing:
+            self._install_log("  ok       %s" % line)
+        for key, detail in failed:
+            self._install_log("  ! FAILED %s -> %s" % (key, detail))
+        if filled:
+            self._install_log(
+                "  %s have been filled in on the Configuration tab - "
+                "click Save there so the .bat scripts use them."
+                % " / ".join(filled))
+        if failed:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "The ARK server installed, but these cluster folders could not be "
+                "created:\n\n%s\n\nUse \"Create ServerCluster folders\" on the "
+                "Configuration tab after picking a writable location - the server can "
+                "hang on startup if the cluster folder is missing."
+                % "\n".join("%s -> %s" % f for f in failed))
 
     # ---------------------------------------- ArkServerApi (ArkApi) install - #
     def _fetch_latest_arkapi_release(self, q):
@@ -4152,25 +5816,58 @@ class ArkAPLauncher(tk.Tk):
 
     def _backup_and_clear_dir(self, path, ts):
         """Move path to <path>_backup_<ts> and recreate it empty (mirrors
-        reset_ark_test.bat: the save is MOVED to a timestamped backup, not deleted).
-        Returns a (kind, path, detail) tuple: kind is 'moved'/'created'/'error'."""
+        reset_ark_test.bat: the save is MOVED to a timestamped backup, not deleted),
+        then VERIFY: count what was inside before the move and re-count inside the
+        backup after it. "Backed up" next to an empty backup folder is worse than no
+        message at all, so a move that carried nothing is reported as exactly that.
+
+        Returns a dict:
+          kind   - 'moved' (files arrived), 'empty' (folder existed but held NO
+                   files), 'created' (didn't exist - made empty), 'error'
+          path   - normalized live folder
+          backup - backup folder path ('moved'/'empty' only, else None)
+          files / bytes / saves - what the backup actually contains now
+                   (saves = ARK_SAVE_EXTS files, the ones that really matter)
+          detail - human-readable extra for 'error'"""
         path = os.path.normpath(path)
         if os.path.isdir(path):
+            files_before, _bytes_before, _saves_before = count_dir_files(path)
+            # shutil.move onto an EXISTING directory moves the source INSIDE it
+            # instead of failing, which would bury one backup inside another (two
+            # resets in the same second, or a re-run after a partial failure). Pick
+            # an unused name so a backup can never absorb an earlier one.
             backup = "%s_backup_%s" % (path, ts)
+            n = 2
+            while os.path.exists(backup):
+                backup = "%s_backup_%s-%d" % (path, ts, n)
+                n += 1
             try:
                 shutil.move(path, backup)
             except OSError as exc:
-                return ("error", path, str(exc))
+                return {"kind": "error", "path": path, "backup": None,
+                        "files": 0, "bytes": 0, "saves": 0, "detail": str(exc)}
+            files_after, bytes_after, saves_after = count_dir_files(backup)
             try:
                 os.makedirs(path, exist_ok=True)
             except OSError:
                 pass
-            return ("moved", path, backup)
+            if files_after != files_before:
+                return {"kind": "error", "path": path, "backup": backup,
+                        "files": files_after, "bytes": bytes_after,
+                        "saves": saves_after,
+                        "detail": "backup holds %d file(s) but the folder had %d "
+                                  "- the move did not carry everything"
+                                  % (files_after, files_before)}
+            return {"kind": "moved" if files_after else "empty",
+                    "path": path, "backup": backup, "files": files_after,
+                    "bytes": bytes_after, "saves": saves_after, "detail": None}
         try:
             os.makedirs(path, exist_ok=True)
         except OSError as exc:
-            return ("error", path, str(exc))
-        return ("created", path, None)
+            return {"kind": "error", "path": path, "backup": None,
+                    "files": 0, "bytes": 0, "saves": 0, "detail": str(exc)}
+        return {"kind": "created", "path": path, "backup": None,
+                "files": 0, "bytes": 0, "saves": 0, "detail": None}
 
     def reset_ap_data(self):
         """Button 1: clear ALL plugin/connector tracking, keep the world save."""
@@ -4253,26 +5950,88 @@ class ArkAPLauncher(tk.Tk):
             deleted, missing, errors = [], [], []
             self._log("Full reset: ArkAP plugin folder not found - skipped AP tracking.")
 
-        # 2) World save + optional per-map / cluster data.
+        # 2) World save + optional per-map / cluster data - each move verified.
         ts = time.strftime("%Y%m%d-%H%M%S")
         save_lines = []
+        moved_saves = 0
         for label, path in save_targets:
-            kind, p, detail = self._backup_and_clear_dir(path, ts)
-            if kind == "moved":
-                save_lines.append("%s: backed up -> %s (cleared)" % (label, detail))
-            elif kind == "created":
-                save_lines.append("%s: nothing there yet - created empty %s" % (label, p))
+            r = self._backup_and_clear_dir(path, ts)
+            if r["kind"] == "moved":
+                moved_saves += r["saves"]
+                save_lines.append(
+                    "%s: backed up %d file(s), %s (%d world/character file(s)) -> %s"
+                    % (label, r["files"], fmt_bytes(r["bytes"]), r["saves"],
+                       r["backup"]))
+            elif r["kind"] == "empty":
+                save_lines.append(
+                    "! %s: folder held NO files - nothing was actually backed up "
+                    "(empty backup at %s)" % (label, r["backup"]))
+            elif r["kind"] == "created":
+                save_lines.append("%s: nothing there yet - created empty %s"
+                                  % (label, r["path"]))
             else:
-                save_lines.append("! %s: could NOT reset %s (%s)" % (label, p, detail))
-                errors.append("%s: %s" % (p, detail))
+                save_lines.append("! %s: could NOT reset %s (%s)"
+                                  % (label, r["path"], r["detail"]))
+                errors.append("%s: %s" % (r["path"], r["detail"]))
+
+        # 3) Re-anchor the per-map junctions. Moving SAVESROOT aside just broke the
+        # target of every ShooterGame\Saved\Cluster-<Map> junction; left dangling,
+        # ARK can't save through it and the NEXT reset silently no-ops - so recreate
+        # each junction's target folder now, and shout about anything unhealable.
+        saved_root = os.path.join(root, "ShooterGame", "Saved")
+        for jpath, target, resolves in list_map_junctions(saved_root):
+            name = os.path.basename(jpath)
+            if target is None:
+                save_lines.append(
+                    "! %s is a REAL folder, not a junction - anything saved in it "
+                    "was NOT part of this reset and will still be there on the next "
+                    "server start." % jpath)
+                errors.append("%s: real folder where a junction was expected" % jpath)
+                continue
+            if resolves:
+                save_lines.append("junction %s -> %s (ok)" % (name, target))
+                continue
+            try:
+                os.makedirs(target)
+                save_lines.append(
+                    "junction %s -> %s (dangling after the backup move - target "
+                    "recreated)" % (name, target))
+            except OSError as exc:
+                save_lines.append(
+                    "! junction %s -> %s is DANGLING and could not be repaired "
+                    "(%s). ARK cannot save through it." % (name, target, exc))
+                errors.append("%s: dangling junction (%s)" % (jpath, exc))
+
+        # 4) The actual point of the reset: no world/character file may survive at
+        # any live location. saved_root covers SavedArks AND every Cluster-<Map>
+        # junction exactly as ARK will read them; the save_targets cover the real
+        # per-map folders even where a junction is missing.
+        leftovers = find_save_files([saved_root] + [p for _lbl, p in save_targets])
+        for path in leftovers:
+            save_lines.append("! STILL PRESENT after reset: %s" % path)
+            errors.append("%s: still present after reset" % path)
+
+        if not errors and moved_saves == 0:
+            save_lines.append(
+                "! No world save or character file was found in ANY location this "
+                "reset covers - there was nothing to reset. If you expected a "
+                "character to be wiped, it lives somewhere else: run "
+                "tools\\diagnose_reset.bat before starting the server.")
 
         self._report_reset("Full reset for new seed",
                            plugin_dir or "(plugin not installed)",
-                           deleted, missing, errors, extra_lines=save_lines)
+                           deleted, missing, errors, extra_lines=save_lines,
+                           nothing_found=(moved_saves == 0))
 
-    def _report_reset(self, label, plugin_dir, deleted, missing, errors, extra_lines=None):
+    def _report_reset(self, label, plugin_dir, deleted, missing, errors,
+                      extra_lines=None, nothing_found=False):
         """Log a per-file breakdown and show a summary popup. Missing files are reported
-        as already-clear, not failures - only real OSErrors count as problems."""
+        as already-clear, not failures - only real OSErrors count as problems.
+
+        "<label> complete" is only ever shown when there are no errors AND (for the
+        full reset, which passes nothing_found) at least one world/character file was
+        actually moved. A reset that found nothing to reset gets a warning popup
+        instead: from the user's point of view that is a reset that didn't happen."""
         self._log("%s - target: %s" % (label, plugin_dir))
         for line in (extra_lines or []):
             self._log("  %s" % line)
@@ -4296,8 +6055,17 @@ class ArkAPLauncher(tk.Tk):
         if errors:
             messagebox.showwarning(
                 "ARKIpelago Launcher",
-                "%s finished with %d problem(s) - see the log.\n\n%s"
-                % (label, len(errors), summary))
+                "%s did NOT fully complete - %d problem(s), see the log.\n\n"
+                "Do not treat this world as reset until every problem above is "
+                "resolved.\n\n%s" % (label, len(errors), summary))
+        elif nothing_found:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "%s: NOTHING WAS RESET.\n\nNo world save or character file exists "
+                "in any location this reset covers. If a character still appears "
+                "in-game afterwards, it is stored somewhere this reset doesn't "
+                "know about - run tools\\diagnose_reset.bat and check its report "
+                "before starting the server.\n\n%s" % (label, summary))
         else:
             messagebox.showinfo("ARKIpelago Launcher",
                                  "%s complete.\n\n%s" % (label, summary))
@@ -4362,14 +6130,17 @@ class ArkAPLauncher(tk.Tk):
         # background) so the highlighted text stays readable regardless of
         # the current theme's default text color - dark mode's light-gray
         # foreground would otherwise wash out against this bright highlight.
-        style.configure("Highlight.TLabel", background=self.SEARCH_HL_COLOR,
-                         foreground="black")
-        style.configure("Highlight.TCheckbutton", background=self.SEARCH_HL_COLOR,
-                         foreground="black")
-        style.configure("CurrentHighlight.TLabel", background=self.SEARCH_HL_CURRENT_COLOR,
-                         foreground="black")
-        style.configure("CurrentHighlight.TCheckbutton", background=self.SEARCH_HL_CURRENT_COLOR,
-                         foreground="black")
+        # One highlight pair per base style a match can carry. "SaveHint.TLabel"
+        # (the header's yellow "make sure to save!" hint) needs its own pair
+        # rather than riding on TLabel's: ttk resolves an unconfigured
+        # "Highlight.SaveHint.TLabel" by falling back to "SaveHint.TLabel", so
+        # without these the hint would silently refuse to highlight.
+        for base in ("TLabel", "TCheckbutton", "SaveHint.TLabel"):
+            style.configure("Highlight." + base, background=self.SEARCH_HL_COLOR,
+                             foreground="black")
+            style.configure("CurrentHighlight." + base,
+                             background=self.SEARCH_HL_CURRENT_COLOR,
+                             foreground="black")
 
         # Windows' native "vista"/"xpnative" ttk theme draws TEntry's field
         # background itself (via uxtheme.dll) and silently ignores a plain
@@ -4401,7 +6172,10 @@ class ArkAPLauncher(tk.Tk):
         if isinstance(widget, ttk.Checkbutton):
             return "TCheckbutton"
         if isinstance(widget, ttk.Label):
-            return "TLabel"
+            # A label carrying its own style (the header's SaveHint.TLabel) has to
+            # be restored to THAT style when the highlight clears, not to plain
+            # TLabel - otherwise one search would permanently strip its colouring.
+            return str(widget.cget("style") or "") or "TLabel"
         return ""
 
     def _iter_widgets(self, root):
@@ -4463,7 +6237,12 @@ class ArkAPLauncher(tk.Tk):
             idx = "1.0"
             found_here = False
             while True:
-                pos = widget.search(query, idx, stopindex="end", nocase=True)
+                # elide=True: Tk's Text search skips elided text by default, which
+                # would otherwise make the Instructions tab's collapsed steps
+                # invisible to search - elide=True finds matches there too (the
+                # match jumps to them and auto-expands, see
+                # _expand_instruction_step_for_index).
+                pos = widget.search(query, idx, stopindex="end", nocase=True, elide=True)
                 if not pos:
                     break
                 end = "%s+%dc" % (pos, len(query))
@@ -4661,6 +6440,8 @@ class ArkAPLauncher(tk.Tk):
             return
 
         if mtype == "text":
+            if widget is getattr(self, "instructions_text", None):
+                self._expand_instruction_step_for_index(widget, match["start"])
             self._center_text_index(widget, match["start"])
             return
 
@@ -4741,6 +6522,20 @@ class ArkAPLauncher(tk.Tk):
             canvas.yview_moveto(frac)
         except tk.TclError:
             pass
+
+    def _expand_instruction_step_for_index(self, widget, index):
+        """If `index` falls inside a collapsed instruction step's body, expand it -
+        otherwise a search match hiding under an elided (collapsed) step would be
+        "found" but never actually become visible when scrolled to."""
+        for tag_name in widget.tag_names(index):
+            var = self._instruction_step_vars.get(tag_name)
+            if var is not None and var.get():
+                var.set(False)
+            # The "Step N" stub is the mirror case: it's hidden while the step is
+            # expanded, so a match landing in it needs the step collapsed instead.
+            var = getattr(self, "_instruction_step_label_vars", {}).get(tag_name)
+            if var is not None and not var.get():
+                var.set(True)
 
     @staticmethod
     def _center_text_index(widget, index):
