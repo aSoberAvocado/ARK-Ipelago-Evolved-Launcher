@@ -43,6 +43,9 @@ Per-file variable facts that matter:
     switch_map.bat, reset_ark_test.bat and start_transfer_server.bat all `call` it
     instead of holding their own copies, which is what used to let these drift apart
     between scripts unnoticed (see diagnose_reset.bat). See BAT_TARGETS below.
+    A working folder carried over from before that refactor mixes the two schemes and
+    silently wins with its own stale SERVER_ROOT, so those files are detected and
+    replaced on startup rather than preserved - see PATHS_CMD_CALLERS.
   * reset_ark_test.bat still uses different variable NAMES for two of those paths
     locally (CLUSTER == CLUSTERDIR, MAPSAVES == SAVESROOT) - it aliases them from
     paths.cmd right after the `call`, so Save never targets those names directly.
@@ -56,6 +59,7 @@ import re
 import sys
 import json
 import time
+import glob
 import ctypes
 import codecs
 import queue
@@ -80,9 +84,6 @@ from tkinter import font as tkfont
 # GUI groups: (group title, [(key, label, kind), ...])
 # kind: "folder" -> askdirectory Browse ; "file" -> askopenfilename Browse ; "text" -> no Browse
 GROUPS = [
-    ("Locations", [
-        ("connector_ini", "connector.ini file",                                "file"),
-    ]),
     ("Paths", [
         ("SERVER_ROOT", "SERVER_ROOT",           "folder"),
         ("SAVESROOT",   "SAVESROOT",             "folder"),
@@ -112,6 +113,11 @@ GROUPS = [
     ]),
     ("Cluster", [
         ("CLUSTERID", "CLUSTERID", "text"),
+    ]),
+    # Optional and rarely touched, so it sits last - below Paths/Network/Connector/
+    # Cluster - rather than being the first thing the user scrolls past.
+    ("Locations", [
+        ("connector_ini", "connector.ini file (not required)",                                "file"),
     ]),
 ]
 
@@ -263,6 +269,28 @@ PLACEHOLDER_EXAMPLES = {
     "game_ini":      PLACEHOLDER_EXAMPLE_ROOT + r"\ShooterGame\Saved\Config\WindowsServer\Game.ini",
 }
 
+# Connector identity fields get the SAME greyed-example treatment as the path fields
+# above - same _register_placeholder machinery, same get()-returns-"" filtering, so an
+# example can never reach connector.ini or a profile as if it were a real room/slot.
+#
+# Kept in its own dict rather than added to PLACEHOLDER_EXAMPLES because
+# is_unconfigured_example_path's residue test ("equals the example AND doesn't exist on
+# disk") is meaningless for a host:port or a player name - and 38281 is a plausible real
+# AP port, so a user who genuinely is on archipelago.gg:38281 must keep that value.
+CONNECTOR_PLACEHOLDERS = {
+    "server":   "archipelago.gg:38281",
+    "slot":     "YourSlotName",
+    "password": "blank if the room has no password",
+}
+
+
+def server_port(server):
+    """"archipelago.gg:51357" -> "51357". "" for anything without a trailing :digits
+    (blank field, bare hostname, "host:"), so the caller can say so rather than copying
+    garbage. rpartition, not split, so a bracketed IPv6 host still yields its port."""
+    _, sep, port = (server or "").strip().rpartition(":")
+    return port.strip() if sep and port.strip().isdigit() else ""
+
 
 def is_unconfigured_example_path(key, value):
     """True when `value` is nothing more than this field's shipped example.
@@ -351,13 +379,36 @@ PREFILL_ORDER = [
     "apply_server_config.bat",
 ]
 
-# .bat files we expose Run buttons for.
+# .bat files we expose Run buttons for. (reset_ark_test / apply_server_config no longer
+# get Quick Launch buttons - the in-app reset controls and Save cover them; the .bat files
+# still ship and read paths.cmd for anyone who runs them by hand.)
 RUN_BATS = [
     ("Run start_ase_server", "start_ase_server.bat"),
     ("Run switch_map",       "switch_map.bat"),
-    ("Run reset_ark_test",   "reset_ark_test.bat"),
-    ("Run apply_server_config", "apply_server_config.bat"),
 ]
+
+# --- Quick Launch pre-flight ------------------------------------------------- #
+# GUI keys a blank value is legitimately fine for, so the pre-flight check doesn't
+# refuse to run over them: an empty SERVERPASS means "no join password" and an empty
+# CLUSTERID means "clustering disabled" (both documented in paths.cmd itself).
+PREFLIGHT_BLANK_OK = {"SERVERPASS", "CLUSTERID"}
+
+
+def script_requirements(batname):
+    """{gui_key: (file_that_holds_it, var_name_in_it)} for everything `batname` reads.
+
+    Built from the two structures the paths.cmd refactor already defines rather than a
+    third hand-maintained list: the script's own BAT_TARGETS entry (its per-script
+    fields - ports, MAP, SESSION, ...) plus the whole of paths.cmd's set when the
+    script `call`s it (PATHS_CMD_CALLERS). A script that does neither has no
+    launcher-managed variables, so it needs no pre-flight check.
+    """
+    req = {}
+    if batname in PATHS_CMD_CALLERS:
+        req.update({k: ("paths.cmd", v) for k, v in BAT_TARGETS["paths.cmd"].items()})
+    req.update({k: (batname, v) for k, v in BAT_TARGETS.get(batname, {}).items()})
+    return req
+
 
 CONFIG_FILENAME = "arkap_launcher_config.json"
 
@@ -405,18 +456,45 @@ def is_autosave_profile(name):
 # user has profiles" - it just happens to exist before the user made one.
 DEFAULT_PROFILE_NAME = "Profile 1"
 
+# JSON key (in CONFIG_FILENAME, deliberately NOT in the profiles file) holding the name
+# of the profile Save writes into. Kept separate from the profiles list so the list
+# stays a plain name -> snapshot map with no "which one is current" flag to keep in
+# sync. Restored on the next launch, so the app comes back up on whatever profile was
+# in use rather than always on DEFAULT_PROFILE_NAME. Never set to AUTOSAVE_PROFILE_NAME
+# - that slot is a background snapshot the timer owns, and making it the Save target
+# would have each autosave silently overwrite the user's work.
+ACTIVE_PROFILE_KEY = "active_profile"
+
 
 # JSON key that persists the "don't show again" choice for the install reminder banner.
 REMINDER_HIDE_KEY = "hide_install_reminder"
 
-# JSON key that persists the last-used plugin SOURCE folder (the unzipped ArkAP_plugin
-# download the "Install Plugin" button copies FROM). Not a self.vars field - stored/read
-# directly on the config JSON, like REMINDER_HIDE_KEY.
-PLUGIN_SRC_KEY = "plugin_src_dir"
+# JSON key (in CONFIG_FILENAME, deliberately NOT in the profiles file) holding the newest
+# release version the user has clicked "Check for Updates" through to see. Persisted
+# separately from APP_VERSION so it survives restarts and drives the button HIGHLIGHT:
+# the highlight re-appears only when a release newer than THIS value ships. Distinct from
+# the exclamation badge, which tracks "is anything newer than the installed APP_VERSION
+# at all". See _compute_update_cues.
+ACK_VERSION_KEY = "last_acknowledged_version"
+
+# JSON keys recording the version of ArkServerApi / the ArkAP plugin the launcher last
+# installed, so Setup Status can flag (as an advisory, never a failure) when a newer
+# release exists. Stamped by the install flow that has the version in hand - the ArkApi
+# tag comes straight from the GitHub download; the plugin's is the current latest tag at
+# install time (the tag the GitHub download reported). Both are read directly off the
+# config JSON, like REMINDER_HIDE_KEY above.
+ARKAPI_INSTALLED_VERSION_KEY = "arkapi_installed_version"
+PLUGIN_INSTALLED_VERSION_KEY = "plugin_installed_version"
+
+# Config JSON fields the "Export diagnostics" zip must never leak. Everything else in the
+# config is kept as-is so it's still useful for troubleshooting - these three are replaced
+# in place with a marker rather than the whole file being withheld.
+REDACT_MARKER = "[REDACTED]"
+REDACT_CONFIG_KEYS = ("ADMINPASS", "SERVERPASS", "password")
 
 # --- Appearance / theming --------------------------------------------------- #
 # JSON key that persists the light/dark choice - read/written directly like
-# REMINDER_HIDE_KEY/PLUGIN_SRC_KEY above (see _read_theme_pref/_write_theme_pref)
+# REMINDER_HIDE_KEY above (see _read_theme_pref/_write_theme_pref)
 # rather than through the main collect_values()/on_save() flow, so the choice
 # is remembered immediately on toggle, not only after clicking Save.
 THEME_KEY = "theme"
@@ -436,6 +514,7 @@ THEMES = {
         "status_ok":            "#1b7a1b",
         "status_fail":          "#b00020",
         "status_info":          "#8a6d00",
+        "update_badge_fg":      "#e6a000",
         "status_detail_fg":     "#666666",
         "tooltip_bg":           "#ffffe0",
         "tooltip_fg":           "#000000",
@@ -458,6 +537,7 @@ THEMES = {
         "status_ok":            "#4caf50",
         "status_fail":          "#ff5252",
         "status_info":          "#ffca28",
+        "update_badge_fg":      "#ffc400",
         "status_detail_fg":     "#bbbbbb",
         "tooltip_bg":           "#4a4a35",
         "tooltip_fg":           "#f0f0f0",
@@ -491,12 +571,49 @@ BUNDLED_SCRIPTS = [
     "reset_ark_test.bat",
     "apply_server_config.bat",
     "apply_server_config.ps1",
+    # The drift detector itself. Bundled into the exe all along, but missing from this
+    # list until now - so it never reached the working folder, and the log message that
+    # tells users to "run tools\\diagnose_reset.bat" pointed at a file that wasn't there.
+    "diagnose_reset.bat",
+    "diagnose_reset.ps1",
     os.path.join("serverconfig", "Game.ini.settings"),
     os.path.join("serverconfig", "GameUserSettings.ini.settings"),
 ]
 
 # Folder name (under base_dir()) the bundled scripts are extracted into at runtime.
 WORKING_SCRIPTS_DIRNAME = "ArkServerScripts"
+
+# --- Pre-paths.cmd script detection ----------------------------------------- #
+# Every script here sources paths.cmd for SERVER_ROOT/SAVESROOT/CLUSTERDIR/... instead
+# of declaring its own copies. A working file that does NOT is a leftover from before
+# that refactor, and it is silently unconfigurable: Save writes those values into
+# paths.cmd only, so the old file keeps whatever SERVER_ROOT was baked into it (the
+# shipped example, C:\ARKServer) and the server launches against a path the user never
+# chose - while the Configuration tab shows their real one, all green. Nothing in the
+# app noticed, because each half was individually correct.
+#
+# The state is reached by upgrading in place: extract_bundled_scripts() is missing-only
+# so a user's existing ArkServerScripts folder survives an exe update, which is right
+# for their edited values but leaves paths.cmd freshly extracted next to callers that
+# predate it. Unzipping an older ArkServerScripts.zip over the folder does the same.
+PATHS_CMD_CALLERS = (
+    "start_ase_server.bat",
+    "switch_map.bat",
+    "start_transfer_server.bat",
+    "reset_ark_test.bat",
+)
+
+_PATHS_CMD_CALL_RE = re.compile(r'(?im)^[ \t]*call[ \t]+"%~dp0paths\.cmd"')
+
+# Old values are migrated out of these files into a newly-created paths.cmd, first hit
+# wins per variable. start_ase_server.bat leads because it declared the full set;
+# BACKUPROOT only ever existed in switch_map.bat.
+PRE_PATHS_MIGRATE_ORDER = PATHS_CMD_CALLERS
+
+# Suffix for the copy taken before a stale script is replaced. Deliberately NOT ".bak",
+# which Save already uses for its own backups - overwriting that would destroy the
+# user's last known-good pre-Save state to save a file we're about to replace anyway.
+PRE_PATHS_BACKUP_SUFFIX = ".pre-paths.bak"
 
 # --- Game.ini / GameUserSettings.ini upload --------------------------------- #
 # Where ARK reads its two editable server config files from, relative to SERVER_ROOT.
@@ -519,6 +636,31 @@ CONFIG_UPLOAD_HELP = {
                             "upload it while the server is stopped or your changes will "
                             "be overwritten.",
 }
+
+# --- Game.ini dino-randomizer fragment --------------------------------------- #
+# The plugin writes ipc\game_ini_fragment.txt as the ARK section header followed by the
+# NPCReplacements lines. The "Patch Game.ini for randomized creatures" button applies
+# that fragment into Game.ini, wrapping the replacements in the SAME auto-managed markers
+# the connector's own auto-patch uses (ark_ap_connector.py _write_spawn_ini), so the two
+# paths produce an identical, single managed block and re-applying never duplicates it.
+# These markers are also the exact boundary "Full reset for new seed" removes, so a fresh
+# seed doesn't inherit the previous seed's randomization.
+GAME_INI_FRAGMENT_NAME = "game_ini_fragment.txt"
+GAME_INI_SECTION = "[/script/shootergame.shootergamemode]"
+GAME_INI_BLOCK_BEGIN = "; === ArkAP NPCReplacements BEGIN (auto-managed, do not edit) ==="
+GAME_INI_BLOCK_END = "; === ArkAP NPCReplacements END ==="
+
+# Every dino-randomization fragment line starts with this one distinctive key (the real
+# fragment is a wall of ConfigOverrideNPCSpawnEntriesContainer= entries, NOT NPCReplacements
+# - an earlier content-guess keyed on the wrong one and let duplicate walls slip through).
+# Detecting a pre-existing block is therefore just "does any line start with this key?",
+# anywhere in the file, marker-wrapped or not - a literal check, far simpler and more
+# reliable than matching fragment content. A user's own hand-set spawn overrides use the
+# same key, but the patch flow only ever ASKS about an unmarked wall, never silently
+# overwrites, so a "false positive" is just a question the user answers.
+GAME_INI_FRAGMENT_KEY = "ConfigOverrideNPCSpawnEntriesContainer"
+GAME_INI_FRAGMENT_LINE_RE = re.compile(
+    r'(?im)^[ \t]*' + re.escape(GAME_INI_FRAGMENT_KEY) + r'[ \t]*=')
 
 # Process image names checked before any reset - ARK rewrites its save on shutdown and
 # the connector holds the ipc files open + rewrites session.json on its next poll, so a
@@ -663,16 +805,54 @@ INSTALL_BTN_HELP = (
 # --- ArkServerApi (ArkApi) auto-download --- #
 ARKSERVERAPI_RELEASES_API = "https://api.github.com/repos/ArkServerApi/AseApi/releases/latest"
 ARKSERVERAPI_RELEASES_PAGE = "https://github.com/ArkServerApi/AseApi/releases"
+
+# --- ArkAP plugin (this project's own plugin/connector bundle) release API --- #
+# Same repo the "Manual downloads" link (RELEASES_URL) points at. Uses the /releases LIST
+# endpoint (not /releases/latest): this repo is alpha/experimental and its only release is
+# marked "Pre-release", which /releases/latest deliberately excludes (404s). The list
+# endpoint returns pre-releases too, newest first - take the first entry.
+ARKAP_PLUGIN_RELEASES_API = (
+    "https://api.github.com/repos/Jbaker16163/Ark-Survival-Archipelago/releases")
+# The plugin release asset the "Install Plugin" button downloads (matched case-insensitively).
+ARKAP_PLUGIN_ASSET_NAME = "ArkAP_Plugin.zip"
 # GitHub's API 403s anonymous requests with no User-Agent header - any non-empty value works.
 GITHUB_API_USER_AGENT = "ArkAPLauncher"
 
 # --- Launcher self-update (this exe's own releases, separate repo from the plugin/
 # connector bundle above) --- #
-APP_VERSION = "0.3.1"
+# 0.4.0 is the "bridge" release: it is BUILT --onefile (a single .exe) purely so the old
+# --onefile-era updaters already in the wild can find and install it exactly as before (they
+# fetch /releases/latest and download the one .exe asset). But its own update code is the new
+# onedir-aware logic below - so once a user is on 0.4.0, their NEXT update pulls a folder-zip
+# and lays down an --onedir install, permanently ending the "Failed to load Python DLL" race
+# (which was the --onefile bootloader losing a lock-timing fight with AV over the freshly
+# extracted _MEI\python313.dll on the first launch after an update). See build.py --bridge.
+APP_VERSION = "0.4.0"
 UPDATE_REPO = "aSoberAvocado/ARK-Ipelago-Evolved-Launcher"
-UPDATE_RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+# NEW clients discover updates from the releases LIST (newest release carrying a launcher
+# folder-zip wins), NOT from /releases/latest - that deliberately ignores GitHub's "Latest"
+# pin so the bridge release can stay pinned as Latest forever (routing pre-bridge clients to
+# it) without hiding newer onedir releases from up-to-date clients. See _pick_best_release.
+UPDATE_RELEASES_LIST_API = "https://api.github.com/repos/%s/releases?per_page=30" % UPDATE_REPO
 UPDATE_RELEASES_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
-# Written by the generated update-helper .bat into base_dir() right before it exits, so the
+# Known launcher folder-zip asset names (matched case-insensitively; any other *.zip on the
+# release is accepted as a fallback). This is what build.py's shutil.make_archive produces.
+UPDATE_ZIP_ASSET_NAMES = {"arkipelago launcher.zip", "arkaplauncher.zip"}
+# PyInstaller --onedir puts the interpreter DLL + everything else under _internal\. The
+# relaunch gates on the actual pythonNN DLL in there being openable; we glob python3*.dll
+# rather than hardcode python313.dll so a Python minor-version bump at build time doesn't
+# silently break the gate/validation. A folder with no such DLL is not a valid onedir payload.
+UPDATE_INTERNAL_DIRNAME = "_internal"
+UPDATE_PAYLOAD_DLL_GLOB = "python3*.dll"
+# Update-helper working files, all written next to the exe (base_dir()). The relaunched app
+# sweeps any survivors on startup (_sweep_update_leftovers) in case the helper was killed.
+UPDATE_ZIP_TMPNAME = "ArkAPLauncher_update.zip"
+UPDATE_STAGING_DIRNAME = "_arkap_update_staging"
+UPDATE_HELPER_SCRIPT = "arkap_update_helper.ps1"
+# Accepted launcher exe basenames (current + pre-rename), matched case-insensitively when
+# locating the exe inside an extracted update, and preserved across the self-replace.
+_KNOWN_LAUNCHER_EXE_NAMES = {"arkipelago launcher.exe", "arkaplauncher.exe"}
+# Written by the generated update-helper script into base_dir() right before it exits, so the
 # freshly-relaunched exe can report the outcome of the update that just happened - the app
 # itself is gone by the time the helper runs, so this is the only way to surface a failure.
 UPDATE_RESULT_FILENAME = "arkap_update_result.txt"
@@ -741,6 +921,110 @@ def base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+# Unhandled-crash log. Lives next to the config JSON (base_dir()), NOT in the per-run
+# _MEI temp extraction folder, so it survives the process dying and the next launch, and
+# a user can actually find it / drag it into Discord. Appended to across restarts (see
+# write_crash_log) with a size cap so a crash loop can't grow it without bound.
+CRASH_LOG_FILENAME = "arkap_launcher_crash.log"
+CRASH_LOG_MAX_BYTES = 512 * 1024  # ~512 KB is dozens of tracebacks - plenty of history.
+
+
+def crash_log_path():
+    return os.path.join(base_dir(), CRASH_LOG_FILENAME)
+
+
+def _trim_to_tail(text, max_bytes):
+    """Keep the most recent <= max_bytes of `text`, cut on a line boundary so the oldest
+    surviving entry isn't a half line. Used to cap the append-only crash log."""
+    encoded = text.encode("utf-8", "replace")
+    if len(encoded) <= max_bytes:
+        return text
+    tail = encoded[-max_bytes:].decode("utf-8", "replace")
+    nl = tail.find("\n")
+    return tail[nl + 1:] if nl != -1 else tail
+
+
+def write_crash_log(exc_type, exc_value, exc_tb):
+    """Append one timestamped traceback to the crash log and return its path (or None if
+    even logging failed - never raise, we're already in the failure path)."""
+    import traceback
+    path = crash_log_path()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    entry = ("\n===== CRASH %s (launcher %s) =====\n%s\n"
+             % (stamp, APP_VERSION,
+                "".join(traceback.format_exception(exc_type, exc_value, exc_tb))))
+    try:
+        existing = ""
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                existing = f.read()
+        combined = _trim_to_tail(existing + entry, CRASH_LOG_MAX_BYTES)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(combined)
+        return path
+    except OSError:
+        return None
+
+
+def redact_config(data):
+    """Copy of the config dict with REDACT_CONFIG_KEYS replaced in place by REDACT_MARKER
+    (only when present and non-empty), so the rest stays useful for troubleshooting."""
+    out = dict(data)
+    for key in REDACT_CONFIG_KEYS:
+        if out.get(key):
+            out[key] = REDACT_MARKER
+    return out
+
+
+def aggregate_status_state(items):
+    """Overall Setup Status colour from the per-check list: any hard fail -> "fail",
+    else any advisory -> "info", else "ok"."""
+    states = {it.get("state") for it in items}
+    if "fail" in states:
+        return "fail"
+    if "info" in states:
+        return "info"
+    return "ok"
+
+
+def format_setup_status_summary(items):
+    """Plain-text rendering of the Setup Status checks for the diagnostics zip."""
+    tag = {"ok": "PASS", "fail": "FAIL", "info": "INFO"}
+    lines = ["Setup Status (launcher %s)" % APP_VERSION,
+             time.strftime("Generated %Y-%m-%d %H:%M:%S"), ""]
+    for it in items:
+        lines.append("[%s] %s" % (tag.get(it.get("state"), "?"), it.get("label", "")))
+        if it.get("detail"):
+            lines.append("        %s" % it["detail"])
+    lines.append("")
+    lines.append("Overall: %s" % tag.get(aggregate_status_state(items), "?"))
+    return "\n".join(lines)
+
+
+def fetch_latest_release_tag(api_url):
+    """tag_name of a repo's latest release, or None on any network/parse failure.
+
+    Accepts either a /releases/latest endpoint (single object) or a /releases list
+    endpoint (array, newest first - used for repos like the ArkAP plugin's that only
+    ever publish pre-releases, which /releases/latest 404s on). Best-effort: the
+    component-version advisory just goes quiet when GitHub is unreachable, exactly
+    like the launcher's own update check."""
+    try:
+        req = urllib.request.Request(
+            api_url, headers={"User-Agent": GITHUB_API_USER_AGENT,
+                              "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, list):
+            data = next((r for r in data if isinstance(r, dict) and not r.get("draft")), None)
+        if not isinstance(data, dict):
+            return None
+        tag = data.get("tag_name")
+        return tag or None
+    except (OSError, ValueError):
+        return None
+
+
 def _parse_version(v):
     """"v1.2.3-alpha" / "1.2.3" -> (1, 2, 3). Non-numeric segments (pre-release/build
     metadata) are dropped rather than raising, since GitHub tag conventions vary."""
@@ -760,13 +1044,33 @@ def _version_is_newer(remote_tag, local_version):
     return _parse_version(remote_tag) > _parse_version(local_version)
 
 
+def _compute_update_cues(latest_version, installed_version, acknowledged_version):
+    """Decide the two independent "update available" cues from the live latest release.
+
+    Returns (show_badge, show_highlight):
+      show_badge     - an update genuinely exists: `latest_version` is newer than the
+                       INSTALLED version. Drives the persistent "!" exclamation mark,
+                       which only clears by actually updating (which raises
+                       installed_version), never by clicking "Check for Updates".
+      show_highlight - the update is ALSO newer than the version the user last clicked
+                       through to acknowledge. Clicking "Check for Updates" persists
+                       acknowledged_version = latest_version, so the highlight clears
+                       while the badge stays lit.
+
+    Two comparisons against the same live `latest_version`, but against two different
+    reference points (installed for the mark, acknowledged for the highlight)."""
+    show_badge = bool(latest_version) and _version_is_newer(latest_version, installed_version)
+    show_highlight = show_badge and _version_is_newer(latest_version, acknowledged_version)
+    return show_badge, show_highlight
+
+
 _RELEASE_VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}")
 
 
 def _extract_release_version(data):
     """Best-effort (version_str, display_str) for a GitHub release JSON payload.
 
-    Prefers tag_name (the normal convention - what _pick_update_asset/messages should
+    Prefers tag_name (the normal convention - what _pick_best_release/messages should
     show), but not every release necessarily tags with a strict semver string - falls
     back to searching the release's display "name" field for a version number too, and
     to using name as the display string when tag_name is empty or non-numeric."""
@@ -779,6 +1083,218 @@ def _extract_release_version(data):
             version_str = m.group(0)
             break
     return version_str, (tag or name)
+
+
+def _launcher_zip_asset(data):
+    """The launcher folder-zip asset on a release JSON payload, or None.
+
+    Prefers a known launcher zip name (UPDATE_ZIP_ASSET_NAMES), else the first *.zip that
+    isn't an obvious side artifact (e.g. ArkServerScripts.zip), else the first *.zip. This is
+    the onedir replacement for the old single-.exe asset: build.py ships the whole app folder
+    as one zip, and the updater extracts + swaps it."""
+    assets = data.get("assets") or []
+    zips = [a for a in assets if (a.get("name") or "").lower().endswith(".zip")]
+    if not zips:
+        return None
+    preferred = next((a for a in zips
+                      if (a.get("name") or "").lower() in UPDATE_ZIP_ASSET_NAMES), None)
+    if preferred:
+        return preferred
+    for a in zips:
+        if "arkserverscripts" not in (a.get("name") or "").lower():
+            return a
+    return zips[0]
+
+
+def _pick_best_release(releases, installed_version):
+    """Newest release (by version) that is BOTH newer than installed_version AND carries a
+    launcher folder-zip asset. Ignores drafts and GitHub's 'Latest' pin entirely (see the
+    UPDATE_RELEASES_LIST_API note) so a permanently-pinned bridge release never hides newer
+    onedir releases from clients that are already past it. Returns (release_dict, version_str)
+    or (None, None)."""
+    best, best_ver = None, None
+    for rel in releases or []:
+        if not isinstance(rel, dict) or rel.get("draft"):
+            continue
+        ver, _display = _extract_release_version(rel)
+        if not ver or not _version_is_newer(ver, installed_version):
+            continue
+        if _launcher_zip_asset(rel) is None:
+            continue
+        if best is None or _version_is_newer(ver, best_ver):
+            best, best_ver = rel, ver
+    return best, best_ver
+
+
+def _ps_quote(s):
+    """Quote a string as a PowerShell single-quoted literal (doubling embedded quotes), for
+    baking paths into the generated update helper without any arg-escaping surprises."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def _locate_staged_app(staging_root):
+    """Find the extracted --onedir app inside staging_root: a folder holding BOTH a launcher
+    .exe and <internal>\\python3*.dll. Handles the zip having a single top-level folder (the
+    normal build.py shape) or being extracted flat. Returns (app_dir, exe_path) or None."""
+    candidates = [staging_root]
+    try:
+        for name in sorted(os.listdir(staging_root)):
+            p = os.path.join(staging_root, name)
+            if os.path.isdir(p):
+                candidates.append(p)
+    except OSError:
+        return None
+    for d in candidates:
+        internal = os.path.join(d, UPDATE_INTERNAL_DIRNAME)
+        if not glob.glob(os.path.join(internal, UPDATE_PAYLOAD_DLL_GLOB)):
+            continue
+        exes = glob.glob(os.path.join(d, "*.exe"))
+        if not exes:
+            continue
+        preferred = next((e for e in exes
+                          if os.path.basename(e).lower() in _KNOWN_LAUNCHER_EXE_NAMES), None)
+        return d, (preferred or exes[0])
+    return None
+
+
+# The self-update helper, generated at update time (the running exe can't replace its own
+# folder). @@TOKENS@@ are substituted with _ps_quote'd values - see _build_update_ps_script.
+# The one line that matters for the "Failed to load Python DLL" bug is the Wait-Unlocked gate
+# just before Start-Process: it blocks the relaunch until the freshly-written interpreter DLL
+# can be opened with FileShare.None, i.e. the AV on-access scan has released it, so the
+# PyInstaller bootloader can never lose the load race that produced the error dialog.
+_PS_UPDATE_TEMPLATE = r"""
+$ErrorActionPreference = 'Stop'
+$targetPid   = @@PID@@
+$appDir      = @@APPDIR@@
+$currentExe  = @@CURRENTEXE@@
+$stagedDir   = @@STAGEDDIR@@
+$stagedExe   = @@STAGEDEXE@@
+$internalDir = @@INTERNAL@@
+$dllGlob     = @@DLLGLOB@@
+$zipPath     = @@ZIPPATH@@
+$stagingRoot = @@STAGINGROOT@@
+$resultPath  = @@RESULTPATH@@
+$tag         = @@TAG@@
+
+function Write-Result($status, $msg) {
+  try {
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($resultPath, @($status, $tag, $msg), $enc)
+  } catch { }
+}
+
+function Wait-Unlocked($path) {
+  for ($i = 0; $i -lt 120; $i++) {
+    try {
+      $s = [System.IO.File]::Open($path, 'Open', 'Read', 'None')
+      $s.Close()
+      return $true
+    } catch { Start-Sleep -Milliseconds 250 }
+  }
+  return $false
+}
+
+function Clean-Temp {
+  Remove-Item -Recurse -Force $stagingRoot -ErrorAction SilentlyContinue
+  Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+}
+
+# 1. Wait (up to ~30s) for the old launcher process to exit so its files are free.
+for ($i = 0; $i -lt 60; $i++) {
+  if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) { break }
+  Start-Sleep -Milliseconds 500
+}
+
+$curInternal = Join-Path $appDir $internalDir
+$stagedInternal = Join-Path $stagedDir $internalDir
+$bakInternal = "$curInternal.old"
+$bakExe = "$currentExe.old"
+
+# 2. Validate the staged payload really is there before touching the install.
+$stagedDll = Get-ChildItem -LiteralPath $stagedInternal -Filter $dllGlob -ErrorAction SilentlyContinue | Select-Object -First 1
+if ((-not (Test-Path -LiteralPath $stagedExe)) -or (-not $stagedDll)) {
+  Write-Result 'FAIL' 'The downloaded update was incomplete (program files missing); nothing was changed.'
+  Clean-Temp
+  exit 1
+}
+
+# 3. Let the AV on-access scan of the freshly-extracted DLL finish before we move anything.
+Wait-Unlocked $stagedDll.FullName | Out-Null
+
+# 4. Swap in the new program files (exe + _internal), rolling back on any failure so the
+#    user is never left without a working launcher. Config/profiles are never touched.
+Remove-Item -Recurse -Force $bakInternal -ErrorAction SilentlyContinue
+Remove-Item -Force $bakExe -ErrorAction SilentlyContinue
+try {
+  if (Test-Path -LiteralPath $curInternal) {
+    Rename-Item -LiteralPath $curInternal -NewName ([System.IO.Path]::GetFileName($bakInternal))
+  }
+  Move-Item -LiteralPath $stagedInternal -Destination $curInternal
+  if (Test-Path -LiteralPath $currentExe) {
+    Rename-Item -LiteralPath $currentExe -NewName ([System.IO.Path]::GetFileName($bakExe))
+  }
+  Move-Item -LiteralPath $stagedExe -Destination $currentExe
+} catch {
+  $err = $_.Exception.Message
+  if ((-not (Test-Path -LiteralPath $currentExe)) -and (Test-Path -LiteralPath $bakExe)) {
+    Rename-Item -LiteralPath $bakExe -NewName ([System.IO.Path]::GetFileName($currentExe))
+  }
+  if ((-not (Test-Path -LiteralPath $curInternal)) -and (Test-Path -LiteralPath $bakInternal)) {
+    Rename-Item -LiteralPath $bakInternal -NewName ([System.IO.Path]::GetFileName($curInternal))
+  }
+  Write-Result 'FAIL' ('Could not install the update; your previous version was restored. ' + $err)
+  try { Start-Process -FilePath $currentExe -WorkingDirectory $appDir } catch { }
+  Clean-Temp
+  exit 1
+}
+
+# 5. THE GATE. Do not relaunch until the new interpreter DLL (and the exe) at their final
+#    paths can be opened exclusively - i.e. AV has released them - so the bootloader never
+#    races the scanner and the 'Failed to load Python DLL' dialog can never appear.
+$finalDll = Get-ChildItem -LiteralPath $curInternal -Filter $dllGlob -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($finalDll) { Wait-Unlocked $finalDll.FullName | Out-Null }
+Wait-Unlocked $currentExe | Out-Null
+
+Write-Result 'OK' 'Updated successfully.'
+Start-Process -FilePath $currentExe -WorkingDirectory $appDir
+
+# 6. Best-effort cleanup (the relaunched app also sweeps these on startup).
+Remove-Item -Recurse -Force $bakInternal -ErrorAction SilentlyContinue
+Remove-Item -Force $bakExe -ErrorAction SilentlyContinue
+Clean-Temp
+exit 0
+"""
+
+
+def _build_update_ps_script(pid, app_dir, current_exe, staged_dir, staged_exe,
+                            internal_dir, dll_glob, zip_path, staging_root,
+                            result_path, tag):
+    """Generate the PowerShell self-update helper (the running exe can't replace its own
+    folder). It waits for our PID to exit, swaps in the new --onedir program files (the exe +
+    <internal>\\) with full rollback, and - the fix for the 'Failed to load Python DLL'
+    dialog - waits until the freshly-written interpreter DLL can be opened exclusively (AV
+    scan released it) BEFORE relaunching, so the bootloader never races the scanner. User
+    config/profiles beside the exe are never touched. Writes a 3-line result file (status,
+    tag, message) the relaunched app reports via _check_previous_update_result()."""
+    safe_tag = re.sub(r"[\r\n]", " ", tag) or "unknown"
+    subs = {
+        "@@PID@@": str(int(pid)),
+        "@@APPDIR@@": _ps_quote(app_dir),
+        "@@CURRENTEXE@@": _ps_quote(current_exe),
+        "@@STAGEDDIR@@": _ps_quote(staged_dir),
+        "@@STAGEDEXE@@": _ps_quote(staged_exe),
+        "@@INTERNAL@@": _ps_quote(internal_dir),
+        "@@DLLGLOB@@": _ps_quote(dll_glob),
+        "@@ZIPPATH@@": _ps_quote(zip_path),
+        "@@STAGINGROOT@@": _ps_quote(staging_root),
+        "@@RESULTPATH@@": _ps_quote(result_path),
+        "@@TAG@@": _ps_quote(safe_tag),
+    }
+    script = _PS_UPDATE_TEMPLATE
+    for token, value in subs.items():
+        script = script.replace(token, value)
+    return script
 
 
 def resource_dir():
@@ -859,24 +1375,111 @@ def working_scripts_dir():
     return os.path.join(base_dir(), WORKING_SCRIPTS_DIRNAME)
 
 
-def extract_bundled_scripts():
-    """Copy any bundled script that isn't already present into working_scripts_dir().
+def is_pre_paths_script(text):
+    """True if this is a paths.cmd caller from before the paths.cmd refactor.
 
-    Missing-only so a user's already-personalised scripts (Save rewrites their
-    `set "VAR=..."` lines) are never clobbered on a later launch, while a fresh
-    install still gets a full working set. Returns (dest_dir, [extracted_relpaths],
-    [errors])."""
+    Two signals, both required. Missing `call "%~dp0paths.cmd"` alone isn't enough -
+    that would also match a file a user gutted on purpose. Pairing it with "still
+    declares a variable paths.cmd now owns" identifies the old shipped layout
+    specifically, and those declarations are exactly what makes the file harmful:
+    they're the stale SERVER_ROOT the server ends up launching against.
+    """
+    if _PATHS_CMD_CALL_RE.search(text):
+        return False
+    return any(bat_read_var(text, var) is not None
+               for var in BAT_TARGETS["paths.cmd"].values())
+
+
+def _migrate_into_paths_cmd(dst_root, old_texts, errors):
+    """Move the shared values out of pre-refactor scripts into a fresh paths.cmd.
+
+    Only ever called for a paths.cmd this run just created, never one already holding
+    the user's settings. Without this the upgrade is lossy in a way that looks like
+    data loss from the outside: the only record of the user's real SERVER_ROOT was the
+    old script we're about to replace, so they'd reopen the launcher to empty path
+    fields and a server that had been running fine yesterday.
+    """
+    path = os.path.join(dst_root, "paths.cmd")
+    try:
+        text, enc = read_text(path)
+    except OSError as exc:
+        errors.append("paths.cmd: %s" % exc)
+        return []
+    migrated = []
+    for var in BAT_TARGETS["paths.cmd"].values():
+        for batname in PRE_PATHS_MIGRATE_ORDER:
+            old = old_texts.get(batname)
+            if old is None:
+                continue
+            value = bat_read_var(old, var)
+            if value is None:
+                continue
+            text, found = bat_write_var(text, var, value)
+            if found:
+                migrated.append(var)
+            break
+    if not migrated:
+        return []
+    try:
+        write_text(path, text, enc)
+    except OSError as exc:
+        errors.append("paths.cmd: %s" % exc)
+        return []
+    return migrated
+
+
+def extract_bundled_scripts():
+    """Install the bundled scripts into working_scripts_dir(): missing ones are copied
+    in, pre-paths.cmd ones are replaced.
+
+    Still missing-only for anything current, so a user's personalised scripts (Save
+    rewrites their `set "VAR=..."` lines) are never clobbered on a later launch. The
+    exception is a script that predates paths.cmd - see PATHS_CMD_CALLERS for why
+    leaving one of those in place is worse than replacing it. Those are backed up
+    first, keep the per-script fields the GUI manages, and hand their shared values to
+    paths.cmd on the way out, so the replacement is a migration rather than a reset.
+
+    Returns (dest_dir, [extracted], [refreshed], [errors], [migrated_var_names]).
+    """
     src_root = bundled_scripts_dir()
     dst_root = working_scripts_dir()
-    extracted, errors = [], []
+    extracted, refreshed, errors = [], [], []
+    pre_paths_texts = {}
     for rel in BUNDLED_SCRIPTS:
         src = os.path.join(src_root, rel)
         dst = os.path.join(dst_root, rel)
-        if os.path.isfile(dst):
-            continue
         if not os.path.isfile(src):
             # Bundle is incomplete (e.g. a lightweight/dev build) - not fatal, the
             # matching Run/Save just reports the script missing later.
+            continue
+        if os.path.isfile(dst):
+            if os.path.basename(rel) not in PATHS_CMD_CALLERS:
+                continue
+            try:
+                old_text, old_enc = read_text(dst)
+            except OSError as exc:
+                errors.append("%s: %s" % (rel, exc))
+                continue
+            if not is_pre_paths_script(old_text):
+                continue
+            try:
+                new_text, _ = read_text(src)
+                # The fields the GUI owns for this script (MAP, SESSION, ports, ...)
+                # are per-script and live nowhere else, so they come across as-is.
+                # Everything not listed takes the canonical value deliberately: the
+                # old copies also carry fixed bugs, and start_transfer_server.bat's
+                # old ports are the 7778 clash that ARK loses to silently.
+                for var in BAT_TARGETS.get(os.path.basename(rel), {}).values():
+                    kept = bat_read_var(old_text, var)
+                    if kept is not None:
+                        new_text, _ = bat_write_var(new_text, var, kept)
+                shutil.copyfile(dst, dst + PRE_PATHS_BACKUP_SUFFIX)
+                write_text(dst, new_text, old_enc)
+            except OSError as exc:
+                errors.append("%s: %s" % (rel, exc))
+                continue
+            pre_paths_texts[os.path.basename(rel)] = old_text
+            refreshed.append(rel)
             continue
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -884,7 +1487,13 @@ def extract_bundled_scripts():
             extracted.append(rel)
         except OSError as exc:
             errors.append("%s: %s" % (rel, exc))
-    return dst_root, extracted, errors
+
+    # Only when this run created paths.cmd: an existing one is the user's own, already
+    # holding the values Save wrote, and must not be rewritten from an older script.
+    migrated = []
+    if pre_paths_texts and "paths.cmd" in extracted:
+        migrated = _migrate_into_paths_cmd(dst_root, pre_paths_texts, errors)
+    return dst_root, extracted, refreshed, errors, migrated
 
 
 def is_process_running(image_name):
@@ -920,6 +1529,76 @@ def read_text(path):
 def write_text(path, text, encoding="utf-8"):
     with open(path, "w", encoding=encoding, newline="") as f:
         f.write(text)
+
+
+def _fragment_payload_lines(fragment_text):
+    """The NPCReplacements lines from a game_ini_fragment.txt, minus its own section
+    header (so merging never emits a second [/script/shootergame.shootergamemode])."""
+    return [ln for ln in fragment_text.splitlines()
+            if ln.strip() and ln.strip().lower() != GAME_INI_SECTION.lower()]
+
+
+def remove_game_ini_marked_block(text):
+    """Strip the app's marker-wrapped NPCReplacements block (BEGIN..END, inclusive) from
+    Game.ini text. Returns (new_text, removed). Everything else is left byte-for-byte -
+    the section header and any of the user's own lines in it stay put."""
+    new = re.sub(re.escape(GAME_INI_BLOCK_BEGIN) + r".*?" + re.escape(GAME_INI_BLOCK_END)
+                 + r"(?:\r?\n)?", "", text, flags=re.S)
+    return new, (new != text)
+
+
+def game_ini_unmarked_fragment_count(text):
+    """How many dino-randomization fragment lines sit OUTSIDE the app's marker block - a
+    hand-pasted / leftover wall we didn't put there (0 if none). The marker block is
+    stripped first so its own lines never count."""
+    outside, _ = remove_game_ini_marked_block(text)   # ignore our own managed block
+    return len(GAME_INI_FRAGMENT_LINE_RE.findall(outside))
+
+
+def merge_game_ini_fragment(existing_text, fragment_text, remove_unmarked=False):
+    """Apply the plugin's game_ini_fragment.txt into an existing Game.ini's text.
+
+    Returns (new_text, n_replacements). new_text is None (n == 0) when the fragment
+    carries no NPCReplacements lines to apply.
+
+    The fragment is the ARK section header followed by NPCReplacements lines; only the
+    replacement lines are the payload (its own header is dropped so we never emit a
+    second one). The payload is wrapped in the auto-managed BEGIN/END markers, and any
+    previous such block is stripped first, so re-applying replaces rather than stacks.
+    remove_unmarked also drops any hand-pasted NPCReplacements lines that sit outside the
+    markers (used when the user confirms replacing a manual block). If a
+    [/script/shootergame.shootergamemode] header already exists ANYWHERE the block is
+    merged in right under it (ARK honours only one instance of that section); otherwise a
+    fresh section + block is placed at the top. Every other line is preserved."""
+    payload = _fragment_payload_lines(fragment_text)
+    if not payload:
+        return None, 0
+
+    nl = "\r\n" if "\r\n" in existing_text else "\n"
+    # Drop any previous auto-managed block so a re-apply replaces it instead of stacking.
+    txt, _ = remove_game_ini_marked_block(existing_text)
+    if remove_unmarked:
+        # Also remove hand-pasted / leftover fragment lines (now the only ones left, the
+        # marker block having just gone) so the confirmed replace collapses to one wall.
+        txt = re.sub(r'(?im)^[ \t]*' + re.escape(GAME_INI_FRAGMENT_KEY)
+                     + r'[ \t]*=.*(?:\r?\n)?', "", txt)
+
+    block = (GAME_INI_BLOCK_BEGIN + nl + nl.join(payload) + nl
+             + GAME_INI_BLOCK_END + nl)
+
+    idx = txt.lower().find(GAME_INI_SECTION.lower())
+    if idx == -1:
+        # No section yet: fresh section + block at the very top, user's content below it.
+        prefix = GAME_INI_SECTION + nl + block
+        return (prefix + nl + txt if txt.strip() else prefix), len(payload)
+    # Section present: splice the block in right under its header - no duplicate header.
+    line_end = txt.find("\n", idx)
+    if line_end == -1:                     # header is the final line with no newline
+        txt += nl
+        at = len(txt)
+    else:
+        at = line_end + 1
+    return txt[:at] + block + txt[at:], len(payload)
 
 
 def bat_read_var(text, var):
@@ -1078,6 +1757,25 @@ def direct_candidate_server_roots():
     return cands
 
 
+# "<name>_backup_<timestamp>" - the snapshot folder _backup_and_clear_dir() creates
+# ("Full reset for new seed" / switch_map.bat). \d{6,} matches its yyyymmdd-hhmmss
+# stamp and the "-2" collision suffix it may carry.
+_BACKUP_SNAPSHOT_RE = re.compile(r"_backup_\d{6,}")
+
+
+def is_backup_snapshot_path(path):
+    """True if `path` IS, or lives anywhere inside, a timestamped backup snapshot.
+
+    A snapshot is frozen data that has already been moved aside, so nothing in one is
+    ever a live location for ANY field - offering it would point the app at old data
+    instead of the real folder. The check is on the whole path, not just the leaf:
+    the snapshot root is named "<name>_backup_<ts>", but the folders inside it keep
+    their ordinary live-looking names ("ServerCluster_backup_20260721-124852\\Saves"),
+    so a basename-only test (classify_cluster_folder) happily classifies them."""
+    return any(_BACKUP_SNAPSHOT_RE.search(part.lower())
+               for part in re.split(r"[\\/]", path or "") if part)
+
+
 def bounded_drive_scan(log_fn, is_cancelled):
     """Depth-limited, filtered walk of common drive roots looking for
     ShooterGameServer.exe. Bounded by MAX_SCAN_DIRS and SCAN_TIME_BUDGET_SECONDS so a
@@ -1115,6 +1813,8 @@ def bounded_drive_scan(log_fn, is_cancelled):
                             continue
                         if entry.name.lower() in SKIP_SCAN_DIR_NAMES:
                             continue
+                        if _BACKUP_SNAPSHOT_RE.search(entry.name.lower()):
+                            continue  # a backed-up server tree has its own ShooterGameServer.exe
                         stack.append((entry.path, depth + 1))
             except OSError:
                 continue
@@ -1229,7 +1929,7 @@ def classify_cluster_folder(name):
         return None
     if low.startswith("cluster-"):
         return None
-    if re.search(r"_backup_\d{6,}", low):
+    if _BACKUP_SNAPSHOT_RE.search(low):
         return None
     if "backup" in low:
         return "BACKUPROOT"
@@ -1303,6 +2003,12 @@ def _walk_bounded(starts, max_depth, max_dirs, budget_seconds, is_cancelled, on_
                         low = entry.name.lower()
                         if low in SKIP_SCAN_DIR_NAMES or low in SKIP_SCOPED_SCAN_DIR_NAMES:
                             continue
+                        if _BACKUP_SNAPSHOT_RE.search(low):
+                            # Never descend into a snapshot: everything inside it looks
+                            # live by name (Saves, Backups, an ArkApi Plugins tree, a
+                            # Game.ini) and would be offered for the matching field.
+                            # Skipping the root also keeps the walk budget for real folders.
+                            continue
                         on_dir(entry.path, entry.name, depth + 1)
                         stack.append((entry.path, depth + 1))
             except OSError:
@@ -1347,6 +2053,11 @@ def scoped_scan_paths(server_root, level, is_cancelled=None, progress=None):
     suggestions = {}
 
     def _note_suggestion(key, path):
+        # Catches what the _walk_bounded prune can't: SERVER_ROOT itself sitting inside
+        # a snapshot (the walk starts in there, so it never sees the snapshot root), and
+        # the Quick tier, which lists folders directly instead of walking.
+        if is_backup_snapshot_path(path):
+            return
         bucket = suggestions.setdefault(key, [])
         if not any(os.path.normcase(p) == os.path.normcase(path) for p in bucket):
             bucket.append(path)
@@ -1478,6 +2189,40 @@ def check_plugin_mode(plugin_dir):
         return False, "could not read ArkAP.config.json (%s)" % exc
     mode = str(data.get("mode", "")).strip().lower()
     return (mode == "ap"), ("mode = \"%s\"" % mode if mode else "mode field missing")
+
+
+def check_scripts_sourced(scripts_dir):
+    """(ok, detail) - ok if every paths.cmd caller in scripts_dir actually calls it.
+
+    The one check on this tab that looks at the scripts rather than the server. It
+    exists because the failure it catches is invisible from everywhere else: each
+    individual thing the user can see (the path field, paths.cmd, Save's log) is
+    correct, and only the relationship between two files is broken.
+    """
+    if not scripts_dir or not os.path.isdir(scripts_dir):
+        return False, "Scripts folder not found: %s" % (scripts_dir or "(unknown)")
+    if not os.path.isfile(os.path.join(scripts_dir, "paths.cmd")):
+        return False, "paths.cmd is missing from %s" % scripts_dir
+    stale, unreadable = [], []
+    for batname in PATHS_CMD_CALLERS:
+        path = os.path.join(scripts_dir, batname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            text, _ = read_text(path)
+        except OSError:
+            unreadable.append(batname)
+            continue
+        if is_pre_paths_script(text):
+            stale.append(batname)
+    if stale:
+        plural = len(stale) > 1
+        return False, ("%s still %s %s own SERVER_ROOT instead of reading paths.cmd"
+                       % (", ".join(stale), "declare" if plural else "declares",
+                          "their" if plural else "its"))
+    if unreadable:
+        return False, "could not read %s" % ", ".join(unreadable)
+    return True, "all scripts read their paths from paths.cmd"
 
 
 def check_connector_filled(connector_ini_path):
@@ -1687,9 +2432,6 @@ class ArkAPLauncher(tk.Tk):
         # Scripts folder is no longer a user field - it's the working folder next to the
         # launcher that bundled scripts are extracted into (set in _discover_locations).
         self._scripts_dir = working_scripts_dir()
-        # Plugin SOURCE folder (unzipped ArkAP_plugin download) the Install Plugin button
-        # copies FROM - remembered across runs via the config JSON (PLUGIN_SRC_KEY).
-        self._plugin_src_dir = ""
         self.backup_var = tk.BooleanVar(value=True)
         self._logo_img = None     # keep a reference so Tk doesn't garbage-collect it
 
@@ -1698,6 +2440,10 @@ class ArkAPLauncher(tk.Tk):
         self.profiles_path = os.path.join(base_dir(), PROFILES_FILENAME)
         self._profiles = {}             # name -> {"values": {key: str, ...}, "notes": str}
         self._loaded_profile_name = None
+        # Which profile Save writes into, remembered across launches (ACTIVE_PROFILE_KEY).
+        # Tracked separately from _loaded_profile_name because loading the reserved
+        # autosave slot must NOT retarget Save at it - see _set_active_profile.
+        self._active_profile = None
         self._loaded_profile_values = None  # snapshot of Configuration values as loaded
         self._loaded_profile_notes = None   # notes text as loaded
         # Reserved autosave slot (see AUTOSAVE_PROFILE_NAME). _autosave_last_values is
@@ -1724,6 +2470,10 @@ class ArkAPLauncher(tk.Tk):
         # install_status_var widgets with the SteamCMD flow above (see _any_install_running).
         self._arkapi_queue = queue.Queue()
         self._arkapi_thread = None
+        # ArkAP plugin download+install - shares the same install_log/install_progress/
+        # install_status_var widgets (see _any_install_running).
+        self._plugin_queue = queue.Queue()
+        self._plugin_thread = None
         self._hide_install_reminder = self._read_hide_reminder_flag()
 
         # Broad SERVER_ROOT auto-detect state (Steam libraries / common drive roots).
@@ -1742,12 +2492,19 @@ class ArkAPLauncher(tk.Tk):
         self._scan_cancelled = False
 
         # Launcher self-update state - see "Launcher self-update" section below.
-        # Never touched on startup: the "Check for Updates" button is the only trigger,
-        # so no network call happens until the user asks for one.
+        # A silent background check also runs once on startup (see
+        # _start_background_update_check) - it only sets the badge, never opens the
+        # update dialog or downloads anything on its own.
         self._update_check_thread = None
         self._update_download_thread = None
         self._update_download_queue = queue.Queue()
         self._update_progress_win = None
+        # Component-version advisory rows (ArkApi / plugin newer-than-installed), filled in
+        # by the background check and appended to Setup Status. See #4 / _on_component_versions.
+        self._component_advisories = []
+        # PhotoImages for the Setup Status tab-bar symbol, kept referenced so Tk doesn't
+        # GC them; rebuilt per state/theme in _update_status_tab_indicator.
+        self._status_tab_glyphs = {}
 
         # Theme must be selected before _build_ui() constructs any widget,
         # since widget colors are read from self.theme at construction time.
@@ -1765,9 +2522,6 @@ class ArkAPLauncher(tk.Tk):
             # A shipped-blank config.json (present on disk but empty - see build.py)
             # must still count as first launch, same as no file at all.
             self._is_first_launch = True
-        self._plugin_src_dir = saved.get(PLUGIN_SRC_KEY, "") or ""
-        if hasattr(self, "_plugin_src_var"):
-            self._plugin_src_var.set(self._plugin_src_dir)
         self._discover_locations(saved)
         self.load_from_files(initial=True, saved=saved)
         self._apply_path_placeholders()
@@ -1778,6 +2532,10 @@ class ArkAPLauncher(tk.Tk):
         # the pre-created profile already selected on a fresh install.
         self._ensure_default_profile()
         self._refresh_profile_list()
+        # Come back up on whatever profile was active last session (ACTIVE_PROFILE_KEY)
+        # rather than always on DEFAULT_PROFILE_NAME. No-op on a fresh install, where
+        # _ensure_default_profile just made and activated that one.
+        self._restore_active_profile(saved)
         self._update_profile_status()
 
         # Armed last, so the first snapshot it writes is of fully-loaded values.
@@ -1789,6 +2547,36 @@ class ArkAPLauncher(tk.Tk):
         # Local file read only (no network) - reports the outcome of an update helper
         # that ran just before this process started, if there was one.
         self._check_previous_update_result()
+        # Best-effort housekeeping: remove any update-helper leftovers (staging, backups,
+        # the helper script/zip) and stale --onefile _MEI temp folders from before the
+        # switch to --onedir. Never fatal.
+        self._sweep_update_leftovers()
+
+        # Silent, non-blocking: runs on a background thread so it can never delay the
+        # window appearing, and fails quietly (no popup) if GitHub is unreachable.
+        self._start_background_update_check()
+        # Same check for the installed ArkApi / plugin vs their latest GitHub releases -
+        # feeds the yellow "i" advisory rows on Setup Status (see #4). Background/quiet.
+        self._start_component_version_check()
+
+    def report_callback_exception(self, exc_type, exc_value, exc_tb):
+        """Tk calls this when a callback (button command, event binding, after-timer)
+        raises. Default prints a raw traceback to a console the windowed build doesn't
+        have, and the error vanishes. Instead: log it to the crash file and show a
+        friendly dialog, but keep the app alive - one bad handler shouldn't kill a
+        session mid-configuration."""
+        path = write_crash_log(exc_type, exc_value, exc_tb)
+        where = path or crash_log_path()
+        try:
+            messagebox.showerror(
+                "ARKIpelago Launcher - Something went wrong",
+                "The launcher hit an unexpected error, but is still running - you can "
+                "keep going or restart to be safe.\n\n"
+                "A crash report was saved to:\n%s\n\n"
+                "Please attach that file (or use \"Export diagnostics\" on the "
+                "Configuration tab) when reporting this." % where)
+        except tk.TclError:
+            pass
 
     # ---------------------------------------------------------------- UI ---- #
     def _build_ui(self):
@@ -1814,12 +2602,35 @@ class ArkAPLauncher(tk.Tk):
         self.theme_toggle_btn.pack(side="right", padx=(0, 8))
         Tooltip(self.theme_toggle_btn, "Switch between light and dark mode.")
 
-        self.update_check_btn = ttk.Button(header_row, text="Check for Updates",
+        # "Check for Updates" sits in the same warn_bg/warn_border halo the Save button
+        # uses (see save_btn_halo), but this one only lights up when a release newer than
+        # the user's last-acknowledged version is detected; clicking acknowledges it and
+        # the halo goes back to blending into the header. The frame is always present at
+        # the same size (thickness 1, just recoloured) so toggling never shifts the header.
+        self.update_btn_halo = tk.Frame(header_row, background=self.theme["bg"],
+                                        highlightbackground=self.theme["bg"],
+                                        highlightthickness=1)
+        self.update_btn_halo.pack(side="right", padx=(0, 8))
+        self._update_highlight_on = False
+        self.update_check_btn = ttk.Button(self.update_btn_halo, text="Check for Updates",
                                             command=self._on_check_for_updates)
-        self.update_check_btn.pack(side="right", padx=(0, 8))
+        self.update_check_btn.pack(padx=2, pady=2)
+
+        # Badge shown to the LEFT of the button when a silent background check (see
+        # _start_background_update_check) finds a newer release. Packed after the
+        # button so it sits on the button's left. Kept always-packed with empty
+        # text rather than pack/pack_forget, so showing it doesn't shift the other
+        # header buttons. Its own warm-gold colour (update_badge_fg) reads as a
+        # secondary nudge, not an error - brighter/more saturated than status_info
+        # but not the loud red of status_fail.
+        self.update_badge_label = ttk.Label(header_row, text="", foreground=self.theme["update_badge_fg"],
+                                             font=(self._header_font_family or "Segoe UI", 12, "bold"))
+        self.update_badge_label.pack(side="right", padx=(0, 4))
+        Tooltip(self.update_badge_label, "A newer version is available - click Check for Updates.")
         Tooltip(self.update_check_btn,
                 "Check GitHub for a newer launcher release (current version: %s). "
-                "Only runs when you click this - never automatically." % APP_VERSION)
+                "Also checked silently once on launch; clicking always does a fresh "
+                "check." % APP_VERSION)
 
         header_font_family = self._register_header_font()
         title_row = ttk.Frame(header_row)
@@ -1902,9 +2713,11 @@ class ArkAPLauncher(tk.Tk):
             canvas.itemconfigure(inner_id, width=e.width)
         canvas.bind("<Configure>", _on_canvas_resize)
 
+        # Claim the global wheel binding only while the pointer is over this canvas, so the
+        # Setup Status tab's own scrollable canvas (same pattern) doesn't fight over it.
         def _on_wheel(e):
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_wheel)
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
 
         # Install reminder banner - dismissible, points at the Server Install tab.
         self.reminder_banner = tk.Frame(inner, background=self.theme["warn_bg"],
@@ -2031,8 +2844,10 @@ class ArkAPLauncher(tk.Tk):
                                    ).grid(row=1, column=1, sticky="e")
 
                 self._entries[key] = entry_widget
-                if key in PLACEHOLDER_EXAMPLES and kind in ("folder", "file"):
-                    self._register_placeholder(key, entry_widget, PLACEHOLDER_EXAMPLES[key])
+                example = (PLACEHOLDER_EXAMPLES.get(key) if kind in ("folder", "file")
+                           else CONNECTOR_PLACEHOLDERS.get(key))
+                if example:
+                    self._register_placeholder(key, entry_widget, example)
                 if key == "SERVER_ROOT":
                     entry_widget.bind("<FocusOut>", self._on_server_root_focus_out, add="+")
                 if key == "CLUSTERDIR":
@@ -2059,6 +2874,12 @@ class ArkAPLauncher(tk.Tk):
                     copy_btn.pack(side="left")
                     Tooltip(copy_btn, "This is the command you'll type in once spawned in "
                             "the server to connect to archipelago.")
+                    port_btn = ttk.Button(crow, text="Copy port",
+                                           command=self._copy_port)
+                    port_btn.pack(side="left", padx=(6, 0))
+                    Tooltip(port_btn, "Copies just the port number from the server field "
+                            "(the digits after the colon) - handy for the connector and "
+                            "for firewall/port-forward entries.")
 
         self._build_config_upload_section(inner)
 
@@ -2075,8 +2896,12 @@ class ArkAPLauncher(tk.Tk):
             ("Open Plugins folder",    self.open_plugins),
             ("Open Game.ini folder",   self.open_gameini_folder),
             ("Open SERVER_ROOT",       self.open_server_root),
+            ("Open ClusterDir folder", self.open_cluster_dir),
         ]:
-            ttk.Button(qrow, text=text, command=cmd).pack(side="left", padx=3, pady=2)
+            btn = ttk.Button(qrow, text=text, command=cmd)
+            btn.pack(side="left", padx=3, pady=2)
+            if text == "Open ClusterDir folder":
+                Tooltip(btn, "Opens the cluster data folder (ClusterDir) in Explorer.")
 
         rrow = ttk.Frame(q)
         rrow.pack(fill="x")
@@ -2084,6 +2909,17 @@ class ArkAPLauncher(tk.Tk):
             ttk.Button(rrow, text=text,
                        command=lambda b=batname: self.run_bat(b)
                        ).pack(side="left", padx=3, pady=2)
+
+        # Sits where "Run reset_ark_test" / "Run apply_server_config" used to, on the same
+        # row as the other Run buttons.
+        patch_gi_btn = ttk.Button(rrow, text="Patch Game.ini for randomized creatures",
+                                  command=self.patch_game_ini_for_randomized_dinos)
+        patch_gi_btn.pack(side="left", padx=3, pady=2)
+        Tooltip(patch_gi_btn,
+                "Applies the plugin's ipc\\%s into your Game.ini (backed up first) so "
+                "randomized creatures take effect - the automated version of copying that "
+                "block in by hand. Stop the ARK server first." % GAME_INI_FRAGMENT_NAME,
+                wraplength=520)
 
         # New-seed reset controls. These replace the old "Delete session.json" button,
         # which only cleared the AP->game direction (session.json) and left the outgoing
@@ -2113,9 +2949,25 @@ class ArkAPLauncher(tk.Tk):
         act.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(act, text="Back up each file (.bak) before writing",
                         variable=self.backup_var).pack(side="left")
-        ttk.Button(act, text="Save", command=self.on_save).pack(side="right", padx=3)
+        # Save sits in a thin warn_bg/warn_border frame - the same pale yellow as the
+        # header's "make sure to save!" hint and the install reminder banner, so the
+        # reminder and the button it points at read as one thing. A frame rather than a
+        # styled button because ttk's "vista" engine ignores background on TButton.
+        self.save_btn_halo = tk.Frame(act, background=self.theme["warn_bg"],
+                                      highlightbackground=self.theme["warn_border"],
+                                      highlightthickness=1)
+        self.save_btn_halo.pack(side="right", padx=3)
+        ttk.Button(self.save_btn_halo, text="Save", command=self.on_save
+                   ).pack(padx=2, pady=2)
         ttk.Button(act, text="Reload from files",
                    command=lambda: self.load_from_files()).pack(side="right", padx=3)
+        export_btn = ttk.Button(act, text="Export diagnostics",
+                                command=self.export_diagnostics)
+        export_btn.pack(side="right", padx=3)
+        Tooltip(export_btn,
+                "Bundle ArkAP_debug.log, a Setup Status summary, a password-redacted copy "
+                "of your config, and the crash log (if any) into one zip on your Desktop - "
+                "drag it into Discord or a GitHub issue when asking for help.")
 
         # Status / report log ---------------------------------------------------
         self.log = tk.Text(bottom, height=7, wrap="word", state="disabled",
@@ -2409,34 +3261,22 @@ class ArkAPLauncher(tk.Tk):
         plug = ttk.LabelFrame(wrap, text="Install ArkAP Plugin", padding=(8, 6))
         plug.pack(fill="x", pady=(8, 0))
         ttk.Label(plug, wraplength=640, justify="left",
-                  text="Installs the ArkAP plugin into "
-                       "<SERVER_ROOT>\\ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins\\ArkAP. "
-                       "ArkApi must already be installed in Win64 first. Point the source "
-                       "at your unzipped ArkAP_plugin folder (the one containing "
-                       "ArkAP\\ArkAP.dll); an existing ArkAP.config.json is kept."
+                  text="Downloads the latest ArkAP plugin from GitHub and installs it into "
+                       "<SERVER_ROOT>\\ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins\\ArkAP - "
+                       "no manual download/unzip needed. ArkApi must already be installed in "
+                       "Win64 first. An existing ArkAP.config.json is kept on upgrade. If the "
+                       "automated download ever fails, or you want a specific older version, "
+                       "use \"Manual downloads\" below."
                   ).pack(anchor="w")
-        srcrow = ttk.Frame(plug)
-        srcrow.pack(fill="x", pady=(4, 0))
-        srcrow.columnconfigure(0, weight=1)
-        ttk.Label(srcrow, text="Plugin source folder (unzipped ArkAP_plugin):").grid(
-            row=0, column=0, columnspan=2, sticky="w")
-        self._plugin_src_var = tk.StringVar(value=self._plugin_src_dir)
-        src_entry = ttk.Entry(srcrow, textvariable=self._plugin_src_var)
-        src_entry.grid(row=1, column=0, sticky="ew", padx=(0, 6))
-        ttk.Button(srcrow, text="Browse...", width=10,
-                   command=self._browse_plugin_src).grid(row=1, column=1, sticky="e")
-        Tooltip(src_entry,
-                "The folder you unzipped ArkAP_plugin.zip into - it must contain an "
-                "ArkAP\\ subfolder with ArkAP.dll. Left blank, the launcher auto-detects "
-                "it next to the launcher / in Downloads when you click Install Plugin.")
         pbtnrow = ttk.Frame(plug)
         pbtnrow.pack(fill="x", pady=(6, 0))
         self.install_plugin_btn = ttk.Button(pbtnrow, text="Install Plugin",
                                               command=self.on_install_plugin)
         self.install_plugin_btn.pack(side="left", padx=3, pady=2)
         Tooltip(self.install_plugin_btn,
-                "Copy the plugin files into the ArkApi Plugins folder under SERVER_ROOT. "
-                "Requires SERVER_ROOT set and ArkApi already installed in Win64.")
+                "Download the latest ArkAP_Plugin.zip from GitHub and install it into the "
+                "ArkApi Plugins folder under SERVER_ROOT. Requires SERVER_ROOT set and ArkApi "
+                "already installed in Win64. Your ArkAP.config.json is kept on upgrade.")
 
         # Manual downloads (ArkConnector still isn't automated) -------------------
         ext = ttk.LabelFrame(wrap, text="Manual downloads (not automated but you'll need the YAML and .apworld from here also should only be used if something goes wrong in the launcher)", padding=(8, 6))
@@ -2468,7 +3308,7 @@ class ArkAPLauncher(tk.Tk):
         top = ttk.Frame(wrap)
         top.pack(fill="x")
         ttk.Label(top, text="Setup Status", font=("Segoe UI", 11, "bold")).pack(side="left")
-        ttk.Button(top, text="Re-check", command=self._refresh_setup_status
+        ttk.Button(top, text="Re-check", command=self._recheck_setup_status
                    ).pack(side="right")
 
         ttk.Label(wrap, foreground=self.theme["subtle_fg"], wraplength=640, justify="left",
@@ -2478,10 +3318,27 @@ class ArkAPLauncher(tk.Tk):
                        "a ✗."
                   ).pack(anchor="w", pady=(4, 8))
 
+        # Scrollable list of checks - same Canvas + Scrollbar pattern as the Configuration
+        # tab, since the check rows grow past the visible area (cluster folders, connector.ini,
+        # plugin mode, component-version advisories, ...).
         items_wrap = ttk.Frame(wrap)
         items_wrap.pack(fill="both", expand=True)
-        self.status_items_frame = ttk.Frame(items_wrap)
-        self.status_items_frame.pack(fill="both", expand=True, anchor="n")
+        canvas = tk.Canvas(items_wrap, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
+        vsb = ttk.Scrollbar(items_wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self.status_items_frame = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=self.status_items_frame, anchor="nw")
+        self.status_items_frame.bind(
+            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
 
     def _arkapi_win64_dir(self):
         root = self.get("SERVER_ROOT")
@@ -2522,22 +3379,27 @@ class ArkAPLauncher(tk.Tk):
             "label": "Cluster folders exist (CLUSTERDIR / SAVESROOT / BACKUPROOT)",
             "state": "ok" if ok else "fail",
             "detail": detail,
-            "hint": "Set the Cluster paths on the Configuration tab, then re-run Server "
-                    "Install -> Install ARK Server (it creates them), or create them by "
-                    "hand. A missing cluster folder makes the server hang on launch with "
-                    "no error.",
+            "hint": "The field has a path but nothing is there. Usual causes: the folder "
+                    "was never created (SteamCMD does not create any of these), or it "
+                    "was renamed/moved/deleted after the path was saved - the saved path "
+                    "keeps looking right either way. Fix: Configuration tab -> \"Create "
+                    "%s folders\" creates whichever are missing, at the exact paths "
+                    "shown above (existing folders are left untouched); or create the "
+                    "folder by hand and hit Re-check. A missing cluster folder makes the "
+                    "server hang on launch with no error."
+                    % CLUSTER_ROOT_DIRNAME,
         })
 
-        # BattlEye is only ever turned off via the -NoBattlEye launch flag inside
-        # start_ase_server.bat - there's no persisted file/registry setting to check
-        # once the server isn't running, so this is deliberately informational rather
-        # than a real pass/fail (a "silent" check here would just be guessing).
+        # BattlEye isn't a persisted setting, but it doesn't need to be: the only way
+        # this launcher ever starts the server is start_ase_server.bat, which passes
+        # -NoBattlEye unconditionally (no flag, no branch). So it's guaranteed by the
+        # launch line rather than unknown - a checkmark, not an info icon.
         items.append({
             "label": "BattlEye disabled",
-            "state": "info",
-            "detail": "Not a persisted setting, so this can't be checked directly.",
-            "hint": "Set automatically by start_ase_server.bat (-NoBattlEye) every time "
-                    "you launch via Quick Launch - we gotchu fam",
+            "state": "ok",
+            "detail": "Always disabled by start_ase_server.bat (-NoBattlEye is passed "
+                      "on every launch).",
+            "hint": "",
         })
 
         plugin_dir = self._arkap_plugin_dir()
@@ -2558,15 +3420,43 @@ class ArkAPLauncher(tk.Tk):
                     "(\"offline\" self-randomizes locally for solo hook testing).",
         })
 
-        ok, detail = check_connector_filled(self.get("connector_ini"))
+        ok, detail = check_scripts_sourced(self._scripts_dir)
+        items.append({
+            "label": "Server scripts read their paths from paths.cmd",
+            "state": "ok" if ok else "fail",
+            "detail": detail,
+            "hint": "A script left over from an older launcher keeps its own SERVER_ROOT "
+                    "and ignores what Save writes, so the server starts against the "
+                    "wrong folder while this tab's paths all look right. Close the "
+                    "launcher, delete the offending file from the ArkServerScripts "
+                    "folder and reopen - the current version is unpacked from the exe.",
+        })
+
+        # Reads the FILE, not the Connector fields - so a user with server/slot/ipc_dir
+        # all filled in still fails this when no connector.ini exists to write them to
+        # (Save logs "connector.ini: not found - skipped" and the fields only ever reach
+        # the launcher's own JSON). Two different failures, so two different hints -
+        # telling someone to "fill in the fields and Save" when the fields ARE filled is
+        # what sent them in circles.
+        ini_path = self.get("connector_ini")
+        ok, detail = check_connector_filled(ini_path)
         items.append({
             "label": "connector.ini filled in (server / slot / ipc_dir)",
             "state": "ok" if ok else "fail",
             "detail": detail,
-            "hint": "Fill in server / slot / ipc_dir in the Connector group on the "
-                    "Configuration tab, then Save.",
+            "hint": ("Point Connector tab in configurations  "
+                     "make sure you've set your server (eg. archipelago.gg:38281) "
+                     "and your slot name and password if room has one. also make sure ipc_dir has been set"
+                     if not (ini_path and os.path.isfile(ini_path)) else
+                     "Fill in server / slot / ipc_dir in the Connector group on the "
+                     "Configuration tab, then Save."),
         })
 
+        # Component/launcher version rows (yellow "i" when newer, green check for the
+        # launcher when up to date - never a ✗) computed off the main thread against the
+        # GitHub releases; empty until that check comes back. See
+        # _component_version_check_worker.
+        items.extend(getattr(self, "_component_advisories", []))
         return items
 
     def _refresh_setup_status(self):
@@ -2577,7 +3467,8 @@ class ArkAPLauncher(tk.Tk):
             "fail": self.theme["status_fail"],
             "info": self.theme["status_info"],
         }
-        for item in self._gather_setup_status():
+        items = self._gather_setup_status()
+        for item in items:
             icon = self.STATUS_ICONS[item["state"]]
             color = state_colors[item["state"]]
             row = ttk.Frame(self.status_items_frame)
@@ -2600,6 +3491,66 @@ class ArkAPLauncher(tk.Tk):
             elif item["state"] == "info" and item.get("hint"):
                 ttk.Label(textcol, text=item["hint"], foreground=self.theme["note_fg"],
                           wraplength=560, justify="left").pack(anchor="w")
+            # Clickable release link for the component-version advisories.
+            if item.get("link"):
+                link = ttk.Label(textcol, text=item["link"],
+                                 foreground=self.theme["status_info"], cursor="hand2")
+                link.pack(anchor="w")
+                link.bind("<Button-1>", lambda _e, u=item["link"]: webbrowser.open(u))
+
+        # Keep the tab-bar symbol in step with whatever's on screen now, so it's right
+        # regardless of what triggered this refresh (Re-check, tab switch, theme toggle,
+        # or the async component check landing).
+        self._update_status_tab_indicator(aggregate_status_state(items))
+
+    def _make_status_glyph(self, state):
+        """A tiny colored symbol (green check / amber "i" / red X) for the Setup Status
+        tab label, drawn pixel-wise so it needs no font or image asset and can be recolored
+        to the current theme. Returns a tk.PhotoImage with a transparent background."""
+        size = 14
+        color = {"ok": self.theme["status_ok"], "info": self.theme["status_info"],
+                 "fail": self.theme["status_fail"]}[state]
+        img = tk.PhotoImage(width=size, height=size)
+
+        def block(x, y):  # 2x2 stroke so the symbol reads at this size, clipped to bounds
+            for dx in (0, 1):
+                for dy in (0, 1):
+                    px, py = x + dx, y + dy
+                    if 0 <= px < size and 0 <= py < size:
+                        img.put(color, to=(px, py))
+
+        if state == "fail":            # X
+            for i in range(8):
+                block(3 + i, 3 + i)
+                block(10 - i, 3 + i)
+        elif state == "ok":            # check mark
+            for i in range(4):
+                block(3 + i, 7 + i)    # short arm down-right
+            for i in range(7):
+                block(6 + i, 10 - i)   # long arm up-right
+        else:                          # info "i"
+            block(6, 2)                # dot
+            for y in (5, 7, 9, 11):    # stem
+                block(6, y)
+        return img
+
+    def _update_status_tab_indicator(self, state):
+        """Show the aggregate state as a small colored symbol to the right of the "Setup
+        Status" tab label, so it's visible from every tab. Called on every refresh."""
+        if not hasattr(self, "notebook"):
+            return
+        try:
+            img = self._make_status_glyph(state)
+            self._status_tab_glyphs[state] = img  # keep a ref so Tk doesn't GC it
+            self.notebook.tab(self.tab_status, image=img, compound="right")
+        except (tk.TclError, KeyError):
+            pass
+
+    def _recheck_setup_status(self):
+        """Manual Re-check: redraw the on-disk checks immediately, and re-query the
+        component GitHub releases in the background (which redraws again when it lands)."""
+        self._refresh_setup_status()
+        self._start_component_version_check()
 
     def _on_tab_changed(self, _event=None):
         try:
@@ -2610,6 +3561,68 @@ class ArkAPLauncher(tk.Tk):
             self._refresh_setup_status()
         elif current == str(self.tab_profiles):
             self._update_profile_status()
+
+    # ----------------------------------------------------- Diagnostics export #
+    def _redacted_config_json(self):
+        """The current config JSON as pretty text with the secret fields blanked, or a
+        short note if it can't be read. Reads the file on disk (what's actually saved)."""
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            return "(could not read %s: %s)" % (self.config_path, exc)
+        return json.dumps(redact_config(data), indent=2)
+
+    def export_diagnostics(self):
+        """Bundle the debug log, a Setup Status summary, a redacted config copy, and the
+        crash log (if any) into one zip the user can drag straight into Discord. Secrets
+        (ADMINPASS / SERVERPASS / connector password) are replaced with [REDACTED] - the
+        rest of the config is kept so it's still useful for troubleshooting."""
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        initial_dir = desktop if os.path.isdir(desktop) else base_dir()
+        default_name = "arkap_diagnostics_%s.zip" % time.strftime("%Y%m%d_%H%M%S")
+        dest = filedialog.asksaveasfilename(
+            title="Save diagnostics zip",
+            initialdir=initial_dir, initialfile=default_name,
+            defaultextension=".zip", filetypes=[("Zip archive", "*.zip")])
+        if not dest:
+            return
+
+        # Gather text pieces first so a read error surfaces before we open the zip.
+        summary = format_setup_status_summary(self._gather_setup_status())
+        redacted = self._redacted_config_json()
+        debug_path = self._arkap_debug_log_path()
+        crash_path = crash_log_path()
+        included = []
+        try:
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("setup_status.txt", summary)
+                zf.writestr("arkap_launcher_config.redacted.json", redacted)
+                if debug_path and os.path.isfile(debug_path):
+                    zf.write(debug_path, "ArkAP_debug.log")
+                    included.append("ArkAP_debug.log")
+                else:
+                    zf.writestr("ArkAP_debug.log.txt",
+                                "(no ArkAP_debug.log found - expected at %s)"
+                                % (debug_path or "unknown; set SERVER_ROOT/PLUGINS_DIR"))
+                if os.path.isfile(crash_path):
+                    zf.write(crash_path, CRASH_LOG_FILENAME)
+                    included.append(CRASH_LOG_FILENAME)
+        except OSError as exc:
+            messagebox.showerror("Export diagnostics",
+                                 "Could not write the diagnostics zip:\n\n%s" % exc)
+            return
+
+        extra = (" It also includes: %s." % ", ".join(included)) if included else ""
+        messagebox.showinfo(
+            "Export diagnostics",
+            "Diagnostics saved to:\n\n%s\n\nIt contains a Setup Status summary and a "
+            "redacted copy of your config (passwords removed).%s\n\nDrag this file into "
+            "Discord or attach it to a GitHub issue when asking for help." % (dest, extra))
+        try:
+            os.startfile(os.path.dirname(dest))  # noqa: S606 - open the folder in Explorer
+        except OSError:
+            pass
 
     # ------------------------------------------------------------ Debug Log #
     def _build_debug_log_tab(self, parent):
@@ -2819,22 +3832,20 @@ class ArkAPLauncher(tk.Tk):
                        "Folders that already exist are left untouched, and a path you "
                        "set yourself is created where you put it rather than moved."),
 
-            ("bullet", "2. Same tab -> click \"Install ArkServerApi\". This downloads the "
+            ("bullet", "2. Server install tab -> click \"Install ArkServerApi\". This downloads the "
                        "latest ArkApi release and extracts it into "
                        "ShooterGame\\Binaries\\Win64 for you - no manual unzipping. When "
                        "it's done, Win64 contains version.dll and an ArkApi\\ folder. "
                        "Note: BattlEye must be OFF for ArkApi to work, but "
                        "start_ase_server already disables it for you - We gotchu fam."),
 
-            ("bullet", "3. Download ArkAP_plugin.zip (see \"Manual downloads\" at the "
-                       "bottom of the Server Install tab) and unzip it somewhere. Then in "
-                       "the \"Install ArkAP Plugin\" box, point \"Plugin source folder\" at "
-                       "the unzipped folder (the one containing ArkAP\\ArkAP.dll) and click "
-                       "\"Install Plugin\". It copies the plugin into "
-                       "Win64\\ArkApi\\Plugins\\ArkAP for you. Leave the source box blank "
-                       "and it will try to auto-find the download next to the launcher or "
-                       "in your Downloads folder. Upgrading later keeps your existing "
-                       "ArkAP.config.json."),
+            ("bullet", "3. Same tab -> in the \"Install ArkAP Plugin\" box, click \"Install "
+                       "Plugin\". It downloads the latest ArkAP_Plugin.zip straight from "
+                       "GitHub and extracts it into Win64\\ArkApi\\Plugins\\ArkAP for you - "
+                       "no manual download/unzip. Progress shows in the console box. "
+                       "Upgrading later keeps your existing ArkAP.config.json. (If the "
+                       "download ever fails or you want a specific older version, use "
+                       "\"Manual downloads\" at the bottom of the tab instead.)"),
 
             ("bullet", "4. Configuration tab -> in the Paths group, click \"Scan for "
                        "paths\", or Browse to set paths by hand. "                      
@@ -2862,7 +3873,7 @@ class ArkAPLauncher(tk.Tk):
                        "the launcher stays usable while scanning."),
 
             ("bullet", "5. Setup Status tab -> click Re-check and confirm everything shows "
-                       "a checkmark before going further. Anything showing an X has a hint "
+                       "a checkmark before going further (you'll have an X for connector, we'll address this in step 6). Anything showing an X has a hint "
                        "telling you what to fix. This is the fastest way to catch a missed "
                        "step before you start troubleshooting in-game."),
 
@@ -2887,7 +3898,7 @@ class ArkAPLauncher(tk.Tk):
                        "name (default: ArchipelagoSolo). Join, spawn your character, open "
                        "in-game chat, and paste the connection command from step 7."),
 
-            ("bullet", "10. You should be good to go! Quick test: level up and see if a "
+            ("bullet", "10. You should be good to go! (if randomize dino spawns enabled see bottom of instuctions)Quick test: level up and see if a "
                        "check goes out. To test check-in: in the host's server console (the "
                        "ArchipelagoServer window, or the web room's command box) run "
                        "/send ARCHIPELAGONAME Engram: Canteen - within a few seconds it "
@@ -2905,14 +3916,26 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Server Install - the three installers, in order: \"Install ARK "
                        "Server\" (SteamCMD, ~18gb), \"Install ArkServerApi\" (downloads + "
                        "extracts the latest ArkApi into Win64), and \"Install Plugin\" "
-                       "(copies the ArkAP plugin into ArkApi\\Plugins). \"Manual "
-                       "downloads\" at the bottom is only a fallback if something goes "
-                       "wrong, plus the ArkAP plugin zip and ArkConnector, which still "
-                       "need downloading by hand."),
+                       "(downloads the latest ArkAP_Plugin.zip from GitHub and installs it "
+                       "into ArkApi\\Plugins). \"Manual downloads\" at the bottom is only a "
+                       "fallback if an automated download fails (or you want a specific "
+                       "older plugin version), plus the ArkConnector, which still needs "
+                       "downloading by hand."),
             ("bullet", "Setup Status - a read-only checklist (server installed / ArkApi "
                        "installed / plugin installed / plugin mode / connector.ini) with "
                        "hints for anything showing an X. Click Re-check after fixing "
-                       "something."),
+                       "something. It also shows advisory rows (a yellow \"i\", not a red "
+                       "X) for things that are worth knowing but aren't broken - the "
+                       "BattlEye note, and \"update available\" when a newer ArkServerApi "
+                       "or ArkAP plugin release exists than the one you installed (with a "
+                       "link to the release). An older component version isn't a failure, "
+                       "so it never shows an X."),
+            ("bullet", "   The Setup Status tab has a small coloured symbol next to its "
+                       "name in the tab bar, so you can see your overall status from any "
+                       "tab without opening it: a green check = everything passes, a "
+                       "yellow \"i\" = no failures but at least one advisory (BattlEye, or "
+                       "a newer component version), a red X = at least one hard failure. "
+                       "It updates whenever the checks re-run."),
             ("bullet", "Debug Log - live view of ArkAP_debug.log with a search box, "
                        "\"Jump to latest\", and \"Refresh\". Check here first when checks "
                        "or items aren't coming through."),
@@ -2941,20 +3964,25 @@ class ArkAPLauncher(tk.Tk):
 
             ("h1", "Quick launch (bottom of the Configuration tab)"),
             ("bullet", "Open ipc folder / Open Plugins folder / Open Game.ini folder / "
-                       "Open SERVER_ROOT - open the matching folder in Explorer."),
+                       "Open SERVER_ROOT / Open ClusterDir folder - open the matching "
+                       "folder in Explorer."),
             ("bullet", "Run start_ase_server - launches the main ARK server."),
             ("bullet", "Run switch_map - swaps the active map (optionally backing up "
                        "first)."),
-            ("bullet", "Run reset_ark_test - wipes the test cluster/map save data."),
+            ("bullet", "Patch Game.ini for randomized creatures - applies the plugin's "
+                       "ipc\\game_ini_fragment.txt into your Game.ini (backed up first) so "
+                       "randomized creatures take effect. Stop the ARK server first."),
             ("bullet", "Reset AP data (keep world save) - deletes every Archipelago "
                        "tracking file the plugin and connector generate (both incoming "
                        "items AND outgoing checks). Note: if the character/world isn't "
                        "also reset, level/inventory checks re-send immediately."),
             ("bullet", "Full reset for new seed - does the above AND backs up + wipes the "
                        "world save (SavedArks, your per-map saves and the cluster tribute "
-                       "data). Backups are moved aside with a timestamp, never deleted. "
-                       "Use this when joining a new seed. Stop the ARK server (and the "
-                       "connector) first."),
+                       "data). It also removes the randomized-creatures block from Game.ini "
+                       "if this launcher added one (backed up first), so a fresh seed "
+                       "doesn't inherit the previous seed's dino randomization. Backups are "
+                       "moved aside with a timestamp, never deleted. Use this when joining a "
+                       "new seed. Stop the ARK server (and the connector) first."),
             ("bullet", "   It no longer just says \"done\" and hopes. Every backup is "
                        "checked to confirm it actually received files (an empty one is "
                        "flagged, not counted), then it re-scans every live save location "
@@ -2964,8 +3992,6 @@ class ArkAPLauncher(tk.Tk):
                        "happen, and you should run tools\\diagnose_reset.bat before "
                        "starting the server. Only a run with no problems AND at least one "
                        "save actually wiped reports success."),
-            ("bullet", "Run apply_server_config - re-applies the saved config to the "
-                       "install."),
 
             ("h1", "Uploading your own Game.ini / GameUserSettings.ini"),
             ("bullet", "Configuration tab -> \"Upload server config files\" (below the "
@@ -2994,13 +4020,39 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Save only rewrites the one matching line for each field in each "
                        "file - everything else in the script is left untouched."),
 
+            ("h1", "Reporting a problem (diagnostics & crash log)"),
+            ("bullet", "Export diagnostics - a button next to Save / Reload on the "
+                       "Configuration tab. It bundles ArkAP_debug.log, a text summary of "
+                       "the Setup Status checks, a copy of your config with the passwords "
+                       "removed (ADMINPASS, SERVERPASS and the connector password show as "
+                       "[REDACTED] - everything else is kept so it's still useful), and "
+                       "the crash log if there is one, into a single .zip. It saves to "
+                       "your Desktop by default (you pick where) and opens the folder when "
+                       "it's done. Drag that zip straight into Discord or attach it to a "
+                       "GitHub issue when asking for help - it's the fastest way to get "
+                       "diagnosed."),
+            ("bullet", "Crash log - if the launcher ever hits an unexpected error it shows "
+                       "a \"Something went wrong\" message and writes the full details to "
+                       "arkap_launcher_crash.log, saved next to the launcher's .exe (the "
+                       "same folder as arkap_launcher_config.json). It's kept across "
+                       "restarts (new crashes are appended, with a size cap so it can't "
+                       "grow forever), so it survives even if the app crashes again before "
+                       "you get to report the first one. When reporting a crash, attach "
+                       "that file - or just use \"Export diagnostics\", which already "
+                       "includes it."),
+
             ("h1", "Other Information"),
             ("bullet", "If you want to restart your world for a new Archipelago seed, "
                        "click \"Full reset for new seed\" under Quick Launch (stop the ARK "
                        "server and the connector first)."),
-            ("bullet", "If you randomized dinos, find the txt file for it by opening the "
-                       "ipc folder under Quick Launch: game_ini_fragment.txt then paste it at "
-                       "the top of your Game.ini file."),
+            ("bullet", "If you randomized dinos, stop the ARK server and click \"Patch "
+                       "Game.ini for randomized creatures\" under Quick Launch. It applies "
+                       "the plugin's ipc\\game_ini_fragment.txt into your Game.ini for you "
+                       "(backing it up first, and merging into an existing "
+                       "[/script/shootergame.shootergamemode] section rather than "
+                       "duplicating it) - no more copy-pasting it by hand. Restart the "
+                       "server afterwards. (The fragment only exists once you've connected "
+                       "to the server at least once on a randomized seed.)"),
         
          
         ]
@@ -3142,18 +4194,26 @@ class ArkAPLauncher(tk.Tk):
         name = data.get(THEME_KEY, "light")
         return name if name in THEMES else "light"
 
-    def _write_theme_pref(self, name):
+    def _write_config_key(self, key, value, label):
+        """Update ONE key in the config JSON, leaving everything else in the file
+        alone. For the launcher preferences that persist the moment they change
+        instead of waiting for Save (theme, active profile)."""
         try:
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
             except (OSError, ValueError):
                 data = {}
-            data[THEME_KEY] = name
+            data[key] = value
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError as exc:
-            self._log("! Could not save theme preference: %s" % exc)
+            self._log("! Could not save %s: %s" % (label, exc))
+
+    def _write_theme_pref(self, name):
+        self._write_config_key(THEME_KEY, name, "theme preference")
 
     def _theme_toggle_label(self):
         """Button text names the destination state (what clicking it does),
@@ -3258,6 +4318,19 @@ class ArkAPLauncher(tk.Tk):
         # example paths need re-tagging under the new theme's placeholder colour.
         try:
             self._tag_instruction_examples()
+        except tk.TclError:
+            pass
+
+        try:
+            self.save_btn_halo.configure(background=t["warn_bg"],
+                                         highlightbackground=t["warn_border"])
+        except tk.TclError:
+            pass
+
+        # Reapplies under the new theme - _set_update_highlight reads self.theme, so this
+        # repaints the halo to whichever state (lit warn colours / blended-in bg) it holds.
+        try:
+            self._set_update_highlight(self._update_highlight_on)
         except tk.TclError:
             pass
 
@@ -3498,22 +4571,38 @@ class ArkAPLauncher(tk.Tk):
         download) so it's still auto-located from the usual sibling folders."""
         b = base_dir()
         cwd = os.getcwd()
-        parent = os.path.dirname(b)
 
-        dst_root, extracted, errors = extract_bundled_scripts()
+        dst_root, extracted, refreshed, errors, migrated = extract_bundled_scripts()
         self._scripts_dir = os.path.normpath(dst_root)
         self._scripts_extracted = extracted
+        self._scripts_refreshed = refreshed
+        self._scripts_migrated_vars = migrated
         self._scripts_extract_errors = errors
 
-        # connector.ini: first existing candidate.
+        # connector.ini: first existing candidate, searched ONLY in the launcher's own
+        # folder and its immediate parent - i.e. the documented layout, where
+        # ArkConnector\ is unzipped beside the launcher folder.
+        #
+        # This used to walk 5 parents up, which was added purely to accommodate the dev
+        # tree (the exe runs from dist\<name>\ while ArkConnector\ sits 3 levels up beside
+        # the source). That reach is what leaked real data into shipped builds: a freshly
+        # built exe launched from dist\ found the DEVELOPER's connector.ini and pulled
+        # server=archipelago.gg:51357 / slot=Avocado into the Connector fields, which
+        # autosave then wrote into the config + profiles JSON sitting next to the exe.
+        # Reaching that far also means an end user's launcher probes unrelated folders
+        # far outside its own install. One level covers every real layout.
+        #
+        # The bug the 5-level walk was originally justified by - "Save silently dropped
+        # every Connector value" when no ini was found - is fixed on its own merits in
+        # _apply_ini(), which now logs loudly and says how to set the path.
         ini = saved.get("connector_ini", "")
         if not ini or not os.path.isfile(ini):
-            cand_ini = [
-                os.path.join(b, "connector.ini"),
-                os.path.join(b, "ArkConnector", "connector.ini"),
-                os.path.join(parent, "ArkConnector", "connector.ini"),
-                os.path.join(cwd, "ArkConnector", "connector.ini"),
-            ]
+            roots = [b, cwd]
+            up = os.path.dirname(b)
+            if up and up not in roots:
+                roots.append(up)
+            cand_ini = [os.path.join(b, "connector.ini")]
+            cand_ini += [os.path.join(r, "ArkConnector", "connector.ini") for r in roots]
             for p in cand_ini:
                 if p and os.path.isfile(p):
                     ini = os.path.normpath(p)
@@ -3584,6 +4673,15 @@ class ArkAPLauncher(tk.Tk):
         self._log("  Scripts folder (bundled): %s" % (scripts or "(not found)"))
         if getattr(self, "_scripts_extracted", None):
             self._log("  Extracted bundled scripts: %s" % ", ".join(self._scripts_extracted))
+        if getattr(self, "_scripts_refreshed", None):
+            self._log("  Replaced %s - these were from before paths.cmd existed, so they "
+                      "held their own copy of SERVER_ROOT and ignored anything Save wrote. "
+                      "The previous version of each is kept alongside it as %s."
+                      % (", ".join(self._scripts_refreshed), PRE_PATHS_BACKUP_SUFFIX))
+        if getattr(self, "_scripts_migrated_vars", None):
+            self._log("  Carried %s out of those old scripts into paths.cmd - check them "
+                      "on the Configuration tab before starting the server."
+                      % ", ".join(self._scripts_migrated_vars))
         if getattr(self, "_scripts_extract_errors", None):
             for err in self._scripts_extract_errors:
                 self._log("  ! Could not extract %s" % err)
@@ -3599,13 +4697,22 @@ class ArkAPLauncher(tk.Tk):
     def collect_values(self):
         values = {key: self.get(key) for key in self.vars}
         values[REMINDER_HIDE_KEY] = self._hide_install_reminder
-        if hasattr(self, "_plugin_src_var"):
-            self._plugin_src_dir = self._plugin_src_var.get().strip()
-        values[PLUGIN_SRC_KEY] = self._plugin_src_dir
         return values
 
     def _save_json(self, values):
+        # Merged onto whatever is already in the file rather than replacing it: the
+        # config JSON also carries keys that are written outside this flow and are not
+        # in collect_values() (THEME_KEY, ACTIVE_PROFILE_KEY - see _write_config_key),
+        # and a wholesale overwrite would drop them on every Save.
         try:
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    existing.update(values)
+                    values = existing
+            except (OSError, ValueError):
+                pass
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(values, f, indent=2)
             return True, self.config_path
@@ -3636,6 +4743,9 @@ class ArkAPLauncher(tk.Tk):
             # user gets to their first Save there is always a profile behind these
             # values. Retried here only for the case where that startup write failed.
             self._ensure_default_profile()
+            # Save is also what commits these values into the ACTIVE profile, so the
+            # Configuration tab and the profile behind it can't drift apart.
+            self._save_active_profile()
         else:
             self._log("! Could not write JSON: %s" % info)
 
@@ -3696,7 +4806,14 @@ class ArkAPLauncher(tk.Tk):
     def _apply_ini(self, values):
         path = self.get("connector_ini")
         if not path or not os.path.isfile(path):
-            self._log("connector.ini: not found - skipped.")
+            # Loud, not "skipped": everything the user typed into the Connector group
+            # goes nowhere in this case, and the old one-liner read like a harmless
+            # note about an optional file.
+            self._log("! connector.ini: %s - your Connector values (server / slot / "
+                      "ipc_dir / ...) were NOT written anywhere the connector reads."
+                      % ("no file set" if not path else "not found at %s" % path))
+            self._log("  Fix: set \"connector.ini file\" in the Locations group to the "
+                      "connector.ini in your ArkConnector folder, then Save again.")
             return
         text, enc = read_text(path)
         original = text
@@ -3721,8 +4838,8 @@ class ArkAPLauncher(tk.Tk):
     def _current_profile_snapshot(self):
         """Every Configuration-tab field, keyed the same as self.vars - i.e. the
         Locations/Paths/Network/Connector/Cluster groups (paths, network, cluster,
-        connector settings). Deliberately does NOT include REMINDER_HIDE_KEY /
-        PLUGIN_SRC_KEY - those are launcher preferences, not part of a server config."""
+        connector settings). Deliberately does NOT include REMINDER_HIDE_KEY - that's a
+        launcher preference, not part of a server config."""
         return {key: self.get(key) for key in self.vars}
 
     def _current_profile_notes(self):
@@ -3845,7 +4962,7 @@ class ArkAPLauncher(tk.Tk):
         if not self._save_profiles(quiet=True):
             self._profiles.pop(DEFAULT_PROFILE_NAME, None)
             return
-        self._loaded_profile_name = DEFAULT_PROFILE_NAME
+        self._set_active_profile(DEFAULT_PROFILE_NAME)
         self._loaded_profile_values = dict(values)
         self._loaded_profile_notes = ""
         self._refresh_profile_list(select_name=DEFAULT_PROFILE_NAME)
@@ -3890,11 +5007,47 @@ class ArkAPLauncher(tk.Tk):
         self.profile_notes_text.edit_modified(False)
         self._update_profile_status()
 
-    def _on_load_profile(self):
-        name = self.profile_select_var.get()
-        if not name or name not in self._profiles:
-            messagebox.showwarning("ARKIpelago Launcher", "Select a profile to load first.")
+    # ------------------------------------------------- active profile ------ #
+    def _active_profile_name(self):
+        """Which profile Save writes into: whichever the user last created/loaded
+        (restored from ACTIVE_PROFILE_KEY at startup), or DEFAULT_PROFILE_NAME until
+        they pick one."""
+        return self._active_profile or DEFAULT_PROFILE_NAME
+
+    def _set_active_profile(self, name):
+        """Mark `name` as loaded AND remember it across launches (ACTIVE_PROFILE_KEY).
+        Persisted the moment it changes rather than at close, so a crash or a kill from
+        Task Manager can't lose the choice."""
+        self._loaded_profile_name = name
+        if is_autosave_profile(name):
+            # Loadable, but never the active one - the timer rewrites it, so Saving
+            # into it would lose the values within 10 minutes. Whichever profile was
+            # active stays active (and stays on disk), so recovering values from the
+            # autosave doesn't also erase which profile the user was working in.
             return
+        self._active_profile = name
+        self._write_config_key(ACTIVE_PROFILE_KEY, name or "", "active profile")
+
+    def _save_active_profile(self):
+        """Write the current Configuration fields + notes into the active profile.
+        Called from on_save only - loading a profile still changes nothing on disk
+        beyond which profile is active."""
+        name = self._active_profile_name()
+        self._profiles[name] = {"values": self._current_profile_snapshot(),
+                                "notes": self._current_profile_notes()}
+        if not self._save_profiles(quiet=True):
+            return
+        self._set_active_profile(name)
+        self._loaded_profile_values = dict(self._profiles[name]["values"])
+        self._loaded_profile_notes = self._profiles[name]["notes"]
+        self._refresh_profile_list(select_name=name)
+        self._update_profile_status()
+        self._log("Saved into profile \"%s\" (the active profile)." % name)
+
+    def _apply_profile(self, name):
+        """Populate the Configuration fields + notes from a profile and make it the
+        active one. Shared by the Load button and the startup restore, so a profile
+        restored on launch lands in exactly the same state as one loaded by hand."""
         profile = self._profiles[name]
         values = profile.get("values", {})
         for key in self.vars:
@@ -3903,10 +5056,33 @@ class ArkAPLauncher(tk.Tk):
         self.profile_notes_text.delete("1.0", "end")
         self.profile_notes_text.insert("1.0", notes)
         self.profile_notes_text.edit_modified(False)
-        self._loaded_profile_name = name
+        self._set_active_profile(name)
         self._loaded_profile_values = self._current_profile_snapshot()
         self._loaded_profile_notes = notes
         self._update_profile_status()
+
+    def _restore_active_profile(self, saved):
+        """Re-load whichever profile was active when the app last closed, instead of
+        always coming up on DEFAULT_PROFILE_NAME.
+
+        No Save is required afterwards: unlike the Load button (a new, pending choice
+        the user has to confirm with Save), this is the state already persisted on
+        disk - the .bat files and config JSON were written from these very values last
+        session. Nothing is written back here either, so the Profiles tab still shows
+        "matches the saved profile" until something is actually edited."""
+        name = (saved or {}).get(ACTIVE_PROFILE_KEY) or ""
+        if not name or is_autosave_profile(name) or name not in self._profiles:
+            return
+        self._apply_profile(name)
+        self._refresh_profile_list(select_name=name)
+        self._log("Loaded the profile that was active last session: \"%s\"." % name)
+
+    def _on_load_profile(self):
+        name = self.profile_select_var.get()
+        if not name or name not in self._profiles:
+            messagebox.showwarning("ARKIpelago Launcher", "Select a profile to load first.")
+            return
+        self._apply_profile(name)
         self._log("Loaded profile \"%s\" into the Configuration fields." % name)
         messagebox.showinfo(
             "ARKIpelago Launcher",
@@ -3938,7 +5114,7 @@ class ArkAPLauncher(tk.Tk):
         }
         if not self._save_profiles():
             return
-        self._loaded_profile_name = name
+        self._set_active_profile(name)
         self._loaded_profile_values = dict(self._profiles[name]["values"])
         self._loaded_profile_notes = self._profiles[name]["notes"]
         self._refresh_profile_list(select_name=name)
@@ -3969,7 +5145,7 @@ class ArkAPLauncher(tk.Tk):
         }
         if not self._save_profiles():
             return
-        self._loaded_profile_name = name
+        self._set_active_profile(name)
         self._loaded_profile_values = dict(self._profiles[name]["values"])
         self._loaded_profile_notes = self._profiles[name]["notes"]
         self._update_profile_status()
@@ -4012,7 +5188,7 @@ class ArkAPLauncher(tk.Tk):
             self._profiles[name] = self._profiles.pop(new_name)
             return
         if self._loaded_profile_name == name:
-            self._loaded_profile_name = new_name
+            self._set_active_profile(new_name)
         self._refresh_profile_list(select_name=new_name)
         self._update_profile_status()
         self._log("Renamed profile \"%s\" -> \"%s\"." % (name, new_name))
@@ -4045,7 +5221,7 @@ class ArkAPLauncher(tk.Tk):
             # instead of deciding "nothing changed" and leaving the slot gone.
             self._autosave_last_values = None
         if self._loaded_profile_name == name:
-            self._loaded_profile_name = None
+            self._set_active_profile(None)
             self._loaded_profile_values = None
             self._loaded_profile_notes = None
         self._refresh_profile_list()
@@ -4067,6 +5243,20 @@ class ArkAPLauncher(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(cmd)
         self._log("Copied to clipboard: %s" % cmd)
+
+    def _copy_port(self):
+        """Copy just the port from the server field. get() returns "" while the greyed
+        placeholder is showing, so an empty field can never copy the example port."""
+        port = server_port(self.get("server"))
+        if not port:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "No port to copy - set the server field to host:port first "
+                "(for example archipelago.gg:38281).")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(port)
+        self._log("Copied port to clipboard: %s" % port)
 
     # ------------------------------------ SERVER_ROOT auto-detect (broad) -- #
     def _start_auto_detect(self):
@@ -4359,6 +5549,11 @@ class ArkAPLauncher(tk.Tk):
         that's already set - nothing to suggest there."""
         if not cluster_dir or not os.path.isdir(cluster_dir):
             return
+        if is_backup_snapshot_path(cluster_dir):
+            # A CLUSTERDIR inside a snapshot makes every sibling here a snapshot folder
+            # too - including the "offer the expected sibling path anyway" fallback below,
+            # which doesn't go through classify_cluster_folder at all.
+            return
         cluster_dir = os.path.normpath(cluster_dir)
         self._last_cluster_dir_scan = cluster_dir
         parent = os.path.dirname(cluster_dir)
@@ -4442,11 +5637,12 @@ class ArkAPLauncher(tk.Tk):
         self.install_log.configure(state="disabled")
 
     def _any_install_running(self):
-        """True if either the SteamCMD or ArkServerApi install flow is active - they
+        """True if the SteamCMD, ArkServerApi, or ArkAP plugin install flow is active - they
         share the install_log/install_progress/install_status_var widgets, so only one
         may run at a time."""
         return ((self._install_thread is not None and self._install_thread.is_alive())
-                or (self._arkapi_thread is not None and self._arkapi_thread.is_alive()))
+                or (self._arkapi_thread is not None and self._arkapi_thread.is_alive())
+                or (self._plugin_thread is not None and self._plugin_thread.is_alive()))
 
     def on_install_server(self):
         if self._any_install_running():
@@ -4908,6 +6104,8 @@ class ArkAPLauncher(tk.Tk):
         if success:
             q.put(("line",
                    "ArkServerApi installed - found version.dll and ArkApi\\ in Win64\\."))
+            # Record what we just installed so Setup Status can later flag a newer release.
+            q.put(("version", tag))
         else:
             q.put(("line", "! Extraction finished but version.dll / ArkApi\\ were not found "
                             "in:\n%s" % win64))
@@ -4963,6 +6161,9 @@ class ArkAPLauncher(tk.Tk):
                 kind, payload = self._arkapi_queue.get_nowait()
                 if kind == "line":
                     self._install_log(payload)
+                elif kind == "version":
+                    self._write_config_key(ARKAPI_INSTALLED_VERSION_KEY, payload,
+                                           "installed ArkApi version")
                 elif kind == "progress":
                     try:
                         self.install_progress["value"] = payload
@@ -4970,6 +6171,7 @@ class ArkAPLauncher(tk.Tk):
                         pass
                 elif kind == "done":
                     self._on_arkapi_done(payload)
+                    self._start_component_version_check()
                     return
         except queue.Empty:
             pass
@@ -4991,16 +6193,165 @@ class ArkAPLauncher(tk.Tk):
                                   "ArkServerApi install failed. See the log for details.")
 
     # ------------------------------------------------ Launcher self-update - #
-    # Entirely opt-in: nothing here runs unless the user clicks "Check for Updates" in
-    # the header. Checking, downloading, and the confirm-before-updating dialog all use
-    # this app's OWN release repo (UPDATE_REPO), separate from RELEASES_URL /
-    # ARKSERVERAPI_RELEASES_API above, which point at the plugin/connector/ArkApi bundle.
+    # Downloading and the confirm-before-updating dialog are entirely opt-in: nothing
+    # downloads unless the user clicks "Update Now" in that dialog. Checking for a new
+    # version does also happen once, silently, on startup (see
+    # _start_background_update_check) - it only lights up the "!" badge / button highlight
+    # (see _apply_update_indicators), never opens the dialog itself. Both checks use this app's OWN release repo
+    # (UPDATE_REPO), separate from RELEASES_URL / ARKSERVERAPI_RELEASES_API above, which
+    # point at the plugin/connector/ArkApi bundle.
+    @staticmethod
+    def _fetch_release_list():
+        """The repo's releases as a list (newest-first per GitHub). New clients pick the best
+        installable one themselves (see _pick_best_release) instead of trusting /releases/
+        latest, so a permanently-pinned bridge release can't hide newer onedir releases."""
+        req = urllib.request.Request(
+            UPDATE_RELEASES_LIST_API,
+            headers={"User-Agent": GITHUB_API_USER_AGENT,
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, list) else []
+
+    def _start_background_update_check(self):
+        threading.Thread(target=self._background_update_check_worker, daemon=True).start()
+
+    # ------------------------------------------- Component version advisories #
+    def _read_config_dict(self):
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _start_component_version_check(self):
+        """Kick a background check of the installed ArkApi / plugin versions against their
+        latest GitHub releases. Silent and non-blocking, same as the launcher self-check."""
+        threading.Thread(target=self._component_version_check_worker, daemon=True).start()
+
+    def _component_version_check_worker(self):
+        """Build the advisory rows off the main thread. Only compares components whose
+        installed version the launcher actually recorded at install time - with no baseline
+        there's nothing to compare against, so it stays silent rather than guessing."""
+        cfg = self._read_config_dict()
+        advisories = []
+        checks = [
+            (cfg.get(ARKAPI_INSTALLED_VERSION_KEY, ""), ARKSERVERAPI_RELEASES_API,
+             "ArkServerApi", ARKSERVERAPI_RELEASES_PAGE,
+             "Server Install tab -> \"Install ArkServerApi\" upgrades it in place."),
+            (cfg.get(PLUGIN_INSTALLED_VERSION_KEY, ""), ARKAP_PLUGIN_RELEASES_API,
+             "ArkAP plugin", RELEASES_URL,
+             "Server Install tab -> \"Install Plugin\" downloads and upgrades it in place "
+             "- your ArkAP.config.json is kept."),
+        ]
+        for installed, api, name, page, how in checks:
+            if not installed:
+                continue
+            latest = fetch_latest_release_tag(api)
+            if latest and _version_is_newer(latest, installed):
+                advisories.append({
+                    "label": "%s update available (advisory)" % name,
+                    "state": "info",
+                    "detail": "Installed %s, latest release is %s. Being on an older "
+                              "version isn't broken - just worth knowing. %s"
+                              % (installed, latest, how),
+                    "hint": "",
+                    "link": page,
+                })
+
+        # The launcher's own version, via the SAME release-picking the self-update flow and
+        # the tab-bar "!" badge use (_fetch_release_list + _pick_best_release) - no duplicated
+        # comparison logic, so this row and the badge can never disagree. Coexists with the
+        # badge: this is just the Setup Status surfacing of the same result. Unlike the
+        # component rows above, the launcher always gets a row (green check when up to date,
+        # yellow "i" when newer) - it's shown only when GitHub was reachable this run.
+        try:
+            best, version_str = _pick_best_release(self._fetch_release_list(), APP_VERSION)
+        except (OSError, ValueError):
+            best = version_str = None
+            reachable = False
+        else:
+            reachable = True
+        if reachable and best is not None:
+            advisories.append({
+                "label": "Launcher update available (advisory)",
+                "state": "info",
+                "detail": "Installed %s, latest release is %s. Being on an older version "
+                          "isn't broken - just worth knowing. Use \"Check for Updates\" at "
+                          "the top of the window to update in place."
+                          % (APP_VERSION, version_str),
+                "hint": "",
+                "link": (best.get("html_url") or UPDATE_RELEASES_PAGE),
+            })
+        elif reachable:
+            advisories.append({
+                "label": "Launcher up to date",
+                "state": "ok",
+                "detail": "Running %s, the latest release." % APP_VERSION,
+                "hint": "",
+            })
+
+        self.after(0, self._on_component_versions, advisories)
+
+    def _on_component_versions(self, advisories):
+        self._component_advisories = advisories
+        # Re-render the Setup Status rows and the tab-bar symbol with the new advisories,
+        # whether or not that tab is currently open.
+        self._refresh_setup_status()
+
+    def _background_update_check_worker(self):
+        try:
+            releases = self._fetch_release_list()
+        except (OSError, ValueError):
+            return
+        _best, version_str = _pick_best_release(releases, APP_VERSION)
+        # Silent check never acknowledges - it only reflects the current state, so a newer
+        # installable release lights up both cues until the user actually clicks the button.
+        self.after(0, self._apply_update_indicators, version_str or "")
+
+    def _read_acknowledged_version(self):
+        """Newest release the user has clicked 'Check for Updates' through to see, from the
+        persistent config file (empty string if never / unreadable)."""
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return ""
+        val = data.get(ACK_VERSION_KEY, "")
+        return val if isinstance(val, str) else ""
+
+    def _acknowledge_version(self, version_str):
+        """Persist `version_str` as the newest release the user has now seen. Written to
+        the config JSON (not profiles) so it survives restarts - see ACK_VERSION_KEY."""
+        self._write_config_key(ACK_VERSION_KEY, version_str, "acknowledged update version")
+
+    def _set_update_highlight(self, on):
+        """Light up (or clear) the button's Save-style halo. Off = recoloured to the header
+        bg so it blends in at the same size, never shifting the header layout."""
+        self._update_highlight_on = on
+        t = self.theme
+        colour = t["warn_bg"] if on else t["bg"]
+        border = t["warn_border"] if on else t["bg"]
+        self.update_btn_halo.configure(background=colour, highlightbackground=border)
+
+    def _apply_update_indicators(self, latest_version):
+        """Set both cues from the live latest-release version: the persistent "!" badge
+        (an update exists at all, vs installed APP_VERSION) and the dismissible button
+        highlight (newer than what the user has acknowledged). See _compute_update_cues."""
+        show_badge, show_highlight = _compute_update_cues(
+            latest_version, APP_VERSION, self._read_acknowledged_version())
+        self.update_badge_label.configure(text="!" if show_badge else "")
+        self._set_update_highlight(show_highlight)
+
     def _on_check_for_updates(self):
         if self._update_check_thread and self._update_check_thread.is_alive():
             return
         if self._update_download_thread and self._update_download_thread.is_alive():
             messagebox.showinfo("ARKIpelago Launcher", "An update is already downloading.")
             return
+        # NB: the "!" badge is deliberately NOT cleared here - clicking only dismisses the
+        # highlight (done in _on_update_check_done, once the acknowledged version is known).
         self.update_check_btn.configure(state="disabled", text="Checking...")
         self._update_check_thread = threading.Thread(
             target=self._update_check_worker, daemon=True)
@@ -5008,13 +6359,8 @@ class ArkAPLauncher(tk.Tk):
 
     def _update_check_worker(self):
         try:
-            req = urllib.request.Request(
-                UPDATE_RELEASES_API,
-                headers={"User-Agent": GITHUB_API_USER_AGENT,
-                         "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            self.after(0, self._on_update_check_done, True, data)
+            releases = self._fetch_release_list()
+            self.after(0, self._on_update_check_done, True, releases)
         except (OSError, ValueError) as exc:
             self.after(0, self._on_update_check_done, False, str(exc))
 
@@ -5025,42 +6371,25 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showerror("ARKIpelago Launcher",
                                   "Could not check for updates:\n\n%s" % payload)
             return
-        data = payload
-        version_str, tag = _extract_release_version(data)
-        html_url = data.get("html_url") or UPDATE_RELEASES_PAGE
-        if not tag:
-            messagebox.showerror("ARKIpelago Launcher",
-                                  "GitHub returned no release tag or name for the latest "
-                                  "release.")
-            return
-        if version_str is None:
-            messagebox.showwarning(
-                "ARKIpelago Launcher",
-                "Found a release (%s) but couldn't find a version number in it to compare "
-                "against your installed version (%s). Check the release page yourself:\n\n%s"
-                % (tag, APP_VERSION, html_url))
-            return
-        if not _version_is_newer(version_str, APP_VERSION):
+        # payload is the releases list; pick the newest installable (folder-zip) release that
+        # is newer than what's installed. None means we're already on (or ahead of) it.
+        data, version_str = _pick_best_release(payload, APP_VERSION)
+        if data is None:
             messagebox.showinfo(
                 "ARKIpelago Launcher",
-                "You're up to date.\n\nInstalled version: %s\nLatest release: %s"
-                % (APP_VERSION, tag))
+                "You're up to date.\n\nInstalled version: %s" % APP_VERSION)
             return
+        _v, tag = _extract_release_version(data)
+        html_url = data.get("html_url") or UPDATE_RELEASES_PAGE
+        # The user clicked through to see this release: acknowledge it (persisted), then
+        # recompute both cues. The highlight clears (this release is no longer newer than
+        # what's acknowledged); the "!" badge stays lit while it's newer than APP_VERSION.
+        self._acknowledge_version(version_str)
+        self._apply_update_indicators(version_str)
         self._show_update_available_dialog(data, tag, html_url)
 
-    def _pick_update_asset(self, data):
-        """The .exe asset to download - prefers one literally named ArkAPLauncher.exe,
-        falls back to the first .exe asset on the release (there should only ever be one)."""
-        assets = data.get("assets") or []
-        exe_assets = [a for a in assets if (a.get("name") or "").lower().endswith(".exe")]
-        if not exe_assets:
-            return None
-        preferred = next((a for a in exe_assets
-                           if (a.get("name") or "").lower() == "arkaplauncher.exe"), None)
-        return preferred or exe_assets[0]
-
     def _find_checksum_asset(self, data, asset_name):
-        """Best-effort: some releases attach a checksum file alongside the exe. Recognises
+        """Best-effort: some releases attach a checksum file alongside the zip. Recognises
         a handful of common naming conventions; returns None (silently) if none match -
         the size check already performed is still a real completeness guarantee on its own."""
         assets = data.get("assets") or []
@@ -5101,7 +6430,7 @@ class ArkAPLauncher(tk.Tk):
         return h.hexdigest()
 
     def _show_update_available_dialog(self, data, tag, html_url):
-        asset = self._pick_update_asset(data)
+        asset = _launcher_zip_asset(data)
 
         win = tk.Toplevel(self)
         win.title("Update available")
@@ -5140,8 +6469,8 @@ class ArkAPLauncher(tk.Tk):
                        command=lambda: self._confirm_and_start_update(win, data, asset, tag)
                        ).pack(side="left")
         else:
-            ttk.Label(btn_row, text="No downloadable .exe was found on this release - "
-                                     "update manually from the link above.",
+            ttk.Label(btn_row, text="No downloadable update package (.zip) was found on this "
+                                     "release - update manually from the link above.",
                       foreground=self.theme["subtle_fg"], wraplength=340, justify="left"
                       ).pack(side="left")
         ttk.Button(btn_row, text="Not Now", command=win.destroy).pack(side="right")
@@ -5160,8 +6489,9 @@ class ArkAPLauncher(tk.Tk):
                 "The launcher will close automatically once the download finishes, apply "
                 "the update, and reopen on its own.\n\n"
                 "Your saved configuration (%s) and profiles (%s) live in this same folder "
-                "and are never touched by this - only the .exe itself is replaced. Make "
-                "sure any unsaved changes in the Configuration tab are saved first."
+                "and are never touched by this - only the launcher program files are "
+                "replaced. Make sure any unsaved changes in the Configuration tab are saved "
+                "first."
                 % (tag, CONFIG_FILENAME, PROFILES_FILENAME),
                 parent=dialog):
             return
@@ -5199,6 +6529,10 @@ class ArkAPLauncher(tk.Tk):
         except OSError:
             pass
 
+    @staticmethod
+    def _rmtree_quiet(path):
+        shutil.rmtree(path, ignore_errors=True)
+
     def _download_update_asset(self, url, dest_path, expected_size, q):
         req = urllib.request.Request(url, headers={"User-Agent": GITHUB_API_USER_AGENT})
         downloaded = 0
@@ -5228,21 +6562,24 @@ class ArkAPLauncher(tk.Tk):
 
     def _update_download_worker(self, data, asset, tag):
         q = self._update_download_queue
-        new_path = os.path.join(base_dir(), "ArkAPLauncher_new.exe")
+        exe_dir = base_dir()
+        zip_path = os.path.join(exe_dir, UPDATE_ZIP_TMPNAME)
+        staging_root = os.path.join(exe_dir, UPDATE_STAGING_DIRNAME)
         url = asset.get("browser_download_url")
         expected_size = asset.get("size", 0)
-        self._cleanup_failed_download(new_path)
+        self._cleanup_failed_download(zip_path)
+        self._rmtree_quiet(staging_root)
 
         try:
             q.put(("status", "Downloading %s..." % asset.get("name", "update")))
-            downloaded = self._download_update_asset(url, new_path, expected_size, q)
+            downloaded = self._download_update_asset(url, zip_path, expected_size, q)
         except (OSError, ValueError) as exc:
-            self._cleanup_failed_download(new_path)
+            self._cleanup_failed_download(zip_path)
             q.put(("error", "Download failed: %s" % exc))
             return
 
         if expected_size and downloaded != expected_size:
-            self._cleanup_failed_download(new_path)
+            self._cleanup_failed_download(zip_path)
             q.put(("error",
                    "Downloaded file size (%d bytes) did not match the size GitHub "
                    "reported (%d bytes) - the download was incomplete. Nothing was "
@@ -5264,9 +6601,9 @@ class ArkAPLauncher(tk.Tk):
             except OSError:
                 pass  # checksum fetch failing isn't fatal - the size check above already ran
             if expected_hash:
-                actual_hash = self._sha256_of_file(new_path)
+                actual_hash = self._sha256_of_file(zip_path)
                 if actual_hash != expected_hash:
-                    self._cleanup_failed_download(new_path)
+                    self._cleanup_failed_download(zip_path)
                     q.put(("error",
                            "Checksum verification failed for the downloaded update "
                            "(expected %s, got %s). Nothing was changed."
@@ -5274,8 +6611,35 @@ class ArkAPLauncher(tk.Tk):
                     return
                 q.put(("status", "Checksum verified."))
 
-        q.put(("status", "Download verified (%d bytes). Preparing to restart..." % downloaded))
-        q.put(("ready", (new_path, tag)))
+        # Extract in-process, BEFORE relaunch. This validates the package and, just as
+        # importantly, gives the AV on-access scanner a head start on the freshly-written
+        # program files while the old app is still shutting down - so the helper's "DLL
+        # openable" gate resolves fast instead of having to wait out a full first-time scan.
+        q.put(("status", "Extracting update..."))
+        try:
+            self._rmtree_quiet(staging_root)
+            os.makedirs(staging_root, exist_ok=True)
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(staging_root)
+        except (OSError, zipfile.BadZipFile) as exc:
+            self._cleanup_failed_download(zip_path)
+            self._rmtree_quiet(staging_root)
+            q.put(("error", "Could not extract the downloaded update: %s\n\n"
+                            "Nothing was changed." % exc))
+            return
+
+        staged = _locate_staged_app(staging_root)
+        if not staged:
+            self._cleanup_failed_download(zip_path)
+            self._rmtree_quiet(staging_root)
+            q.put(("error",
+                   "The downloaded update did not contain the expected launcher program "
+                   "files (an .exe alongside %s\\%s). Nothing was changed."
+                   % (UPDATE_INTERNAL_DIRNAME, UPDATE_PAYLOAD_DLL_GLOB)))
+            return
+
+        q.put(("status", "Update verified. Preparing to restart..."))
+        q.put(("ready", (staged, tag)))
 
     def _poll_update_download_queue(self):
         try:
@@ -5292,8 +6656,8 @@ class ArkAPLauncher(tk.Tk):
                     self._on_update_download_error(payload)
                     return
                 elif kind == "ready":
-                    new_path, tag = payload
-                    self._on_update_download_ready(new_path, tag)
+                    staged, tag = payload
+                    self._on_update_download_ready(staged, tag)
                     return
         except queue.Empty:
             pass
@@ -5311,108 +6675,53 @@ class ArkAPLauncher(tk.Tk):
                               "Update failed - the current launcher was left untouched.\n\n%s"
                               % message)
 
-    def _on_update_download_ready(self, new_exe_path, tag):
+    def _on_update_download_ready(self, staged, tag):
         win, self._update_progress_win = self._update_progress_win, None
         if win is not None:
             try:
                 win.destroy()
             except tk.TclError:
                 pass
+        staged_dir, staged_exe = staged
         try:
-            self._launch_update_helper_and_exit(new_exe_path, tag)
+            self._launch_update_helper_and_exit(staged_dir, staged_exe, tag)
         except OSError as exc:
-            self._cleanup_failed_download(new_exe_path)
+            self._rmtree_quiet(os.path.join(base_dir(), UPDATE_STAGING_DIRNAME))
+            self._cleanup_failed_download(os.path.join(base_dir(), UPDATE_ZIP_TMPNAME))
             messagebox.showerror(
                 "ARKIpelago Launcher",
                 "Downloaded the update but could not start the updater helper - the "
                 "current launcher was left untouched.\n\n%s" % exc)
 
-    @staticmethod
-    def _build_update_bat_script(pid, current_exe, new_exe, old_backup, result_path, tag):
-        """A short-lived helper script: the running exe can't overwrite/rename itself, so
-        this waits for our PID to exit, then does old-exe-out / new-exe-in / relaunch. Every
-        exit path writes a two-line result_path (status, tag[, message]) before exiting so
-        the relaunched app (or the user, on failure) can tell what happened - see
-        _check_previous_update_result(). On any failure after the rename of the running exe
-        has already happened, it rolls that rename back before giving up, so the exe is
-        never left missing."""
-        old_name = os.path.basename(old_backup)
-        cur_name = os.path.basename(current_exe)
-        safe_tag = re.sub(r"[\r\n]", " ", tag) or "unknown"
-
-        def write_result(status, message):
-            return [
-                '> "%s" echo %s' % (result_path, status),
-                '>> "%s" echo %s' % (result_path, safe_tag),
-                '>> "%s" echo %s' % (result_path, message),
-            ]
-
-        lines = [
-            "@echo off",
-            "setlocal EnableDelayedExpansion",
-            "",
-            "set /a COUNT=0",
-            ":wait",
-            'tasklist /FI "PID eq %s" 2>NUL | find "%s" >NUL' % (pid, pid),
-            "if not errorlevel 1 (",
-            "    set /a COUNT+=1",
-            "    if !COUNT! GEQ 30 goto afterwait",
-            "    timeout /t 1 /nobreak >NUL",
-            "    goto wait",
-            ")",
-            ":afterwait",
-            "",
-            'if not exist "%s" (' % new_exe,
-        ]
-        lines += ["    " + l for l in write_result(
-            "FAIL", "Downloaded update file was missing when the helper ran.")]
-        lines += ["    exit /b 1", ")", "",
-                   'if exist "%s" del /f /q "%s" >NUL 2>&1' % (old_backup, old_backup), "",
-                   'ren "%s" "%s"' % (current_exe, old_name),
-                   "if errorlevel 1 ("]
-        lines += ["    " + l for l in write_result(
-            "FAIL", "Could not rename the running exe out of the way - it may still be "
-                     "locked.")]
-        lines += ["    exit /b 1", ")",
-                   'if not exist "%s" (' % old_backup]
-        lines += ["    " + l for l in write_result(
-            "FAIL", "Renaming the old exe did not produce the expected backup file.")]
-        lines += ["    exit /b 1", ")", "",
-                   'ren "%s" "%s"' % (new_exe, cur_name),
-                   "if errorlevel 1 ("]
-        lines += ['    ren "%s" "%s"' % (old_backup, cur_name)]
-        lines += ["    " + l for l in write_result(
-            "FAIL", "Could not rename the new exe into place - the previous version was "
-                     "restored.")]
-        lines += ['    start "" "%s"' % current_exe,
-                   '    del "%~f0"',
-                   "    exit /b 1", ")", ""]
-        lines += write_result("OK", "Updated successfully.")
-        lines += ['start "" "%s"' % current_exe,
-                   'del "%~f0"',
-                   "exit /b 0", ""]
-        return "\r\n".join(lines)
-
-    def _launch_update_helper_and_exit(self, new_exe_path, tag):
+    def _launch_update_helper_and_exit(self, staged_dir, staged_exe, tag):
         exe_dir = base_dir()
         current_exe = os.path.normpath(sys.executable)
-        old_backup = os.path.join(exe_dir, "ArkAPLauncher_old.exe")
-        bat_path = os.path.join(exe_dir, "arkap_update_helper.bat")
+        ps_path = os.path.join(exe_dir, UPDATE_HELPER_SCRIPT)
         result_path = os.path.join(exe_dir, UPDATE_RESULT_FILENAME)
+        zip_path = os.path.join(exe_dir, UPDATE_ZIP_TMPNAME)
+        staging_root = os.path.join(exe_dir, UPDATE_STAGING_DIRNAME)
 
-        script = self._build_update_bat_script(
-            os.getpid(), current_exe, new_exe_path, old_backup, result_path, tag)
-        with open(bat_path, "w", encoding="utf-8", newline="") as f:
+        script = _build_update_ps_script(
+            pid=os.getpid(), app_dir=exe_dir, current_exe=current_exe,
+            staged_dir=staged_dir, staged_exe=staged_exe,
+            internal_dir=UPDATE_INTERNAL_DIRNAME, dll_glob=UPDATE_PAYLOAD_DLL_GLOB,
+            zip_path=zip_path, staging_root=staging_root,
+            result_path=result_path, tag=tag)
+        # utf-8-sig so PowerShell 5.1 reads any non-ASCII path in the baked-in literals
+        # correctly (a BOM-less .ps1 is read as the system ANSI codepage there).
+        with open(ps_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
             f.write(script)
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen(["cmd.exe", "/c", bat_path], cwd=exe_dir,
-                          creationflags=creationflags, close_fds=True)
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-File", ps_path],
+            cwd=exe_dir, creationflags=creationflags, close_fds=True)
         self.destroy()
 
     def _check_previous_update_result(self):
         """Local file read only, no network - reports the outcome of an update-helper run
-        that happened just before this process started (see _build_update_bat_script)."""
+        that happened just before this process started (see _build_update_ps_script)."""
         path = os.path.join(base_dir(), UPDATE_RESULT_FILENAME)
         if not os.path.isfile(path):
             return
@@ -5435,83 +6744,166 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showerror(
                 "ARKIpelago Launcher",
                 "The update to %s did not complete successfully; your previous launcher "
-                "exe was left in place (or restored) rather than leaving you without one."
+                "was left in place (or restored) rather than leaving you without one."
                 "\n\n%s" % (tag or "the latest version",
-                             detail or "See arkap_update_helper.bat next to the exe, if "
-                                       "it's still there, for details."))
+                             detail or "See %s next to the exe, if it's still there, for "
+                                       "details." % UPDATE_HELPER_SCRIPT))
+
+    def _sweep_update_leftovers(self):
+        """Best-effort startup housekeeping (never fatal). Removes update-helper working
+        files that survive only if the helper was killed mid-run: the staging folder, the
+        downloaded zip, the helper script, and the exe/_internal .old backups - all ours,
+        all next to the exe. (Stale --onefile _MEI* temp folders from older versions are
+        deliberately left alone: they share a name pattern with every other PyInstaller app
+        on the machine, so blind deletion could corrupt another running app. --onedir no
+        longer creates them, so they stop accumulating on their own.)"""
+        b = base_dir()
+        self._rmtree_quiet(os.path.join(b, UPDATE_STAGING_DIRNAME))
+        self._rmtree_quiet(os.path.join(b, UPDATE_INTERNAL_DIRNAME + ".old"))
+        for name in (UPDATE_ZIP_TMPNAME, UPDATE_HELPER_SCRIPT,
+                     os.path.basename(sys.executable) + ".old"):
+            self._cleanup_failed_download(os.path.join(b, name))
 
     # -------------------------------------------- ArkAP plugin install ----- #
-    def _browse_plugin_src(self):
-        current = self._plugin_src_var.get().strip()
-        initial = current if os.path.isdir(current) else base_dir()
-        picked = filedialog.askdirectory(
-            initialdir=initial,
-            title="Select your unzipped ArkAP_plugin folder (contains ArkAP\\ArkAP.dll)")
-        if picked:
-            self._plugin_src_var.set(os.path.normpath(picked))
+    def _fetch_latest_plugin_release(self, q):
+        """Query GitHub for the latest ArkAP plugin release and its ArkAP_Plugin.zip asset.
 
-    def _detect_plugin_source(self):
-        """Best-effort scan of a few likely spots for a folder containing
-        ArkAP\\ArkAP.dll (the unzipped plugin download). Returns a path or None."""
-        b = base_dir()
-        cwd = os.getcwd()
-        parent = os.path.dirname(b)
-        home = os.path.expanduser("~")
-        cands = [
-            b, os.path.join(b, "ArkAP_plugin"),
-            parent, os.path.join(parent, "ArkAP_plugin"),
-            cwd, os.path.join(cwd, "ArkAP_plugin"),
-            os.path.join(home, "Downloads", "ArkAP_plugin"),
-            os.path.join(home, "Downloads"),
-        ]
-        seen = set()
-        for c in cands:
-            if not c:
-                continue
-            cn = os.path.normpath(c)
-            key = cn.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            if os.path.isfile(os.path.join(cn, PLUGIN_PAYLOAD_MARKER)):
-                return cn
+        Returns (tag, asset_name, download_url, size_bytes). Raises RuntimeError/OSError/
+        ValueError on failure - the worker turns that into a log line + failure result."""
+        req = urllib.request.Request(
+            ARKAP_PLUGIN_RELEASES_API,
+            headers={"User-Agent": GITHUB_API_USER_AGENT,
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            releases = json.loads(resp.read().decode("utf-8"))
+        data = next((r for r in releases or [] if isinstance(r, dict) and not r.get("draft")),
+                     None)
+        if not data:
+            raise RuntimeError("No releases found (checked %s)." % ARKAP_PLUGIN_RELEASES_API)
+        tag = data.get("tag_name") or "unknown"
+        assets = data.get("assets") or []
+        want = ARKAP_PLUGIN_ASSET_NAME.lower()
+        asset = next((a for a in assets if (a.get("name") or "").lower() == want), None)
+        if not asset:
+            raise RuntimeError(
+                "Latest release (%s) has no %s asset. Use \"Manual downloads\" below."
+                % (tag, ARKAP_PLUGIN_ASSET_NAME))
+        q.put(("line", "Latest release: %s - asset %s" % (tag, asset["name"])))
+        return tag, asset["name"], asset["browser_download_url"], asset.get("size", 0)
+
+    def _locate_extracted_plugin(self, root):
+        """Find the folder inside `root` that holds ArkAP\\ArkAP.dll (the plugin payload),
+        whether the zip put ArkAP\\ at its root or nested one level down. Returns that folder
+        (the parent of ArkAP\\), or None."""
+        cands = [root]
+        try:
+            cands.extend(os.path.join(root, n) for n in sorted(os.listdir(root))
+                         if os.path.isdir(os.path.join(root, n)))
+        except OSError:
+            return None
+        for d in cands:
+            if os.path.isfile(os.path.join(d, PLUGIN_PAYLOAD_MARKER)):
+                return d
         return None
 
-    def _resolve_plugin_source(self):
-        """Return a folder containing ArkAP\\ArkAP.dll to install from, or None.
+    def _plugin_worker(self, plugins, dst_arkap):
+        q = self._plugin_queue
+        try:
+            q.put(("line", "Fetching latest ArkAP plugin release info..."))
+            tag, asset_name, url, _size = self._fetch_latest_plugin_release(q)
+        except (OSError, ValueError, RuntimeError) as exc:
+            q.put(("line", "! Could not fetch release info: %s" % exc))
+            q.put(("done", None))
+            return
 
-        Order: whatever's typed/remembered -> auto-detect common spots -> ask the user to
-        browse. A message is shown before returning None so the caller can just bail."""
-        typed = self._plugin_src_var.get().strip()
-        if typed and os.path.isfile(os.path.join(typed, PLUGIN_PAYLOAD_MARKER)):
-            return os.path.normpath(typed)
-        if typed:
-            self._install_log("Plugin source '%s' has no ArkAP\\ArkAP.dll - "
-                              "auto-detecting instead." % typed)
+        tmp_dir = tempfile.mkdtemp(prefix="arkap_plugin_dl_")
+        zip_path = os.path.join(tmp_dir, asset_name)
+        extract_dir = os.path.join(tmp_dir, "unzipped")
+        try:
+            q.put(("line", "Downloading %s..." % asset_name))
+            self._download_with_progress(url, zip_path, q)
+            self._extract_zip_to(zip_path, extract_dir, q)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            q.put(("line", "! Download/extract failed: %s" % exc))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            q.put(("done", None))
+            return
 
-        found = self._detect_plugin_source()
-        if found:
-            self._plugin_src_var.set(found)
-            self._install_log("Auto-detected plugin source: %s" % found)
-            return found
+        src_root = self._locate_extracted_plugin(extract_dir)
+        if not src_root:
+            q.put(("line", "! %s didn't contain ArkAP\\ArkAP.dll - nothing installed."
+                   % asset_name))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            q.put(("done", None))
+            return
 
-        messagebox.showinfo(
-            "Install Plugin",
-            "Couldn't find the plugin files automatically.\n\nBrowse to your unzipped "
-            "ArkAP_plugin folder - the one that contains ArkAP\\ArkAP.dll.")
-        picked = filedialog.askdirectory(
-            title="Select your unzipped ArkAP_plugin folder (contains ArkAP\\ArkAP.dll)")
-        if not picked:
-            return None
-        picked = os.path.normpath(picked)
-        if not os.path.isfile(os.path.join(picked, PLUGIN_PAYLOAD_MARKER)):
+        src_arkap = os.path.join(src_root, "ArkAP")
+        copied, skipped, errors = self._copy_plugin_tree(src_arkap, dst_arkap)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        q.put(("line", "Installed into: %s" % dst_arkap))
+        for s in skipped:
+            q.put(("line", "  kept: %s" % s))
+        q.put(("line", "  Copied %d file(s)." % len(copied)))
+        for e in errors:
+            q.put(("line", "  ! %s" % e))
+        if copied:
+            # Record the tag we just installed so the Setup Status advisory can flag a newer
+            # release later (same key the ArkApi installer stamps its version into).
+            q.put(("version", tag))
+        q.put(("done", {"plugins": plugins, "dst_arkap": dst_arkap,
+                        "copied": len(copied), "errors": len(errors)}))
+
+    def _poll_plugin_queue(self):
+        try:
+            while True:
+                kind, payload = self._plugin_queue.get_nowait()
+                if kind == "line":
+                    self._install_log(payload)
+                elif kind == "version":
+                    self._write_config_key(PLUGIN_INSTALLED_VERSION_KEY, payload,
+                                           "installed plugin version")
+                elif kind == "progress":
+                    try:
+                        self.install_progress["value"] = payload
+                    except tk.TclError:
+                        pass
+                elif kind == "done":
+                    self._on_plugin_done(payload)
+                    self._start_component_version_check()
+                    return
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_plugin_queue)
+
+    def _on_plugin_done(self, payload):
+        self.install_btn.configure(state="normal")
+        self.arkapi_install_btn.configure(state="normal")
+        self.install_plugin_btn.configure(state="normal")
+        self._plugin_thread = None
+        self.install_progress.stop()
+        if not payload or not payload["copied"]:
+            self.install_status_var.set("Failed")
+            messagebox.showerror("Install Plugin",
+                                 "Plugin install failed. See the log for details.")
+            return
+        # Point the shared path vars at the confirmed install so reset / Open Plugins /
+        # ipc_dir all follow it (no second parallel path variable).
+        self.set("PLUGINS_DIR", payload["plugins"])
+        self.set("ipc_dir", os.path.join(payload["dst_arkap"], "ipc"))
+        self.install_status_var.set("Done")
+        if payload["errors"]:
             messagebox.showwarning(
                 "Install Plugin",
-                "That folder doesn't contain ArkAP\\ArkAP.dll:\n\n%s\n\nPick the folder "
-                "you unzipped ArkAP_plugin.zip into." % picked)
-            return None
-        self._plugin_src_var.set(picked)
-        return picked
+                "Plugin install finished with %d problem(s) - see the log.\n\nCopied %d "
+                "file(s) to:\n%s"
+                % (payload["errors"], payload["copied"], payload["dst_arkap"]))
+        else:
+            messagebox.showinfo(
+                "Install Plugin",
+                "ArkAP plugin installed (%d file(s)) to:\n\n%s\n\nRestart (or start) the "
+                "ARK dedicated server, then run the connector."
+                % (payload["copied"], payload["dst_arkap"]))
 
     def _copy_plugin_tree(self, src_arkap, dst_arkap):
         """Recursively copy src_arkap -> dst_arkap (merge, like the .bat's robocopy /E -
@@ -5541,28 +6933,14 @@ class ArkAPLauncher(tk.Tk):
                     errors.append("%s: %s" % (d, exc))
         return copied, skipped, errors
 
-    def _persist_plugin_src(self, path):
-        """Immediately remember the chosen plugin source in the config JSON (merged),
-        so it survives even without a full Save."""
-        try:
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, ValueError):
-                data = {}
-            data[PLUGIN_SRC_KEY] = path
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except OSError as exc:
-            self._install_log("! Could not save plugin source path: %s" % exc)
-
     def on_install_plugin(self):
-        """Install the ArkAP plugin into <SERVER_ROOT>\\...\\ArkApi\\Plugins\\ArkAP by
-        copying it natively from the user's unzipped plugin download."""
+        """Download the latest ArkAP_Plugin.zip from GitHub and install it into
+        <SERVER_ROOT>\\...\\ArkApi\\Plugins\\ArkAP (preserving an existing config on upgrade).
+        Runs on a background thread; progress streams into the install console."""
+        if self._any_install_running():
+            messagebox.showinfo("ARKIpelago Launcher", "An install is already running.")
+            return
         self.notebook.select(self.tab_install)
-        self.install_log.configure(state="normal")
-        self.install_log.delete("1.0", "end")
-        self.install_log.configure(state="disabled")
 
         root = self.get("SERVER_ROOT")
         if not root:
@@ -5584,8 +6962,8 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showwarning(
                 "Install Plugin",
                 "ArkApi is not installed yet - no 'ArkApi' folder in:\n\n%s\n\nInstall "
-                "ARK Server API (AseApi) into Win64 first "
-                "(https://github.com/ArkServerApi/AseApi), then try again." % win64)
+                "ArkServerApi into Win64 first (\"Install ArkServerApi\" above), then try "
+                "again." % win64)
             return
 
         plugins = os.path.join(arkapi, "Plugins")
@@ -5596,66 +6974,46 @@ class ArkAPLauncher(tk.Tk):
                                   "Could not create the Plugins folder:\n\n%s\n\n%s"
                                   % (plugins, exc))
             return
-
-        src_root = self._resolve_plugin_source()
-        if not src_root:
-            self._install_log("Install Plugin: cancelled (no plugin source).")
-            return
-        src_arkap = os.path.join(src_root, "ArkAP")
         dst_arkap = os.path.join(plugins, "ArkAP")
 
         upgrade = os.path.isfile(os.path.join(dst_arkap, PLUGIN_PRESERVE_ON_UPGRADE))
         if not messagebox.askyesno(
                 "Install Plugin",
-                "Install the ArkAP plugin?\n\nFrom: %s\nTo:   %s\n\n%s\n\n"
-                "(Any ipc / tracking files already there are left in place - use a reset "
-                "button for a clean seed.)"
-                % (src_arkap, dst_arkap,
+                "Download the latest ArkAP plugin from GitHub and install it into:\n\n%s\n\n"
+                "%s\n\n(Any ipc / tracking files already there are left in place - use a "
+                "reset button for a clean seed.)\n\nProceed?"
+                % (dst_arkap,
                    "An existing ArkAP.config.json will be KEPT (your settings survive)."
                    if upgrade else "This is a fresh install.")):
-            self._install_log("Install Plugin: cancelled.")
             return
 
-        copied, skipped, errors = self._copy_plugin_tree(src_arkap, dst_arkap)
+        self.install_log.configure(state="normal")
+        self.install_log.delete("1.0", "end")
+        self.install_log.configure(state="disabled")
 
-        # Point the shared path vars at the confirmed install so reset / Open Plugins /
-        # ipc_dir all follow it (no second parallel path variable).
-        self.set("PLUGINS_DIR", plugins)
-        self.set("ipc_dir", os.path.join(dst_arkap, "ipc"))
-        self._plugin_src_dir = src_root
-        self._plugin_src_var.set(src_root)
-        self._persist_plugin_src(src_root)
+        self._plugin_queue = queue.Queue()
+        self.install_btn.configure(state="disabled")
+        self.arkapi_install_btn.configure(state="disabled")
+        self.install_plugin_btn.configure(state="disabled")
+        self.install_status_var.set("Installing...")
+        self.install_progress.stop()
+        self.install_progress.configure(mode="determinate", maximum=100)
+        self.install_progress["value"] = 0
 
-        self._install_log("Install Plugin:")
-        self._install_log("  From: %s" % src_arkap)
-        self._install_log("  To:   %s" % dst_arkap)
-        for s in skipped:
-            self._install_log("  kept: %s" % s)
-        self._install_log("  Copied %d file(s)." % len(copied))
-        for c in copied:
-            self._install_log("    + %s" % c)
-        if errors:
-            for e in errors:
-                self._install_log("  ! %s" % e)
-            messagebox.showwarning(
-                "Install Plugin",
-                "Plugin install finished with %d problem(s) - see the log.\n\nCopied %d "
-                "file(s) to:\n%s" % (len(errors), len(copied), dst_arkap))
-        else:
-            messagebox.showinfo(
-                "Install Plugin",
-                "ArkAP plugin installed (%d file(s)) to:\n\n%s\n\nRestart (or start) the "
-                "ARK dedicated server, then run the connector." % (len(copied), dst_arkap))
+        self._plugin_thread = threading.Thread(
+            target=self._plugin_worker, args=(plugins, dst_arkap), daemon=True)
+        self._plugin_thread.start()
+        self.after(100, self._poll_plugin_queue)
 
     # -------------------------------------------------- quick-launch ------- #
-    def _open_folder(self, path, label):
+    def _open_folder(self, path, label, hint=""):
         if not path:
             messagebox.showwarning("ARKIpelago Launcher", "%s is not set." % label)
             return
         path = os.path.normpath(path)
         if not os.path.isdir(path):
             messagebox.showwarning("ARKIpelago Launcher",
-                                   "%s does not exist:\n%s" % (label, path))
+                                   "%s does not exist:\n%s%s" % (label, path, hint))
             return
         try:
             os.startfile(path)  # noqa: Windows-only, which is the target platform.
@@ -5678,8 +7036,225 @@ class ArkAPLauncher(tk.Tk):
             os.path.join(root, "ShooterGame", "Saved", "Config", "WindowsServer"),
             "Game.ini config folder")
 
+    def _ipc_dir(self):
+        """The ArkAP ipc folder (where the plugin writes game_ini_fragment.txt), or ""."""
+        ipc = self.get("ipc_dir")
+        if ipc:
+            return os.path.normpath(ipc)
+        plugin_dir = self._arkap_plugin_dir()
+        return os.path.join(plugin_dir, "ipc") if plugin_dir else ""
+
+    def _game_ini_path(self):
+        """The configured Game.ini path, else the one derived from SERVER_ROOT, or ""."""
+        gi = self.get("game_ini")
+        if gi:
+            return os.path.normpath(gi)
+        cfg = self._server_config_dir()
+        return os.path.join(cfg, "Game.ini") if cfg else ""
+
+    def _backup_file(self, path, ts):
+        """Copy path to <path>.<ts>.bak (dupe-suffixed on a same-second collision) and
+        return the backup path. Raises OSError on failure. Same timestamped-.bak pattern
+        the config upload uses; shared by the Game.ini patch and the reset's Game.ini
+        cleanup so both back up identically before writing."""
+        backup = "%s.%s.bak" % (path, ts)
+        dupe = 2
+        while os.path.exists(backup):
+            backup = "%s.%s-%d.bak" % (path, ts, dupe)
+            dupe += 1
+        shutil.copy2(path, backup)
+        return backup
+
+    def patch_game_ini_for_randomized_dinos(self):
+        """Quick-launch: apply ipc\\game_ini_fragment.txt into Game.ini for a randomized
+        run - the automated replacement for the old manual copy-paste. Backs up first."""
+        # 1) Game.ini is read at server startup; editing it live risks being ignored or
+        #    overwritten on shutdown, so refuse outright while the server runs.
+        if is_process_running(ARK_SERVER_PROCESS):
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "%s is currently running.\n\nGame.ini is read when the server starts, so "
+                "any edit made now would be ignored and may be overwritten when the "
+                "server shuts down. Stop the ARK dedicated server first.\n\n(Patch "
+                "Game.ini aborted.)" % ARK_SERVER_PROCESS)
+            self._log("Patch Game.ini: aborted - %s is running." % ARK_SERVER_PROCESS)
+            return
+
+        # 2) The fragment the plugin generates.
+        ipc = self._ipc_dir()
+        if not ipc:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "Can't work out where the ipc folder is.\n\nSet ipc_dir (or SERVER_ROOT / "
+                "the ArkApi Plugins folder) on the Configuration tab first.")
+            return
+        frag_path = os.path.join(ipc, GAME_INI_FRAGMENT_NAME)
+        if not os.path.isfile(frag_path):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "No %s exists yet in:\n\n%s\n\nThe ArkAP plugin generates this file when "
+                "randomize_dino_spawns is on in your yaml. Connect to the server once "
+                "first so the plugin can generate it, then run this again."
+                % (GAME_INI_FRAGMENT_NAME, ipc))
+            self._log("Patch Game.ini: no %s at %s" % (GAME_INI_FRAGMENT_NAME, frag_path))
+            return
+
+        # 3) The Game.ini to patch.
+        game_ini = self._game_ini_path()
+        if not game_ini:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "Can't work out where Game.ini is.\n\nSet game_ini (or SERVER_ROOT) on "
+                "the Configuration tab first.")
+            return
+        if not os.path.isfile(game_ini):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "Game.ini does not exist yet:\n\n%s\n\nStart the server once (or upload a "
+                "Game.ini on the Configuration tab) so the file exists, then run this "
+                "again." % game_ini)
+            self._log("Patch Game.ini: Game.ini not found at %s" % game_ini)
+            return
+
+        # Read both, then compute the merged text before touching disk.
+        try:
+            frag_text, _ = read_text(frag_path)
+        except OSError as exc:
+            messagebox.showerror("ARKIpelago Launcher",
+                                 "Could not read %s:\n\n%s" % (frag_path, exc))
+            return
+        try:
+            existing, enc = read_text(game_ini)
+        except OSError as exc:
+            messagebox.showerror("ARKIpelago Launcher",
+                                 "Could not read Game.ini:\n\n%s" % exc)
+            return
+
+        n = len(_fragment_payload_lines(frag_text))
+        if not n:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "%s has no NPCReplacements lines to apply - nothing to patch.\n\n(This "
+                "usually means the last seed didn't randomize creatures.)"
+                % GAME_INI_FRAGMENT_NAME)
+            self._log("Patch Game.ini: %s had no NPCReplacements lines." % GAME_INI_FRAGMENT_NAME)
+            return
+
+        # What's already in Game.ini decides how we ask. Detection is a literal scan for
+        # ConfigOverrideNPCSpawnEntriesContainer= lines (see GAME_INI_FRAGMENT_LINE_RE):
+        #   * only our own marker block          -> replace in place, no need to ask.
+        #   * an UNMARKED wall (hand-pasted, or  -> stop and ask before touching it.
+        #     ours from before this detection)
+        #   * BOTH a marker block AND a separate -> the duplicate-wall bug; tell the user
+        #     unmarked wall                         and offer to collapse it to one.
+        #   * nothing                            -> a normal fresh insert.
+        has_marked = GAME_INI_BLOCK_BEGIN in existing
+        unmarked = game_ini_unmarked_fragment_count(existing)
+        n_word = "y" if unmarked == 1 else "ies"
+        remove_unmarked = False
+        if has_marked and unmarked:
+            if not messagebox.askyesno(
+                    "Duplicate randomized-creatures entries found",
+                    "Game.ini has TWO sets of randomized-creatures entries:\n\n"
+                    "  - one inside this launcher's own markers, and\n"
+                    "  - a SEPARATE, unmarked wall of %d %s= entr%s further down the "
+                    "file (a leftover duplicate from an earlier patch run).\n\n"
+                    "ARK will try to honour both, which is almost certainly not what you "
+                    "want. Clean this up?\n\n"
+                    "  Yes - remove the unmarked duplicate AND replace the marked block "
+                    "with the current one, leaving exactly one set.\n"
+                    "  No  - change nothing and cancel.\n\n"
+                    "A timestamped backup is made first if you proceed."
+                    % (unmarked, GAME_INI_FRAGMENT_KEY, n_word)):
+                self._log("Patch Game.ini: cancelled (duplicate cleanup declined).")
+                return
+            remove_unmarked = True
+        elif unmarked:
+            if not messagebox.askyesno(
+                    "Existing randomized-creatures block found",
+                    "Game.ini already contains %d %s= entr%s that this launcher did NOT "
+                    "add (not wrapped in the app's markers - most likely pasted in by "
+                    "hand, possibly from a different seed).\n\n"
+                    "Replace them with the current block from %s?\n\n"
+                    "  Yes - remove those lines and insert the new block (wrapped in the "
+                    "app's markers, so future patches and \"Full reset for new seed\" "
+                    "manage it cleanly).\n"
+                    "  No  - leave Game.ini exactly as it is and cancel.\n\n"
+                    "A timestamped backup is made first if you proceed."
+                    % (unmarked, GAME_INI_FRAGMENT_KEY, n_word, GAME_INI_FRAGMENT_NAME)):
+                self._log("Patch Game.ini: cancelled - left the existing unmarked "
+                          "fragment in place.")
+                return
+            remove_unmarked = True
+
+        new_text, n = merge_game_ini_fragment(existing, frag_text,
+                                              remove_unmarked=remove_unmarked)
+        merged = GAME_INI_SECTION.lower() in existing.lower()
+        where = ("merged into the existing %s section" % GAME_INI_SECTION if merged
+                 else "added as a new %s section at the top" % GAME_INI_SECTION)
+        if remove_unmarked:
+            action = "Replacing the existing entries with"
+        elif has_marked:
+            action = "Replacing the current auto-managed block with"
+        else:
+            action = "Applying"
+        # The unmarked / duplicate cases already got an explicit confirm; don't re-prompt.
+        if not remove_unmarked and not messagebox.askyesno(
+                "Patch Game.ini for randomized creatures",
+                "%s %d %s= entr%s from:\n\n%s\n\ninto:\n\n%s\n\nThey will be %s. "
+                "Everything else in Game.ini is left exactly as-is, and a timestamped "
+                "backup is made first (nothing is deleted).\n\nProceed?"
+                % (action, n, GAME_INI_FRAGMENT_KEY, "y" if n == 1 else "ies",
+                   frag_path, game_ini, where)):
+            self._log("Patch Game.ini: cancelled.")
+            return
+
+        self._clear_log()
+        # 4) Back up FIRST - same pattern as the config-upload backup (timestamped .bak
+        #    alongside the original). If the backup fails, Game.ini is left untouched.
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            backup = self._backup_file(game_ini, ts)
+            self._log("Backed up %s -> %s" % (game_ini, os.path.basename(backup)))
+        except OSError as exc:
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "Could not back up Game.ini, so it was NOT modified:\n\n%s" % exc)
+            self._log("! Patch Game.ini: backup failed (%s) - Game.ini not modified." % exc)
+            return
+
+        # 5) Write the patched version.
+        try:
+            write_text(game_ini, new_text, encoding=enc)
+        except OSError as exc:
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "Backup succeeded but writing the patched Game.ini failed:\n\n%s\n\nYour "
+                "original is safe at:\n%s" % (exc, backup))
+            self._log("! Patch Game.ini: write failed (%s). Backup at %s" % (exc, backup))
+            return
+
+        cleaned_note = (" Removed the previous unmarked duplicate wall." if remove_unmarked
+                        else "")
+        self._log("Patched %s: %d %s= line(s) %s.%s"
+                  % (game_ini, n, GAME_INI_FRAGMENT_KEY,
+                     "merged into existing section" if merged
+                     else "added in a new section at the top", cleaned_note))
+        messagebox.showinfo(
+            "ARKIpelago Launcher",
+            "Patched Game.ini with %d %s= line(s) (%s).%s\n\nBackup of the previous "
+            "version:\n%s\n\nRestart the ARK server for the randomized creatures to take "
+            "effect." % (n, GAME_INI_FRAGMENT_KEY, where, cleaned_note, backup))
+
     def open_server_root(self):
         self._open_folder(self.get("SERVER_ROOT"), "SERVER_ROOT")
+
+    def open_cluster_dir(self):
+        # Opens exactly the configured CLUSTERDIR (<SERVER_ROOT>\ServerCluster\ClusterData
+        # by default) - never its parent, so a missing ClusterData is reported instead of
+        # silently opening ServerCluster as a stand-in.
+        self._open_folder(self.get("CLUSTERDIR"), "CLUSTERDIR",
+                          "\n\nUse \"Create ServerCluster folders\" to create it.")
 
     # ------------------------------------------------- new-seed reset ------ #
     def _arkap_plugin_dir(self):
@@ -5818,20 +7393,29 @@ class ArkAPLauncher(tk.Tk):
         """Move path to <path>_backup_<ts> and recreate it empty (mirrors
         reset_ark_test.bat: the save is MOVED to a timestamped backup, not deleted),
         then VERIFY: count what was inside before the move and re-count inside the
-        backup after it. "Backed up" next to an empty backup folder is worse than no
-        message at all, so a move that carried nothing is reported as exactly that.
+        backup after it.
+
+        A folder that holds NO files is left in place and NO backup folder is created -
+        an empty timestamped backup next to a "backed up!" line is worse than saying
+        nothing was there, and the folder is already free of save data anyway.
 
         Returns a dict:
           kind   - 'moved' (files arrived), 'empty' (folder existed but held NO
-                   files), 'created' (didn't exist - made empty), 'error'
+                   files - left as-is, no backup), 'created' (didn't exist - made
+                   empty), 'error'
           path   - normalized live folder
-          backup - backup folder path ('moved'/'empty' only, else None)
+          backup - backup folder path ('moved' only, else None)
           files / bytes / saves - what the backup actually contains now
                    (saves = ARK_SAVE_EXTS files, the ones that really matter)
           detail - human-readable extra for 'error'"""
         path = os.path.normpath(path)
         if os.path.isdir(path):
             files_before, _bytes_before, _saves_before = count_dir_files(path)
+            # Nothing to back up: don't move it (that would create an empty _backup_
+            # folder). The folder is already save-free, so leave it exactly where it is.
+            if files_before == 0:
+                return {"kind": "empty", "path": path, "backup": None,
+                        "files": 0, "bytes": 0, "saves": 0, "detail": None}
             # shutil.move onto an EXISTING directory moves the source INSIDE it
             # instead of failing, which would bury one backup inside another (two
             # resets in the same second, or a re-run after a partial failure). Pick
@@ -5858,9 +7442,9 @@ class ArkAPLauncher(tk.Tk):
                         "detail": "backup holds %d file(s) but the folder had %d "
                                   "- the move did not carry everything"
                                   % (files_after, files_before)}
-            return {"kind": "moved" if files_after else "empty",
-                    "path": path, "backup": backup, "files": files_after,
-                    "bytes": bytes_after, "saves": saves_after, "detail": None}
+            return {"kind": "moved", "path": path, "backup": backup,
+                    "files": files_after, "bytes": bytes_after,
+                    "saves": saves_after, "detail": None}
         try:
             os.makedirs(path, exist_ok=True)
         except OSError as exc:
@@ -5936,6 +7520,9 @@ class ArkAPLauncher(tk.Tk):
         lines.append("  - back up (timestamped) then wipe these saves:")
         for label, path in save_targets:
             lines.append("      %s: %s" % (label, path))
+        lines.append("  - remove the randomized-creatures block from Game.ini if this "
+                     "launcher added one (backed up first), so the new seed starts "
+                     "un-randomized")
         lines += ["", "Backups are MOVED aside (not deleted). The ARK server must be "
                   "STOPPED first.", "", "Proceed?"]
         if not messagebox.askyesno("Full reset for new seed", "\n".join(lines)):
@@ -5950,22 +7537,22 @@ class ArkAPLauncher(tk.Tk):
             deleted, missing, errors = [], [], []
             self._log("Full reset: ArkAP plugin folder not found - skipped AP tracking.")
 
-        # 2) World save + optional per-map / cluster data - each move verified.
+        # 2) World save + optional per-map / cluster data - each move verified. One
+        #    recorder turns a _backup_and_clear_dir result into a log line and returns how
+        #    many world/character files it actually moved; reused for the junctions below.
         ts = time.strftime("%Y%m%d-%H%M%S")
         save_lines = []
         moved_saves = 0
-        for label, path in save_targets:
-            r = self._backup_and_clear_dir(path, ts)
+
+        def _record(label, r):
             if r["kind"] == "moved":
-                moved_saves += r["saves"]
                 save_lines.append(
                     "%s: backed up %d file(s), %s (%d world/character file(s)) -> %s"
-                    % (label, r["files"], fmt_bytes(r["bytes"]), r["saves"],
-                       r["backup"]))
-            elif r["kind"] == "empty":
+                    % (label, r["files"], fmt_bytes(r["bytes"]), r["saves"], r["backup"]))
+                return r["saves"]
+            if r["kind"] == "empty":
                 save_lines.append(
-                    "! %s: folder held NO files - nothing was actually backed up "
-                    "(empty backup at %s)" % (label, r["backup"]))
+                    "%s: no files to back up - skipped (no backup folder created)." % label)
             elif r["kind"] == "created":
                 save_lines.append("%s: nothing there yet - created empty %s"
                                   % (label, r["path"]))
@@ -5973,34 +7560,46 @@ class ArkAPLauncher(tk.Tk):
                 save_lines.append("! %s: could NOT reset %s (%s)"
                                   % (label, r["path"], r["detail"]))
                 errors.append("%s: %s" % (r["path"], r["detail"]))
+            return 0
 
-        # 3) Re-anchor the per-map junctions. Moving SAVESROOT aside just broke the
-        # target of every ShooterGame\Saved\Cluster-<Map> junction; left dangling,
-        # ARK can't save through it and the NEXT reset silently no-ops - so recreate
-        # each junction's target folder now, and shout about anything unhealable.
+        for label, path in save_targets:
+            moved_saves += _record(label, self._backup_and_clear_dir(path, ts))
+
+        # 3) Every ShooterGame\Saved\Cluster-<Map> entry, handled EXPLICITLY rather than
+        #    trusting the SAVESROOT move above to have reached it - a character surviving a
+        #    reset is almost always one of these left behind:
+        #      * a REAL folder (not a junction): its saves live here, physically outside
+        #        SAVESROOT, so clearing SAVESROOT never touched them - back it up + clear
+        #        it right here (this is the case that fully explains "character persisted").
+        #      * a junction whose target STILL resolves with data: it points somewhere the
+        #        SAVESROOT move didn't cover (SAVESROOT blank/mismatched, or a stale
+        #        target) - clear it through the link so nothing survives.
+        #      * a junction gone dangling (its target WAS under the SAVESROOT we just moved
+        #        aside): recreate the empty target so ARK can save through it next start.
+        # ponytail: a cleared real folder is recreated empty, so it stays a real folder and
+        # is re-cleared every reset - clean each time, but not self-healing back into a
+        # junction. Converting it back to a junction is the bigger SAVESROOT-vs-Saved
+        # architecture question, deliberately left out of this symptom fix.
         saved_root = os.path.join(root, "ShooterGame", "Saved")
         for jpath, target, resolves in list_map_junctions(saved_root):
             name = os.path.basename(jpath)
             if target is None:
-                save_lines.append(
-                    "! %s is a REAL folder, not a junction - anything saved in it "
-                    "was NOT part of this reset and will still be there on the next "
-                    "server start." % jpath)
-                errors.append("%s: real folder where a junction was expected" % jpath)
-                continue
-            if resolves:
-                save_lines.append("junction %s -> %s (ok)" % (name, target))
-                continue
-            try:
-                os.makedirs(target)
-                save_lines.append(
-                    "junction %s -> %s (dangling after the backup move - target "
-                    "recreated)" % (name, target))
-            except OSError as exc:
-                save_lines.append(
-                    "! junction %s -> %s is DANGLING and could not be repaired "
-                    "(%s). ARK cannot save through it." % (name, target, exc))
-                errors.append("%s: dangling junction (%s)" % (jpath, exc))
+                moved_saves += _record("%s (real folder in Saved, not a junction)" % name,
+                                       self._backup_and_clear_dir(jpath, ts))
+            elif resolves:
+                moved_saves += _record("junction %s -> %s" % (name, target),
+                                       self._backup_and_clear_dir(target, ts))
+            else:
+                try:
+                    os.makedirs(target)
+                    save_lines.append(
+                        "junction %s -> %s (dangling after the backup move - target "
+                        "recreated empty)" % (name, target))
+                except OSError as exc:
+                    save_lines.append(
+                        "! junction %s -> %s is DANGLING and could not be repaired "
+                        "(%s). ARK cannot save through it." % (name, target, exc))
+                    errors.append("%s: dangling junction (%s)" % (jpath, exc))
 
         # 4) The actual point of the reset: no world/character file may survive at
         # any live location. saved_root covers SavedArks AND every Cluster-<Map>
@@ -6017,6 +7616,37 @@ class ArkAPLauncher(tk.Tk):
                 "reset covers - there was nothing to reset. If you expected a "
                 "character to be wiped, it lives somewhere else: run "
                 "tools\\diagnose_reset.bat before starting the server.")
+
+        # 5) Randomized-creatures block in Game.ini: a fresh seed shouldn't inherit the
+        #    previous seed's dino randomization, so strip the app's marker block if one is
+        #    there (backed up first, same .bak pattern as the patch feature). ONLY our
+        #    marker block is touched - an unmarked hand-pasted fragment and every other
+        #    line stay exactly as they are, and a file with no block is a silent no-op.
+        game_ini = self._game_ini_path()
+        if game_ini and os.path.isfile(game_ini):
+            try:
+                gi_text, gi_enc = read_text(game_ini)
+            except OSError as exc:
+                save_lines.append("! Game.ini: could not read to check for a randomized-"
+                                  "creatures block (%s)" % exc)
+                errors.append("%s: %s" % (game_ini, exc))
+            else:
+                cleaned, removed = remove_game_ini_marked_block(gi_text)
+                if not removed:
+                    save_lines.append("Game.ini: no randomized-creatures block to remove.")
+                else:
+                    try:
+                        gi_backup = self._backup_file(game_ini, ts)
+                        write_text(game_ini, cleaned, encoding=gi_enc)
+                        save_lines.append(
+                            "Game.ini: randomized-creatures fragment removed (backup: %s)"
+                            % os.path.basename(gi_backup))
+                    except OSError as exc:
+                        save_lines.append("! Game.ini: found a randomized-creatures block "
+                                          "but could NOT remove it (%s)" % exc)
+                        errors.append("%s: %s" % (game_ini, exc))
+        else:
+            save_lines.append("Game.ini: not found - no randomized-creatures block to remove.")
 
         self._report_reset("Full reset for new seed",
                            plugin_dir or "(plugin not installed)",
@@ -6070,6 +7700,33 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showinfo("ARKIpelago Launcher",
                                  "%s complete.\n\n%s" % (label, summary))
 
+    def _preflight_bat(self, batname):
+        """(missing, unsaved, absent_files) for everything script_requirements() says
+        `batname` reads.
+
+        "unsaved" is decided by comparing the Configuration field against the value
+        actually written in the file - not against a dirty flag. That's the only honest
+        test: a value typed but never Saved simply isn't in the .bat, and the script
+        runs on whatever is (this is how SERVER_ROOT/CLUSTERDIR silently ran against
+        stale paths before). It also catches values Save REFUSED to write, e.g. a
+        relative path (see BAT_PATH_KEYS)."""
+        scripts = self._scripts_dir
+        missing, unsaved, absent = [], [], set()
+        texts = {}
+        for key, (fname, var) in sorted(script_requirements(batname).items()):
+            value = self.get(key)
+            if not value and key not in PREFLIGHT_BLANK_OK:
+                missing.append(key)
+                continue
+            if fname not in texts:
+                p = os.path.join(scripts, fname) if scripts else ""
+                texts[fname] = read_text(p)[0] if p and os.path.isfile(p) else None
+            if texts[fname] is None:
+                absent.add(fname)
+            elif bat_read_var(texts[fname], var) != value:
+                unsaved.append((key, fname))
+        return missing, unsaved, sorted(absent)
+
     def run_bat(self, batname):
         scripts = self._scripts_dir
         path = os.path.join(scripts, batname) if scripts else ""
@@ -6077,6 +7734,27 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showwarning("ARKIpelago Launcher",
                                    "%s not found in the scripts folder." % batname)
             return
+
+        missing, unsaved, absent = self._preflight_bat(batname)
+        if missing or unsaved or absent:
+            lines = ["%s reads settings that aren't ready yet, so it wasn't run:"
+                     % batname, ""]
+            for key in missing:
+                lines.append("  * %s is not set - fill it in on the Configuration tab, "
+                             "then click Save." % key)
+            for key, fname in unsaved:
+                lines.append("  * %s has unsaved changes - click Save on the "
+                             "Configuration tab first (it's written into %s)."
+                             % (key, fname))
+            for fname in absent:
+                lines.append("  * %s is missing from the scripts folder (%s) - click "
+                             "Save on the Configuration tab to recreate it."
+                             % (fname, scripts or "(not found)"))
+            text = "\n".join(lines)
+            messagebox.showwarning("ARKIpelago Launcher", text)
+            self._log(text)
+            return
+
         try:
             os.startfile(path)  # double-click behaviour: opens its own console window.
         except OSError as exc:
@@ -6565,5 +8243,32 @@ class ArkAPLauncher(tk.Tk):
             pass
 
 
+def _report_startup_crash(exc_type, exc_value, exc_tb):
+    """Last-resort handler for a crash before/around the mainloop (or one that escapes it):
+    log the full traceback next to the config file, then tell the user where it is instead
+    of the window just vanishing or a raw traceback flashing past in a console-less build."""
+    path = write_crash_log(exc_type, exc_value, exc_tb)
+    where = path or "%s (could not be written)" % crash_log_path()
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "ARKIpelago Launcher - Something went wrong",
+            "The launcher hit an unexpected error and has to close.\n\n"
+            "A full crash report was saved to:\n%s\n\n"
+            "Please attach that file (or use \"Export diagnostics\" on the Configuration "
+            "tab) when reporting this on Discord or GitHub." % where)
+        root.destroy()
+    except tk.TclError:
+        # No display at all - nothing more we can do beyond the log we already wrote.
+        pass
+
+
 if __name__ == "__main__":
-    ArkAPLauncher().mainloop()
+    try:
+        ArkAPLauncher().mainloop()
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: B036 - top-level catch-all is the whole point here
+        _report_startup_crash(*sys.exc_info())
+        sys.exit(1)
