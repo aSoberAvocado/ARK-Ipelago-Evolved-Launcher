@@ -106,3 +106,7 @@ Save only rewrites the one matching line for each field in each file, everything
 - If you want to restart your world for a new Archipelago seed, click **"Full reset for new seed"** under Quick Launch (stop the ARK server and the connector first).
 - If you randomized dinos, stop the ARK server and click **"Patch Game.ini for randomized creatures"** under Quick Launch. It applies the plugin's `ipc\game_ini_fragment.txt` into your `Game.ini` for you (backing it up first, and merging into an existing `[/script/shootergame.shootergamemode]` section rather than duplicating it), no more copy-pasting it by hand. Restart the server afterward.
   > The fragment only exists once you've connected to the server at least once on a randomized seed.
+
+
+
+**Thank you to Ghios, Beeno, Lurch9229, and Wizard_Brandon for helping test and put the entire ARK archipelago together**
