@@ -60,16 +60,19 @@ import sys
 import json
 import time
 import glob
+import zlib
 import ctypes
 import codecs
 import queue
 import shutil
+import struct
 import hashlib
 import zipfile
 import tempfile
 import webbrowser
 import threading
 import subprocess
+import collections
 import configparser
 import urllib.request
 import tkinter as tk
@@ -91,6 +94,15 @@ GROUPS = [
         ("BACKUPROOT",  "BACKUPROOT",            "folder"),
         ("PLUGINS_DIR", "ArkApi Plugins folder", "folder"),
     ]),
+    ("Connector", [
+        ("server",     "server",     "text"),
+        ("slot",       "slot",       "text"),
+        ("password",   "password",   "text"),
+        ("death_link", "death_link", "bool"),
+        ("ipc_dir",    "ipc_dir",    "folder"),
+        ("data_dir",   "data_dir",   "folder"),
+        ("game_ini",   "game_ini",   "file"),
+    ]),
     ("Network", [
         ("MAP",        "MAP",        "text"),
         ("SESSION",    "SESSION",    "text"),
@@ -102,15 +114,6 @@ GROUPS = [
         ("SERVERPASS", "SERVERPASS", "text"),
         ("TRIBUTEEXP", "TRIBUTEEXP", "text"),
     ]),
-    ("Connector", [
-        ("server",     "server",     "text"),
-        ("slot",       "slot",       "text"),
-        ("password",   "password",   "text"),
-        ("death_link", "death_link", "bool"),
-        ("ipc_dir",    "ipc_dir",    "folder"),
-        ("data_dir",   "data_dir",   "folder"),
-        ("game_ini",   "game_ini",   "file"),
-    ]),
     ("Cluster", [
         ("CLUSTERID", "CLUSTERID", "text"),
     ]),
@@ -121,11 +124,22 @@ GROUPS = [
     ]),
 ]
 
+# The filesystem-location fields "Clear all paths" and the per-field "C" button clear
+# (see _on_clear_all_paths / _clear_path_field) - SERVER_ROOT/SAVESROOT/CLUSTERDIR/
+# BACKUPROOT/PLUGINS_DIR (the "Paths" group above) plus ipc_dir/game_ini, which are
+# laid out under "Connector" but are just as much a physical path on disk. Deliberately
+# excludes the rest of Connector (server/slot/password/death_link/data_dir) and
+# Network - those aren't paths, and clearing them isn't what either button is for.
+PATH_GROUP_KEYS = ("SERVER_ROOT", "SAVESROOT", "CLUSTERDIR", "BACKUPROOT",
+                   "PLUGINS_DIR", "ipc_dir", "game_ini")
+
 # Hover tooltip text per field key: what it is, an example location, and any
 # recommended values / gotchas worth knowing before editing it.
 FIELD_HELP = {
     "connector_ini": (
-        "The Archipelago connector's config file (read/written by ark_ap_connector.py).\n"
+        "The optional standalone Python connector's config file (read/written by "
+        "ark_ap_connector.py). Only needed if you run that connector instead of the "
+        "in-game integrated connector - most users can leave this blank.\n"
         "Example: C:\\ARKServer\\ArkConnector\\connector.ini"
     ),
     "SERVER_ROOT": (
@@ -186,11 +200,19 @@ FIELD_HELP = {
     ),
     "server": (
         "Your Archipelago room address, host:port - shown when you host or join the "
-        "room.\n"
+        "room. Used to build the \"Copy ARK connection command\" you paste in-game, "
+        "and (if you also use the optional standalone connector) written into "
+        "connector.ini.\n"
         "Example: archipelago.gg:38281"
     ),
-    "slot": "Your Archipelago slot/player name, exactly as it appears in your .yaml (case-sensitive).",
-    "password": "Room password for the Archipelago server. Leave blank if the room has none.",
+    "slot": (
+        "Your Archipelago slot/player name, exactly as it appears in your .yaml "
+        "(case-sensitive). Used to build the in-game connection command."
+    ),
+    "password": (
+        "Room password for the Archipelago server. Leave blank if the room has none. "
+        "Used to build the in-game connection command."
+    ),
     "ipc_dir": (
         "The ArkAP plugin's ipc folder on THIS PC - where the plugin and the "
         "connector exchange files.\n"
@@ -827,7 +849,7 @@ GITHUB_API_USER_AGENT = "ArkAPLauncher"
 # and lays down an --onedir install, permanently ending the "Failed to load Python DLL" race
 # (which was the --onefile bootloader losing a lock-timing fight with AV over the freshly
 # extracted _MEI\python313.dll on the first launch after an update). See build.py --bridge.
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.2"
 UPDATE_REPO = "aSoberAvocado/ARK-Ipelago-Evolved-Launcher"
 # NEW clients discover updates from the releases LIST (newest release carrying a launcher
 # folder-zip wins), NOT from /releases/latest - that deliberately ignores GitHub's "Latest"
@@ -864,6 +886,46 @@ INSTALL_ARKAPI_BTN_HELP = (
     "Requires the ARK server to already be installed (Win64 must exist).\n"
     "Existing ArkApi files there are overwritten (upgrade-in-place) - your ArkAP plugin "
     "folder (Win64\\ArkApi\\Plugins\\ArkAP) is untouched, it isn't part of this download."
+)
+
+# --- Steam Workshop mods (Mods tab) --- #
+# ARK: Survival Evolved's Steam App ID - the same ID used for `+app_update` (server
+# binaries) above is also what `+workshop_download_item` downloads mods against, since
+# Workshop items are scoped to the app that published them.
+ARK_WORKSHOP_APPID = "346110"
+
+# Installed-mod location under SERVER_ROOT. The dedicated server looks for BOTH
+# `<id>\` (unpacked cooked content) and a sibling `<id>.mod` (packed metadata) directly
+# under here - neither alone is enough, see check_mod_installed.
+MODS_CONTENT_RELDIR = os.path.join("ShooterGame", "Content", "Mods")
+
+# Pre-populated, ArkAP-plugin-verified mod set (name, Workshop ID). Anything added via
+# "Add mod" is marked supported=False instead of joining this list - see MODS_KEY.
+SUPPORTED_MODS = [
+    {"id": "731604991",  "name": "Structures Plus (S+)"},
+    {"id": "1999447172", "name": "Super Structures"},
+    {"id": "1631378184", "name": "Explorer Note Tracker - Universal"},
+    {"id": "2594067220", "name": "Super Spyglass Plus"},
+    {"id": "821530042",  "name": "Upgrade Station v1.8i"},
+    {"id": "1609138312", "name": "Dino Storage v2"},
+    {"id": "1565015734", "name": "Kraken's Better Dinos"},
+    {"id": "1404697612", "name": "Awesome SpyGlass!"},
+    {"id": "889745138",  "name": "Awesome Teleporters!"},
+]
+
+# JSON key (in CONFIG_FILENAME) holding the mod list - id/name/enabled/supported dicts,
+# IN LOAD-ORDER (index 0 = highest ActiveMods= priority - ARK loads left-most first).
+# Written immediately on every change (toggle/reorder/add) via
+# _write_config_key, like THEME_KEY/REMINDER_HIDE_KEY above - a mod's enabled/order
+# state has nothing to do with the Configuration tab's fields or its Save button.
+MODS_KEY = "mods"
+
+MODS_TAB_HELP = (
+    "Download and activate Steam Workshop mods for this server. Checked = should be "
+    "installed and active; the icon shows whether it's actually installed on disk yet.\n"
+    "Order matters: mods load top-to-bottom, the topmost mod has the highest priority "
+    "(matches ActiveMods= order) - use the arrows to reorder.\n"
+    "Requires SERVER_ROOT set and the ARK server already installed."
 )
 
 
@@ -1601,6 +1663,143 @@ def merge_game_ini_fragment(existing_text, fragment_text, remove_unmarked=False)
     return txt[:at] + block + txt[at:], len(payload)
 
 
+# --------------------------------------------------------------------------- #
+#  Mod activation - GameUserSettings.ini [ServerSettings] ActiveMods
+# --------------------------------------------------------------------------- #
+# Phase 0 confirmed ARK: Survival Evolved activates Workshop mods ONLY via the
+# `ActiveMods=id1,id2,id3` line under [ServerSettings] of GameUserSettings.ini, in
+# left-to-right load-priority order. There is no `-mods=` launch arg for ASE (that's
+# Survival Ascended), so this deliberately does NOT touch start_ase_server.bat / paths.cmd:
+# ActiveMods is not a shared .bat variable, it has a single consumer (the server reading
+# its own ini), so the ini line itself IS the single source of truth. read_active_mods()
+# reads it straight back - the launcher config JSON only holds the GUI's editable intent
+# (which mods are known / checked), never a second authoritative copy of the active list.
+#
+# The write is a TARGETED single-key upsert, never a full-file rewrite, so a
+# GameUserSettings.ini the user uploaded via "Upload server config files" keeps every
+# other key and section byte-for-byte. Written UTF-8 without BOM (a BOM breaks ARK's
+# first section header - see apply_server_config.ps1).
+
+ACTIVE_MODS_SECTION = "ServerSettings"
+ACTIVE_MODS_KEY = "ActiveMods"  # capitalization matters to ARK - keep it exactly this.
+
+
+def _ini_section_bounds(lines, section):
+    """(header_index, body_end) for [section] in a list of lines (no line endings), or
+    None. body_end is the index of the next section header, or len(lines)."""
+    hdr = re.compile(r'^\s*\[' + re.escape(section) + r'\]\s*$', re.I)
+    any_hdr = re.compile(r'^\s*\[[^\]]+\]\s*$')
+    start = next((i for i, ln in enumerate(lines) if hdr.match(ln)), None)
+    if start is None:
+        return None
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if any_hdr.match(lines[i]):
+            end = i
+            break
+    return start, end
+
+
+def read_ini_key(text, section, key):
+    """The value of `key` inside [section] (stripped; "" if the key is present but empty),
+    or None if the section or key is absent. Case-insensitive on both."""
+    lines = text.splitlines()
+    bounds = _ini_section_bounds(lines, section)
+    if bounds is None:
+        return None
+    start, end = bounds
+    key_re = re.compile(r'^\s*' + re.escape(key) + r'\s*=(.*)$', re.I)
+    for i in range(start + 1, end):
+        m = key_re.match(lines[i])
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def upsert_ini_key(text, section, key, value):
+    """Return `text` with `key=value` set inside [section], touching nothing else.
+
+    Replaces the key's line in place if present; inserts it right under the header if the
+    section exists but the key doesn't; appends a fresh [section] at the end if neither
+    does. Line endings and every other line are preserved. This is the whole reason we
+    don't use configparser here - it would reorder keys, drop comments, and rewrite the
+    entire file (exactly what the 'targeted update, no full rewrite' requirement forbids)."""
+    nl = "\r\n" if "\r\n" in text else ("\r" if "\r" in text and "\n" not in text else "\n")
+    ended_nl = text.endswith(("\n", "\r"))
+    lines = text.splitlines()
+    new_line = "%s=%s" % (key, value)
+
+    bounds = _ini_section_bounds(lines, section)
+    if bounds is None:
+        if lines and lines[-1].strip():
+            lines.append("")  # blank line between the previous content and a new section
+        lines.append("[%s]" % section)
+        lines.append(new_line)
+    else:
+        start, end = bounds
+        key_re = re.compile(r'^\s*' + re.escape(key) + r'\s*=', re.I)
+        key_idx = next((i for i in range(start + 1, end) if key_re.match(lines[i])), None)
+        if key_idx is not None:
+            lines[key_idx] = new_line
+        else:
+            lines.insert(start + 1, new_line)
+
+    out = nl.join(lines)
+    if ended_nl:
+        out += nl
+    return out
+
+
+def _gameusersettings_path(server_root):
+    return os.path.join(os.path.normpath(server_root), SERVER_CONFIG_RELDIR,
+                        "GameUserSettings.ini")
+
+
+def read_active_mods(server_root):
+    """Ordered list of active mod IDs from GameUserSettings.ini's [ServerSettings]
+    ActiveMods - the AUTHORITATIVE on-disk activation state, read straight off disk so the
+    GUI reflects truth, not in-memory intent. [] if the file/section/key is absent or the
+    value is blank."""
+    if not server_root:
+        return []
+    path = _gameusersettings_path(server_root)
+    if not os.path.isfile(path):
+        return []
+    text, _enc = read_text(path)
+    raw = read_ini_key(text, ACTIVE_MODS_SECTION, ACTIVE_MODS_KEY)
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def set_active_mods(server_root, mod_ids, backup=True):
+    """Write the ordered list of active mod IDs into GameUserSettings.ini's
+    [ServerSettings] ActiveMods, comma-joined in order (left blank when the list is empty,
+    which disables all mods without removing the line). Targeted upsert - all other keys
+    and sections are preserved. Creates the file/section if missing. Backs the file up to
+    <file>.bak first (like the config-upload flow). Returns (ok, message)."""
+    if not server_root or not os.path.isdir(os.path.join(server_root, "ShooterGame")):
+        return False, ("SERVER_ROOT isn't set to an installed ARK server "
+                       "(no ShooterGame folder).")
+    value = ",".join(str(m).strip() for m in mod_ids)
+    path = _gameusersettings_path(server_root)
+    try:
+        if os.path.isfile(path):
+            text, _enc = read_text(path)
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            text = ""
+        new_text = upsert_ini_key(text, ACTIVE_MODS_SECTION, ACTIVE_MODS_KEY, value)
+        if backup and os.path.isfile(path):
+            shutil.copyfile(path, path + ".bak")
+        write_text(path, new_text)  # utf-8, no BOM (write_text passes no BOM)
+    except OSError as exc:
+        return False, "Couldn't write ActiveMods to GameUserSettings.ini: %s" % exc
+    if value:
+        return True, "Set ActiveMods=%s" % value
+    return True, "Cleared ActiveMods (all mods disabled)."
+
+
 def bat_read_var(text, var):
     """Return the value of `set "VAR=value"` in a batch file, or None if absent.
 
@@ -1680,11 +1879,6 @@ def ini_upsert(text, key, value):
 
 ARK_EXE_RELPATH = os.path.join("ShooterGame", "Binaries", "Win64", "ShooterGameServer.exe")
 
-STEAM_VDF_PATHS = [
-    r"C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf",
-    r"C:\Program Files\Steam\steamapps\libraryfolders.vdf",
-]
-
 # Deliberately scoped to common Windows drive letters, not A-Z - keeps the fallback
 # drive walk from wasting time probing letters that are virtually never real disks.
 COMMON_DRIVE_LETTERS = "CDEFGH"
@@ -1696,6 +1890,10 @@ SKIP_SCAN_DIR_NAMES = {
     "$recycle.bin", "system volume information", "appdata", "node_modules",
     "recovery", "perflogs", "config.msi", "windows.old", "$windows.~bt",
     "$windows.~ws", "msocache", "intel", "amd", "nvidia", ".git",
+    # A steamapps tree is a separately Steam-managed install, never the SERVER_ROOT
+    # this launcher itself installs into (see is_steamapps_path) - skipped so the
+    # broad drive walk can never wander into, let alone surface, one.
+    "steamapps",
 }
 
 # Hard caps so the fallback drive walk (run on a background thread) can never run away
@@ -1703,44 +1901,20 @@ SKIP_SCAN_DIR_NAMES = {
 MAX_SCAN_DIRS = 15000
 SCAN_TIME_BUDGET_SECONDS = 20.0
 
-# How many levels below a drive root (or Steam library) we'll look for the exe.
+# How many levels below a drive root we'll look for the exe.
 MAX_SCAN_DEPTH = 3
 
 
-def steam_library_dirs():
-    """Steam install dir(s) + any additional library folders from libraryfolders.vdf."""
-    dirs = []
-    for vdf in STEAM_VDF_PATHS:
-        if not os.path.isfile(vdf):
-            continue
-        try:
-            text, _ = read_text(vdf)
-        except OSError:
-            continue
-        for m in re.finditer(r'"path"\s*"([^"]+)"', text):
-            p = m.group(1).replace("\\\\", "\\")
-            if os.path.isdir(p):
-                dirs.append(p)
-        steam_root = os.path.dirname(os.path.dirname(vdf))  # .../Steam
-        if os.path.isdir(steam_root):
-            dirs.append(steam_root)
-    seen, out = set(), []
-    for d in dirs:
-        k = d.lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(d)
-    return out
-
-
 def direct_candidate_server_roots():
-    """Fixed, fast-to-check guesses: Steam libraries + the handful of folder layouts
-    people commonly install a manual ARK dedicated server into."""
+    """Fixed, fast-to-check guesses: the handful of folder layouts people commonly
+    install a manual ARK dedicated server into.
+
+    Deliberately excludes any Steam Library location (steamapps\\common\\...): that's
+    a separately Steam-managed install the user set up themselves at some other time,
+    never the copy this launcher installs via SteamCMD's -force_install_dir - see
+    is_steamapps_path. Adopting one here would silently point the launcher at the
+    wrong install."""
     cands = []
-    for lib in steam_library_dirs():
-        common = os.path.join(lib, "steamapps", "common")
-        cands.append(os.path.join(common, "ARK Survival Evolved Dedicated Server"))
-        cands.append(os.path.join(common, "ARK Survival Evolved"))
     for letter in COMMON_DRIVE_LETTERS:
         drive = "%s:\\" % letter
         if not os.path.isdir(drive):
@@ -1749,10 +1923,6 @@ def direct_candidate_server_roots():
             os.path.join(drive, "ARK", "Server"),
             os.path.join(drive, "ArkServer"),
             os.path.join(drive, "Games", "ARK Survival Evolved Dedicated Server"),
-            os.path.join(drive, "SteamLibrary", "steamapps", "common",
-                         "ARK Survival Evolved Dedicated Server"),
-            os.path.join(drive, "Steam", "steamapps", "common",
-                         "ARK Survival Evolved Dedicated Server"),
         ])
     return cands
 
@@ -1773,6 +1943,46 @@ def is_backup_snapshot_path(path):
     their ordinary live-looking names ("ServerCluster_backup_20260721-124852\\Saves"),
     so a basename-only test (classify_cluster_folder) happily classifies them."""
     return any(_BACKUP_SNAPSHOT_RE.search(part.lower())
+               for part in re.split(r"[\\/]", path or "") if part)
+
+
+def suggestion_sections(keys, suggestions, current_getter):
+    """Which of `keys` are worth showing in the Folder suggestions popup, and with
+    what current value, given `suggestions` (key -> [candidate path, ...]) and
+    `current_getter(key)` -> the field's current value ("" if unset).
+
+    A field is included whenever it has candidates AND at least one differs from the
+    current value - i.e. always when the field is empty, and also when re-scanning
+    turns up something other than what's already set. A field is dropped when every
+    candidate found for it is exactly the value it already has, since there's nothing
+    to compare there.
+
+    Returns [(key, current, cur_norm, matches), ...] in `keys` order, where cur_norm is
+    normcase(normpath(current)) (or None if current is empty) - the same normalized
+    form callers need to spot which candidate (if any) equals the current value."""
+    sections = []
+    for key in keys:
+        matches = suggestions.get(key)
+        if not matches:
+            continue
+        current = current_getter(key)
+        cur_norm = os.path.normcase(os.path.normpath(current)) if current else None
+        if cur_norm and all(os.path.normcase(os.path.normpath(m)) == cur_norm
+                             for m in matches):
+            continue
+        sections.append((key, current, cur_norm, matches))
+    return sections
+
+
+def is_steamapps_path(path):
+    """True if `path` lives anywhere inside a "steamapps" folder.
+
+    That's a separately Steam-managed install (a Steam Library copy) the user set up
+    themselves at some other time - never the copy this launcher installs and manages
+    itself via SteamCMD's -force_install_dir (which lays the game straight into
+    SERVER_ROOT, no steamapps\\common nesting). Never offered as SERVER_ROOT or any
+    other path candidate."""
+    return any(part.lower() == "steamapps"
                for part in re.split(r"[\\/]", path or "") if part)
 
 
@@ -2056,7 +2266,7 @@ def scoped_scan_paths(server_root, level, is_cancelled=None, progress=None):
         # Catches what the _walk_bounded prune can't: SERVER_ROOT itself sitting inside
         # a snapshot (the walk starts in there, so it never sees the snapshot root), and
         # the Quick tier, which lists folders directly instead of walking.
-        if is_backup_snapshot_path(path):
+        if is_backup_snapshot_path(path) or is_steamapps_path(path):
             return
         bucket = suggestions.setdefault(key, [])
         if not any(os.path.normcase(p) == os.path.normcase(path) for p in bucket):
@@ -2154,6 +2364,366 @@ def check_ark_server_installed(server_root):
         return False, "SERVER_ROOT is not set."
     exe = os.path.join(server_root, ARK_EXE_RELPATH)
     return os.path.isfile(exe), exe
+
+
+def check_mod_installed(server_root, mod_id):
+    """(ok, detail) - ok if both Content\\Mods\\<mod_id>\\ and Content\\Mods\\<mod_id>.mod
+    exist under server_root. Both are required for the server to recognize the mod -
+    see MODS_CONTENT_RELDIR."""
+    if not server_root:
+        return False, "SERVER_ROOT is not set."
+    mods_dir = os.path.join(server_root, MODS_CONTENT_RELDIR)
+    folder = os.path.join(mods_dir, mod_id)
+    mod_file = os.path.join(mods_dir, "%s.mod" % mod_id)
+    return (os.path.isdir(folder) and os.path.isfile(mod_file)), folder
+
+
+def is_mod_installed(server_root, mod_id):
+    """bool convenience wrapper over check_mod_installed - reads REAL disk state
+    (folder + sibling <id>.mod both present), never any cached/GUI value."""
+    return check_mod_installed(server_root, str(mod_id))[0]
+
+
+# --------------------------------------------------------------------------- #
+#  Steam Workshop mod install backend (Mods tab)
+# --------------------------------------------------------------------------- #
+# ARK's Steam Workshop items don't drop in ready to use. SteamCMD leaves each cooked
+# asset as a `.z` chunk-compressed blob, and the `<id>.mod` metadata file the server
+# needs is NOT in the download at all - it has to be generated from mod.info /
+# modmeta.info. Both the `.z` format and the `.mod` binary layout are Wildcard's own,
+# undocumented and community-reverse-engineered years ago. The two routines below are
+# ported to match the long-standing, battle-tested tools (barrycarey/Ark_Mod_Downloader,
+# project-umbrella/arkit.py, TheCherry/ark-server-manager - all tracing back to the
+# original "Ark Server Launcher" by Face Wound) rather than hand-rolled, precisely
+# because a subtly-wrong byte yields a valid-LOOKING .mod the server silently won't load.
+
+# 8-byte little-endian header signature at the start of every ARK `.z` file. Confirmed
+# identical across arkit.py (reads it as 2653586369) and TheCherry (0x9E2A70C1, the same
+# 4 low bytes read signed).
+_Z_FILE_SIGNATURE = 2653586369
+
+# Magic constant written into every .mod file right after the map-name list. Its meaning
+# is unknown (the reference calls it "Not sure of the reason for this") but it is a fixed
+# value in every working .mod, so it's reproduced verbatim.
+_MOD_FILE_MAGIC = 4280483635
+
+ModInstallResult = collections.namedtuple(
+    "ModInstallResult", ["ok", "mod_id", "reason", "message"])
+# reason is None on success, else a short category for the GUI to branch on:
+#   "no_server" | "invalid_id" | "steamcmd_missing" | "network" |
+#   "download_failed" | "partial_download" | "extract" | "install"
+
+# How many times to (re)run the SteamCMD workshop download before giving up. Anonymous
+# workshop_download_item is genuinely flaky - it routinely fails a first attempt with a
+# generic "failed (Failure)" and succeeds on a retry (the ARK server install help says the
+# same about app_update). ponytail: fixed small retry, no backoff - if this proves too
+# few in the wild, raise the count rather than adding exponential-backoff machinery.
+_MOD_DOWNLOAD_ATTEMPTS = 3
+
+
+def _ue4_write_string(f, text):
+    """Serialize an UE4 FString: int32 length (INCLUDING the trailing NUL), the UTF-8
+    bytes, then one NUL byte. Mirrors the reference read_ue4_string's read(count)[:-1]."""
+    data = text.encode("utf-8")
+    f.write(struct.pack("<i", len(data) + 1))
+    f.write(data)
+    f.write(b"\x00")
+
+
+def _ue4_read_string(f):
+    """Inverse of _ue4_write_string. A negative length means an UTF-16 string, which
+    these two files never use - treated as empty, matching the reference parsers."""
+    (count,) = struct.unpack("<i", f.read(4))
+    if count <= 0:
+        return ""
+    return f.read(count)[:-1].decode("utf-8", "replace")
+
+
+def _decompress_z_file(src, dst):
+    """Expand one ARK `.z` chunk-compressed file to dst. Raises ValueError on a bad
+    signature or a chunk that doesn't inflate to its declared size (a corrupt/partial
+    download). Header is 4x int64: signature, max-chunk-size, packed-total,
+    unpacked-total; then (packed, unpacked) size pairs per chunk until the unpacked
+    sizes add up; then the compressed chunks themselves."""
+    with open(src, "rb") as f:
+        header = f.read(32)
+        if len(header) < 32:
+            raise ValueError("truncated .z header in %s" % src)
+        sig, _chunk_max, _packed_total, unpacked_total = struct.unpack("<qqqq", header)
+        if sig != _Z_FILE_SIGNATURE:
+            raise ValueError("bad .z signature in %s" % src)
+        chunks = []
+        acc = 0
+        while acc < unpacked_total:
+            packed, unpacked = struct.unpack("<qq", f.read(16))
+            chunks.append((packed, unpacked))
+            acc += unpacked
+        with open(dst, "wb") as out:
+            for packed, unpacked in chunks:
+                data = zlib.decompress(f.read(packed))
+                if len(data) != unpacked:
+                    raise ValueError("chunk size mismatch in %s" % src)
+                out.write(data)
+
+
+def _extract_z_files(content_dir):
+    """Decompress every `.z` under content_dir in place, then delete the `.z` and its
+    `.uncompressed_size` sidecar (the server wants the plain assets). Returns the count
+    extracted. Raises ValueError (from _decompress_z_file) on the first bad file."""
+    extracted = 0
+    for curdir, _subdirs, files in os.walk(content_dir):
+        for name in files:
+            root, ext = os.path.splitext(name)
+            if ext != ".z":
+                continue
+            src = os.path.join(curdir, name)
+            _decompress_z_file(src, os.path.join(curdir, root))
+            os.remove(src)
+            sidecar = os.path.join(curdir, name + ".uncompressed_size")
+            if os.path.isfile(sidecar):
+                os.remove(sidecar)
+            extracted += 1
+    return extracted
+
+
+def _parse_mod_info(path):
+    """mod.info -> ordered list of map/asset name strings that go into the .mod file."""
+    with open(path, "rb") as f:
+        _ue4_read_string(f)  # the mod's own name - not needed here
+        (count,) = struct.unpack("<i", f.read(4))
+        names = []
+        for _ in range(count):
+            name = _ue4_read_string(f)
+            if name:
+                names.append(name)
+        return names
+
+
+def _parse_modmeta_info(path):
+    """modmeta.info -> {key: value}. int32 pair-count, then length-prefixed key then
+    length-prefixed value per pair (e.g. {'ModType': '1'} for a total-conversion)."""
+    meta = {}
+    with open(path, "rb") as f:
+        (total,) = struct.unpack("<i", f.read(4))
+        for _ in range(total):
+            key = _ue4_read_string(f)
+            val = _ue4_read_string(f)
+            if key and val:
+                meta[key] = val
+    return meta
+
+
+def _build_dot_mod_bytes(mod_id, map_names, meta_data):
+    """Serialize the `<id>.mod` metadata file the dedicated server reads to recognize an
+    installed mod. Byte layout ported verbatim from the reference create_mod_file."""
+    from io import BytesIO
+    buf = BytesIO()
+    # modId as int32 + 4 zero pad bytes (the reference's struct.pack('ixxxx', id)).
+    buf.write(struct.pack("<i", int(mod_id)))
+    buf.write(b"\x00\x00\x00\x00")
+    _ue4_write_string(buf, "ModName")
+    _ue4_write_string(buf, "")
+    buf.write(struct.pack("<i", len(map_names)))
+    for name in map_names:
+        _ue4_write_string(buf, name)
+    buf.write(struct.pack("<I", _MOD_FILE_MAGIC))
+    buf.write(struct.pack("<i", 2))
+    # ModType flag byte. The reference's struct.pack('p', b'1'/'b0') collapses to a single
+    # 0x00 for EVERY mod (verified - a width-1 'p' field has no room for content), and that
+    # is what the whole ecosystem ships and the server accepts. Every mod in the supported
+    # set is a content mod (no 'ModType' in meta) where 0x00 is definitionally correct.
+    # ponytail: hard-coded 0x00 to match proven output; a map/total-conversion mod may want
+    # 0x01 here - untested, revisit only if one is ever actually added.
+    buf.write(b"\x00")
+    buf.write(struct.pack("<i", len(meta_data)))
+    for key, val in meta_data.items():
+        _ue4_write_string(buf, key)
+        _ue4_write_string(buf, val)
+    return buf.getvalue()
+
+
+def _workshop_download_dir(steamcmd_exe, mod_id):
+    """Where SteamCMD actually drops a workshop item. It ignores +force_install_dir for
+    workshop content and always writes under its own install folder, so this is derived
+    from the steamcmd.exe location, not SERVER_ROOT."""
+    return os.path.join(os.path.dirname(steamcmd_exe), "steamapps", "workshop",
+                        "content", ARK_WORKSHOP_APPID, str(mod_id))
+
+
+def _classify_steamcmd_failure(output_text):
+    """Best-effort reason category from SteamCMD's console output when a download didn't
+    land. SteamCMD prints the same generic 'failed (Failure)' for a bad ID, a transient
+    content-server hiccup, and rate limiting, so a wrong ID can't be told apart from a
+    retryable blip with confidence - hence the default is the softer "download_failed"
+    (retry-first) rather than accusing the user's ID. ponytail: string-scan heuristic,
+    upgrade only if SteamCMD ever grows real distinguishable exit codes."""
+    low = output_text.lower()
+    if any(s in low for s in ("timeout", "no connection", "could not connect",
+                              "no subscription", "rate limit", "connection error")):
+        return "network"
+    return "download_failed"
+
+
+def _run_steamcmd_workshop_download(steamcmd_exe, mod_id, log):
+    """Run `+workshop_download_item 346110 <id>` and stream each console line to log().
+    Returns (returncode, full_output_text). Uses the same _ConsoleLineSplitter the server
+    installer uses so SteamCMD's \\r-rewritten progress line shows up live."""
+    cmd = [steamcmd_exe, "+login", "anonymous",
+           "+workshop_download_item", ARK_WORKSHOP_APPID, str(mod_id), "+quit"]
+    log("Running: %s" % " ".join(cmd))
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.Popen(
+        cmd, cwd=os.path.dirname(steamcmd_exe), stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=0, creationflags=creationflags)
+    splitter = _ConsoleLineSplitter()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    captured = []
+    while True:
+        chunk = proc.stdout.read(1024)
+        if not chunk:
+            break
+        for line in splitter.feed(decoder.decode(chunk)):
+            captured.append(line)
+            log(line)
+    rest = splitter.flush()
+    if rest:
+        captured.append(rest)
+        log(rest)
+    proc.stdout.close()
+    return proc.wait(), "\n".join(captured)
+
+
+def download_and_install_mod(mod_id, server_root, steamcmd_exe, log=None):
+    """Download one ARK Workshop mod via SteamCMD and install it so the dedicated server
+    recognizes it: decompress the `.z` assets, copy them into
+    SERVER_ROOT\\ShooterGame\\Content\\Mods\\<id>\\, and generate the sibling <id>.mod.
+
+    Returns a ModInstallResult(ok, mod_id, reason, message). Never raises for an expected
+    failure (bad ID, offline, partial/corrupt download) - those come back as ok=False with
+    a plain-language message and a reason category. `log` is an optional callable(str) fed
+    every SteamCMD console line and each install step (the Mods tab passes _mods_log_line).
+    """
+    mod_id = str(mod_id).strip()
+    log = log or (lambda _line: None)
+
+    if not server_root or not os.path.isdir(os.path.join(server_root, "ShooterGame")):
+        return ModInstallResult(False, mod_id, "no_server",
+                                "SERVER_ROOT isn't set to an installed ARK server "
+                                "(no ShooterGame folder). Install the server first.")
+    if not mod_id.isdigit():
+        return ModInstallResult(False, mod_id, "invalid_id",
+                                "\"%s\" isn't a valid Workshop ID - it should be the "
+                                "number from the mod's Steam Workshop URL." % mod_id)
+    if not steamcmd_exe or not os.path.isfile(steamcmd_exe):
+        return ModInstallResult(False, mod_id, "steamcmd_missing",
+                                "SteamCMD wasn't found. Install the ARK server first - "
+                                "that's what sets SteamCMD up.")
+
+    # SteamCMD workshop downloads are flaky - retry a few times before giving up (see
+    # _MOD_DOWNLOAD_ATTEMPTS). Success is judged by disk state (mod.info present), not the
+    # exit code, which SteamCMD returns as 0 even on "failed (Failure)".
+    content_dir = None
+    output = ""
+    for attempt in range(1, _MOD_DOWNLOAD_ATTEMPTS + 1):
+        if attempt > 1:
+            log("Download didn't complete - retrying (attempt %d of %d)..."
+                % (attempt, _MOD_DOWNLOAD_ATTEMPTS))
+        try:
+            _rc, output = _run_steamcmd_workshop_download(steamcmd_exe, mod_id, log)
+        except OSError as exc:
+            return ModInstallResult(False, mod_id, "steamcmd_missing",
+                                    "Couldn't launch SteamCMD: %s" % exc)
+        download_dir = _workshop_download_dir(steamcmd_exe, mod_id)
+        candidate = os.path.join(download_dir, "WindowsNoEditor")
+        if not os.path.isdir(candidate):
+            # Some items unpack straight into <id>\ with no WindowsNoEditor layer.
+            candidate = download_dir
+        if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "mod.info")):
+            content_dir = candidate
+            break
+    if content_dir is None:
+        reason = _classify_steamcmd_failure(output)
+        if reason == "network":
+            msg = ("SteamCMD couldn't reach Steam to download %s. Check your internet "
+                   "connection and try again." % mod_id)
+        else:
+            msg = ("SteamCMD couldn't finish downloading Workshop ID %s after %d tries. "
+                   "This is often a temporary Steam issue - try again in a moment. If it "
+                   "keeps failing, double-check the ID is correct and is an ARK: Survival "
+                   "Evolved mod." % (mod_id, _MOD_DOWNLOAD_ATTEMPTS))
+        return ModInstallResult(False, mod_id, reason, msg)
+
+    # Copy the RAW (still .z-compressed) download into the destination FIRST, then
+    # decompress there. Extracting inside SteamCMD's own workshop folder would delete its
+    # .z files and corrupt its record of the item, after which SteamCMD aborts EVERY later
+    # workshop download while re-validating installed items ("Missing game files"). Doing
+    # the extraction in our own dest leaves SteamCMD's copy pristine so the next mod's
+    # download still works.
+    mods_dir = os.path.join(server_root, MODS_CONTENT_RELDIR)
+    dest_folder = os.path.join(mods_dir, mod_id)
+    dot_mod_path = os.path.join(mods_dir, "%s.mod" % mod_id)
+    try:
+        os.makedirs(mods_dir, exist_ok=True)
+        if os.path.isdir(dest_folder):
+            shutil.rmtree(dest_folder)
+        log("Copying into %s" % dest_folder)
+        shutil.copytree(content_dir, dest_folder)
+    except OSError as exc:
+        return ModInstallResult(False, mod_id, "install",
+                                "Downloaded %s but couldn't copy it into the server's "
+                                "Content\\Mods folder: %s" % (mod_id, exc))
+
+    log("Decompressing mod files...")
+    try:
+        extracted = _extract_z_files(dest_folder)
+    except ValueError as exc:
+        return ModInstallResult(False, mod_id, "extract",
+                                "Couldn't decompress the downloaded files for %s - the "
+                                "download looks corrupted. Try Verify/Redownload. (%s)"
+                                % (mod_id, exc))
+    log("Decompressed %d file(s)." % extracted)
+
+    try:
+        map_names = _parse_mod_info(os.path.join(dest_folder, "mod.info"))
+        meta_path = os.path.join(dest_folder, "modmeta.info")
+        meta_data = _parse_modmeta_info(meta_path) if os.path.isfile(meta_path) else {}
+        with open(dot_mod_path, "wb") as f:
+            f.write(_build_dot_mod_bytes(mod_id, map_names, meta_data))
+    except (OSError, struct.error) as exc:
+        return ModInstallResult(False, mod_id, "partial_download",
+                                "The download for %s finished but its mod info couldn't "
+                                "be read - it may be incomplete. Try Verify/Redownload. "
+                                "(%s)" % (mod_id, exc))
+
+    if not is_mod_installed(server_root, mod_id):
+        return ModInstallResult(False, mod_id, "install",
+                                "Installed %s but the folder or .mod file is missing "
+                                "afterwards - something went wrong copying it." % mod_id)
+    log("Installed %s successfully." % mod_id)
+    return ModInstallResult(True, mod_id, None, "Installed %s." % mod_id)
+
+
+def uninstall_mod(server_root, mod_id):
+    """Delete a mod's installed files: Content\\Mods\\<id>\\ and the sibling <id>.mod.
+    Returns (ok, message). Idempotent - a mod that isn't there is a no-op success. Only
+    ever removes this launcher's own downloaded mod folders (named by numeric Workshop
+    id), never anything else under Content\\Mods (e.g. the stock DLC map folders)."""
+    mod_id = str(mod_id)
+    mods_dir = os.path.join(server_root, MODS_CONTENT_RELDIR)
+    folder = os.path.join(mods_dir, mod_id)
+    dot_mod = os.path.join(mods_dir, "%s.mod" % mod_id)
+    removed = False
+    try:
+        if os.path.isdir(folder):
+            shutil.rmtree(folder)
+            removed = True
+        if os.path.isfile(dot_mod):
+            os.remove(dot_mod)
+            removed = True
+    except OSError as exc:
+        return False, "Couldn't remove %s: %s" % (mod_id, exc)
+    return True, ("Uninstalled %s." % mod_id if removed
+                  else "%s was not installed - nothing to remove." % mod_id)
 
 
 def check_arkapi_installed(server_root):
@@ -2476,6 +3046,17 @@ class ArkAPLauncher(tk.Tk):
         self._plugin_thread = None
         self._hide_install_reminder = self._read_hide_reminder_flag()
 
+        # Mods tab state - ordered list of {"id","name","enabled","supported"} dicts;
+        # order IS load priority (see MODS_KEY). Loaded once here, every mutation
+        # re-persists immediately via _save_mods_config.
+        self._mods = self._load_mods_config()
+        self._mods_selected_id = None   # workshop id the Verify/Open-Workshop buttons act on
+        self._mods_action_buttons = []  # populated by _build_mods_tab; disabled when gated
+        # Mod download/install worker (own log widget, but shares SteamCMD + SERVER_ROOT
+        # with the other installers, so it joins _any_install_running for mutual exclusion).
+        self._mods_queue = queue.Queue()
+        self._mods_thread = None
+
         # Broad SERVER_ROOT auto-detect state (Steam libraries / common drive roots).
         self._detect_queue = queue.Queue()
         self._detect_thread = None
@@ -2676,18 +3257,21 @@ class ArkAPLauncher(tk.Tk):
         tab_config = ttk.Frame(notebook)
         tab_profiles = ttk.Frame(notebook)
         tab_install = ttk.Frame(notebook)
+        tab_mods = ttk.Frame(notebook)
         tab_status = ttk.Frame(notebook)
         tab_debug = ttk.Frame(notebook)
         tab_instructions = ttk.Frame(notebook)
         notebook.add(tab_config, text="Configuration")
         notebook.add(tab_profiles, text="Profiles")
         notebook.add(tab_install, text="Server Install")
+        notebook.add(tab_mods, text="Mods")
         notebook.add(tab_status, text="Setup Status")
         notebook.add(tab_debug, text="Debug Log")
         notebook.add(tab_instructions, text="Instructions")
         self.notebook = notebook
         self.tab_profiles = tab_profiles
         self.tab_install = tab_install
+        self.tab_mods = tab_mods
         self.tab_status = tab_status
         self.tab_debug = tab_debug
         self.tab_instructions = tab_instructions
@@ -2821,6 +3405,19 @@ class ArkAPLauncher(tk.Tk):
                         "Existing folders are left untouched." % CLUSTER_ROOT_DIRNAME,
                         wraplength=520)
 
+                self.clear_paths_btn = ttk.Button(
+                    crow, text="Clear all paths", command=self._on_clear_all_paths)
+                self.clear_paths_btn.pack(side="left", padx=(6, 0))
+                Tooltip(self.clear_paths_btn,
+                        "Blanks SERVER_ROOT / SAVESROOT / CLUSTERDIR / BACKUPROOT / "
+                        "ArkApi Plugins folder / ipc_dir / game_ini back to a fresh, "
+                        "never-configured state (same greyed-out example text you'd see "
+                        "on a brand new install).\n"
+                        "Doesn't touch anything on disk - existing folders/files are left "
+                        "exactly as they are. Click Save afterward for the cleared fields "
+                        "to actually take effect in the scripts.",
+                        wraplength=520)
+
             for key, label, kind in fields:
                 var = tk.StringVar()
                 self.vars[key] = var
@@ -2842,6 +3439,14 @@ class ArkAPLauncher(tk.Tk):
                         ttk.Button(row, text="Browse...", width=10,
                                    command=lambda k=key, t=kind: self._browse(k, t)
                                    ).grid(row=1, column=1, sticky="e")
+                        if key in PATH_GROUP_KEYS:
+                            clear_btn = ttk.Button(
+                                row, text="C", width=2,
+                                command=lambda k=key: self._clear_path_field(k))
+                            clear_btn.grid(row=1, column=2, sticky="e", padx=(4, 0))
+                            Tooltip(clear_btn, "Clear this field back to blank. Doesn't "
+                                    "touch anything on disk - Save afterward to write the "
+                                    "cleared value into the scripts.")
 
                 self._entries[key] = entry_widget
                 example = (PLACEHOLDER_EXAMPLES.get(key) if kind in ("folder", "file")
@@ -2977,6 +3582,7 @@ class ArkAPLauncher(tk.Tk):
         self.log.pack(fill="x", pady=(8, 0))
 
         self._build_install_tab(tab_install)
+        self._build_mods_tab(tab_mods)
         self._build_setup_status_tab(tab_status)
         self._build_debug_log_tab(tab_debug)
         self._build_profiles_tab(tab_profiles)
@@ -3186,8 +3792,28 @@ class ArkAPLauncher(tk.Tk):
                 % "\n".join(errors))
 
     def _build_install_tab(self, parent):
-        wrap = ttk.Frame(parent, padding=(10, 8))
-        wrap.pack(fill="both", expand=True)
+        # Scrollable container - same Canvas + Scrollbar pattern as the Configuration
+        # and Setup Status tabs, since three installers plus the manual-downloads
+        # section grow past shorter windows. `wrap` stays the parent of every row below,
+        # it's just now the canvas's inner frame instead of packed straight into `parent`.
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        wrap = ttk.Frame(canvas, padding=(10, 8))
+        inner_id = canvas.create_window((0, 0), window=wrap, anchor="nw")
+        wrap.bind("<Configure>",
+                  lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
 
         # Install location -------------------------------------------------------
         loc = ttk.LabelFrame(wrap, text="Install Location", padding=(8, 6))
@@ -3258,7 +3884,7 @@ class ArkAPLauncher(tk.Tk):
         # from the user's unzipped ArkAP_plugin download into <PLUGINS_DIR>\ArkAP. The
         # plugin payload is deliberately NOT bundled in this exe, so it keeps working when
         # the plugin is updated independently - the user points at the download once.
-        plug = ttk.LabelFrame(wrap, text="Install ArkAP Plugin", padding=(8, 6))
+        plug = ttk.LabelFrame(wrap, text="Install/update ArkAP Plugin", padding=(8, 6))
         plug.pack(fill="x", pady=(8, 0))
         ttk.Label(plug, wraplength=640, justify="left",
                   text="Downloads the latest ArkAP plugin from GitHub and installs it into "
@@ -3289,6 +3915,551 @@ class ArkAPLauncher(tk.Tk):
                        "the releases page below.").pack(anchor="w")
         ttk.Button(ext, text="Open Releases Page",
                    command=lambda: webbrowser.open(RELEASES_URL)).pack(anchor="w", pady=(4, 0))
+
+    # ------------------------------------------------------------ Mods tab --- #
+    def _build_mods_tab(self, parent):
+        wrap = ttk.Frame(parent, padding=(10, 8))
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="Mods", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(wrap, foreground=self.theme["subtle_fg"], wraplength=640, justify="left",
+                  text=MODS_TAB_HELP).pack(anchor="w", pady=(2, 6))
+
+        # Prerequisite banner - shown/hidden by _refresh_mods_tab, same idea as the
+        # Configuration tab's install reminder (reminder_banner). Left unpacked here;
+        # the Mods tab is populated lazily on first visit (see _on_tab_changed), same
+        # as Setup Status, so there's nothing worth deciding about it until then.
+        self.mods_gate_banner = tk.Frame(wrap, background=self.theme["warn_bg"],
+                                          highlightbackground=self.theme["warn_border"],
+                                          highlightthickness=1)
+        tk.Label(self.mods_gate_banner, background=self.theme["warn_bg"],
+                 foreground=self.theme["warn_fg"], justify="left", wraplength=460,
+                 text="Set SERVER_ROOT and install the ARK server first - mods install "
+                      "into SERVER_ROOT's Content\\Mods folder."
+                 ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
+        ttk.Button(self.mods_gate_banner, text="Go to Server Install",
+                   command=self._goto_install_tab).pack(side="right", padx=6, pady=4)
+
+        top = ttk.Frame(wrap)
+        top.pack(fill="both", expand=True, pady=(6, 0))
+        self._mods_top_frame = top  # anchor mods_gate_banner packs before this
+
+        # Above the list, left side: bulk-check the boxes only (same as clicking each
+        # one individually via _on_mod_toggle) - no install/uninstall/activation happens
+        # here. Save or Download checked is still what applies it afterwards.
+        checkrow = ttk.Frame(wrap)
+        checkrow.pack(fill="x", anchor="w", before=top)
+        self.mods_check_all_btn = ttk.Button(checkrow, text="Check all",
+                                              command=self.on_mods_check_all)
+        self.mods_check_all_btn.pack(side="left", padx=(0, 4))
+        Tooltip(self.mods_check_all_btn,
+                "Ticks every mod's checkbox (verified and unsupported alike). GUI only - "
+                "same as ticking each box by hand. Press Download checked and/or Save "
+                "afterwards to actually apply it.")
+        self._mods_action_buttons.append(self.mods_check_all_btn)
+        self.mods_uncheck_all_btn = ttk.Button(checkrow, text="Uncheck all",
+                                                command=self.on_mods_uncheck_all)
+        self.mods_uncheck_all_btn.pack(side="left")
+        Tooltip(self.mods_uncheck_all_btn,
+                "Unticks every mod's checkbox. GUI only - same as unticking each box by "
+                "hand. Press Save afterwards to actually apply it.")
+        self._mods_action_buttons.append(self.mods_uncheck_all_btn)
+
+        # Top-left: scrollable, ordered mod list - same Canvas + Scrollbar pattern as
+        # the Configuration/Server Install/Setup Status tabs.
+        list_outer = ttk.Frame(top)
+        list_outer.pack(side="left", fill="both", expand=True)
+        canvas = tk.Canvas(list_outer, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
+        vsb = ttk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.mods_items_frame = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=self.mods_items_frame, anchor="nw")
+        self.mods_items_frame.bind(
+            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+
+        # Top-right: slim action button column.
+        btns = ttk.Frame(top, padding=(8, 0))
+        btns.pack(side="left", fill="y")
+
+        def _add_btn(text, command, tooltip=None, gated=True):
+            b = ttk.Button(btns, text=text, command=command, width=20)
+            b.pack(fill="x", pady=2)
+            if tooltip:
+                Tooltip(b, tooltip, wraplength=280)
+            if gated:
+                self._mods_action_buttons.append(b)
+            return b
+
+        # Save applies the checkbox state above to disk right now - the same
+        # warn_bg/warn_border halo as the Configuration tab's Save button (see
+        # save_btn_halo), so "you have unapplied changes here" reads the same way in
+        # both places. Checking/unchecking a mod (individually, or in bulk via Check
+        # all/Uncheck all - see _on_mod_toggle/on_mods_check_all/on_mods_uncheck_all)
+        # only ever edits in-memory intent - Save (or Download checked) is what
+        # actually writes ActiveMods.
+        self.mods_save_btn_halo = tk.Frame(btns, background=self.theme["warn_bg"],
+                                           highlightbackground=self.theme["warn_border"],
+                                           highlightthickness=1)
+        self.mods_save_btn_halo.pack(fill="x", pady=2)
+        self.mods_save_btn = ttk.Button(self.mods_save_btn_halo, text="Save",
+                                        command=self.on_mods_save)
+        self.mods_save_btn.pack(fill="x", padx=2, pady=2)
+        Tooltip(self.mods_save_btn,
+                "Apply the checkboxes above to GameUserSettings.ini's ActiveMods right "
+                "now, in this list's order (checked + actually installed = active, "
+                "everything else = inactive). A checked mod that isn't installed yet is "
+                "left inactive and noted in the log - Download checked installs it "
+                "first. Restart the ARK server afterwards for the change to take "
+                "effect.", wraplength=280)
+        self._mods_action_buttons.append(self.mods_save_btn)
+
+        self.mods_download_btn = _add_btn(
+            "Download checked", self.on_mods_download_checked,
+            "Runs SteamCMD's workshop download for every checked mod not yet "
+            "installed, then activates it. Not wired up yet (coming in a later step).")
+        self.mods_add_btn = _add_btn(
+            "Add mod...", self.on_mods_add,
+            "Add a raw Workshop mod ID not in the supported list above.", gated=False)
+        self.mods_uninstall_btn = _add_btn(
+            "Uninstall unchecked", self.on_mods_uninstall_unchecked,
+            "Deletes the installed files for every mod that's currently unchecked, "
+            "freeing disk space. Not wired up yet (coming in a later step).")
+        self.mods_verify_btn = _add_btn(
+            "Verify/Redownload", self.on_mods_verify_redownload,
+            "Re-runs the Workshop download for the selected mod, in case it's "
+            "corrupted or partially downloaded. Not wired up yet (coming in a later step).")
+        self.mods_workshop_btn = _add_btn(
+            "Open Workshop page", self.on_mods_open_workshop_page,
+            "Opens the selected mod's Steam Workshop page in your browser.",
+            gated=False)
+        # Copy the checked IDs for pasting into the plugin's YAML. Not gated - it only
+        # reads the checkbox state, and prepping a YAML doesn't require a server yet.
+        self.mods_copy_ids_btn = _add_btn(
+            "Copy active IDs", self.on_mods_copy_active_ids,
+            "Copy the IDs of every checked mod (in this list's top-to-bottom order) to "
+            "the clipboard as a comma-separated list, ready to paste into the plugin's "
+            "YAML mod configuration. Includes unsupported/added mods if they're checked.",
+            gated=False)
+        # Manual refresh - re-reads real install + active state from disk. Not gated: it
+        # must work even with no server set (to show the all-red/unchecked truth).
+        self.mods_refresh_btn = _add_btn(
+            "Refresh", self._refresh_mods_tab,
+            "Re-check every mod's real installed (icon) and active (checkbox) state "
+            "against disk.", gated=False)
+
+        # Bottom: streamed output log - a separate widget from install_log (Server
+        # Install tab) so the two flows don't visually interleave. Once a real mod
+        # install worker exists (Phase 1) it must still register in
+        # _any_install_running() so it can't race the other installers over the same
+        # SERVER_ROOT, even though it logs here instead of to install_log.
+        logframe = ttk.LabelFrame(wrap, text="Output", padding=(6, 4))
+        logframe.pack(fill="both", pady=(8, 0))
+        logrow = ttk.Frame(logframe)
+        logrow.pack(fill="both", expand=True)
+        self.mods_log = tk.Text(logrow, height=10, wrap="word", state="disabled",
+                                font=("Consolas", 9),
+                                background=self.theme["text_bg"], foreground=self.theme["text_fg"],
+                                insertbackground=self.theme["text_fg"])
+        mods_vsb = ttk.Scrollbar(logrow, orient="vertical", command=self.mods_log.yview)
+        self.mods_log.configure(yscrollcommand=mods_vsb.set)
+        self.mods_log.pack(side="left", fill="both", expand=True)
+        mods_vsb.pack(side="right", fill="y")
+
+    def _mods_log_line(self, line):
+        self.mods_log.configure(state="normal")
+        self.mods_log.insert("end", line.rstrip("\n") + "\n")
+        self.mods_log.see("end")
+        self.mods_log.configure(state="disabled")
+
+    def _mods_gate_state(self):
+        """(ok, server_root) - ok only if SERVER_ROOT is set AND the ARK server is
+        installed there. Reuses check_ark_server_installed rather than a second rule,
+        so this tab can't disagree with Setup Status about "is it installed"."""
+        server_root = self.get("SERVER_ROOT")
+        ok, _detail = check_ark_server_installed(server_root)
+        return ok, server_root
+
+    def _refresh_mods_tab(self):
+        ok, _server_root = self._mods_gate_state()
+        self.mods_gate_banner.pack_forget()
+        if not ok:
+            self.mods_gate_banner.pack(fill="x", pady=(0, 6), before=self._mods_top_frame)
+        self._refresh_mods_list()  # also updates button enabled-state
+
+    def _refresh_mods_list(self):
+        """Rebuild every row from REAL disk state: checkbox = is the mod in
+        GameUserSettings.ini's ActiveMods (read_active_mods), icon = is_mod_installed.
+        This is the "re-verify against disk" path - called on tab load, manual Refresh,
+        reorder, and add. In-memory `enabled` is synced to the on-disk active state so it
+        never drifts from what the server will actually load."""
+        gate_ok, server_root = self._mods_gate_state()
+        # Authoritative active list from disk (empty when gated - nothing to read).
+        active_ids = set(read_active_mods(server_root)) if gate_ok else set()
+        for mod in self._mods:
+            mod["enabled"] = mod["id"] in active_ids  # in-memory follows disk truth
+        self._rebuild_mods_rows()
+
+    def _rebuild_mods_rows(self):
+        """Redraw rows from whatever `enabled` currently sits in-memory, without
+        re-reading disk - used after a pure GUI-intent edit (Check all/Uncheck all)
+        that must not be clobbered by _refresh_mods_list's disk sync."""
+        for child in self.mods_items_frame.winfo_children():
+            child.destroy()
+        gate_ok, server_root = self._mods_gate_state()
+        for idx, mod in enumerate(self._mods):
+            self._build_mod_row(idx, mod, server_root, gate_ok)
+        self._update_mods_button_states()
+
+    def _build_mod_row(self, idx, mod, server_root, gate_ok):
+        selected = (mod["id"] == self._mods_selected_id)
+        row_bg = self.theme["tab_active_bg"] if selected else self.theme["bg"]
+        row = tk.Frame(self.mods_items_frame, background=row_bg)
+        row.pack(fill="x", pady=1)
+
+        # When gated (no SERVER_ROOT / server not installed) the whole row is read-only.
+        interactive = "normal" if gate_ok else "disabled"
+
+        reorder = ttk.Frame(row)
+        reorder.pack(side="left", padx=(0, 4))
+        up = ttk.Button(reorder, text="▲", width=2,
+                         command=lambda i=idx: self._move_mod(i, -1))
+        up.pack()
+        down = ttk.Button(reorder, text="▼", width=2,
+                           command=lambda i=idx: self._move_mod(i, 1))
+        down.pack()
+        up.configure(state="disabled" if (not gate_ok or idx == 0) else "normal")
+        down.configure(
+            state="disabled" if (not gate_ok or idx == len(self._mods) - 1) else "normal")
+
+        var = tk.BooleanVar(value=bool(mod.get("enabled")))
+        cb = ttk.Checkbutton(row, variable=var, state=interactive,
+                              command=lambda m=mod, v=var: self._on_mod_toggle(m, v))
+        cb.pack(side="left", padx=(0, 4))
+
+        ok, _detail = check_mod_installed(server_root, mod["id"])
+        icon = self.STATUS_ICONS["ok"] if ok else self.STATUS_ICONS["fail"]
+        color = self.theme["status_ok"] if ok else self.theme["status_fail"]
+        tk.Label(row, text=icon, background=row_bg, foreground=color, width=2
+                 ).pack(side="left", padx=(0, 6))
+
+        name_text = mod["name"]
+        if not mod.get("supported", True):
+            name_text += "  [unsupported]"
+        name_fg = self.theme["fg"] if mod.get("supported", True) else self.theme["status_info"]
+        name_lbl = tk.Label(row, text=name_text, background=row_bg, foreground=name_fg,
+                             anchor="w")
+        name_lbl.pack(side="left", fill="x", expand=True)
+
+        id_lbl = tk.Label(row, text=mod["id"], background=row_bg,
+                           foreground=self.theme["subtle_fg"], width=12, anchor="e")
+        id_lbl.pack(side="left", padx=(6, 4))
+
+        def _select(_e=None, mod_id=mod["id"]):
+            self._mods_selected_id = mod_id
+            self._refresh_mods_list()
+        for w in (row, name_lbl, id_lbl):
+            w.bind("<Button-1>", _select)
+
+    def _update_mods_button_states(self):
+        gate_ok, _server_root = self._mods_gate_state()
+        busy = self._mods_thread is not None and self._mods_thread.is_alive()
+        enabled = gate_ok and not busy
+        has_selection = any(m["id"] == self._mods_selected_id for m in self._mods)
+        for b in self._mods_action_buttons:
+            b.configure(state="normal" if enabled else "disabled")
+        self.mods_workshop_btn.configure(
+            state="normal" if (has_selection and not busy) else "disabled")
+        self.mods_verify_btn.configure(
+            state="normal" if (enabled and has_selection) else "disabled")
+
+    def _move_mod(self, idx, direction):
+        new_idx = idx + direction
+        if not (0 <= new_idx < len(self._mods)):
+            return
+        self._mods[idx], self._mods[new_idx] = self._mods[new_idx], self._mods[idx]
+        self._save_mods_config()
+        self._refresh_mods_list()
+
+    def _on_mod_toggle(self, mod, var):
+        # GUI-intent only - this does NOT touch the server yet. The change is applied to
+        # disk (download / ActiveMods) by the action buttons later; a Refresh/tab-reload
+        # re-reads the real on-disk state and discards un-applied toggles.
+        mod["enabled"] = bool(var.get())
+        self._mods_log_line("%s: %s (pending - click Save to apply)"
+                            % (mod["name"], "checked" if mod["enabled"] else "unchecked"))
+
+    def on_mods_add(self):
+        win = tk.Toplevel(self)
+        win.title("Add mod")
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Steam Workshop mod ID:").pack(anchor="w")
+        id_var = tk.StringVar()
+        entry = ttk.Entry(frm, textvariable=id_var, width=24)
+        entry.pack(anchor="w", pady=(2, 8))
+        entry.focus_set()
+
+        warn = tk.Frame(frm, background=self.theme["warn_bg"],
+                         highlightbackground=self.theme["warn_border"], highlightthickness=1)
+        warn.pack(fill="x", pady=(0, 8))
+        tk.Label(warn, background=self.theme["warn_bg"], foreground=self.theme["warn_fg"],
+                 justify="left", wraplength=340,
+                 text="Not verified as supported by the ArkAP plugin. Only the mods in "
+                      "the pre-populated list are known to integrate with checks/items - "
+                      "an unsupported mod may just work as a normal ARK mod with no "
+                      "Archipelago integration."
+                 ).pack(padx=8, pady=6)
+
+        def _submit():
+            mod_id = id_var.get().strip()
+            if not mod_id.isdigit():
+                messagebox.showwarning("Add mod", "Enter a numeric Steam Workshop ID.")
+                return
+            if any(m["id"] == mod_id for m in self._mods):
+                messagebox.showinfo("Add mod", "That mod ID is already in the list.")
+                win.destroy()
+                return
+            self._mods.append({"id": mod_id, "name": "Workshop Mod %s" % mod_id,
+                               "enabled": False, "supported": False})
+            self._save_mods_config()
+            self._mods_log_line("Added unsupported mod %s to the list." % mod_id)
+            win.destroy()
+            self._refresh_mods_list()
+
+        btnrow = ttk.Frame(frm)
+        btnrow.pack(fill="x")
+        ttk.Button(btnrow, text="Add", command=_submit).pack(side="right", padx=(4, 0))
+        ttk.Button(btnrow, text="Cancel", command=win.destroy).pack(side="right")
+        entry.bind("<Return>", lambda _e: _submit())
+
+    def _mods_gate_warn(self):
+        messagebox.showwarning("ARKIpelago Launcher",
+                               "Set SERVER_ROOT and install the ARK server first.")
+
+    def on_mods_save(self):
+        """Apply the checkboxes exactly as they currently sit to GameUserSettings.ini's
+        ActiveMods - the one on-disk file mod activation lives in (confirmed in Phase 0;
+        there is no second file to keep in sync). Check all/Uncheck all only edit the
+        checkboxes themselves (see on_mods_check_all/on_mods_uncheck_all) - this is what
+        actually writes whatever mixture of checked/unchecked the list is showing now."""
+        if self._any_install_running():
+            messagebox.showinfo("ARKIpelago Launcher",
+                                "A mod install is running - wait for it to finish.")
+            return
+        gate_ok, server_root = self._mods_gate_state()
+        if not gate_ok:
+            self._mods_gate_warn()
+            return
+        checked = [m for m in self._mods if m.get("enabled")]
+        active = [m for m in checked if check_mod_installed(server_root, m["id"])[0]]
+        not_installed = [m for m in checked if m not in active]
+        ok, msg = set_active_mods(server_root, [m["id"] for m in active])
+        self._mods_log_line(msg if ok else "! " + msg)
+        if not_installed:
+            self._mods_log_line(
+                "! Checked but not installed, left inactive - use \"Download checked\" "
+                "first: %s" % ", ".join("%s [%s]" % (m["name"], m["id"])
+                                        for m in not_installed))
+        if ok:
+            self._mods_log_line("Restart the ARK server for the change to take effect.")
+        self._refresh_mods_list()
+
+    def on_mods_check_all(self):
+        # GUI-intent only, same as ticking every box by hand (_on_mod_toggle) - does not
+        # touch ActiveMods. Save (or Download checked) is what applies it.
+        for mod in self._mods:
+            mod["enabled"] = True
+        self._mods_log_line("Checked every mod (pending - click Save or Download checked "
+                            "to apply).")
+        self._rebuild_mods_rows()
+
+    def on_mods_uncheck_all(self):
+        for mod in self._mods:
+            mod["enabled"] = False
+        self._mods_log_line("Unchecked every mod (pending - click Save to apply).")
+        self._rebuild_mods_rows()
+
+    def on_mods_download_checked(self):
+        if self._any_install_running():
+            messagebox.showinfo("ARKIpelago Launcher",
+                                "An install is already running - wait for it to finish.")
+            return
+        gate_ok, server_root = self._mods_gate_state()
+        if not gate_ok:
+            self._mods_gate_warn()
+            return
+        checked = [m for m in self._mods if m.get("enabled")]
+        if not checked:
+            self._mods_log_line("No mods are checked. Tick the mods you want, then "
+                                "Download checked.")
+            return
+        pending = [m for m in checked if not check_mod_installed(server_root, m["id"])[0]]
+        if not pending:
+            # All checked mods are already installed - just (re)apply activation.
+            ok, msg = set_active_mods(server_root, [m["id"] for m in checked])
+            self._mods_log_line("Every checked mod is already installed.")
+            self._mods_log_line(msg if ok else "! " + msg)
+            self._refresh_mods_list()
+            return
+        self._start_mods_worker(server_root, pending, activate=checked, force=False,
+                                title="Download checked")
+
+    def on_mods_verify_redownload(self):
+        if self._any_install_running():
+            messagebox.showinfo("ARKIpelago Launcher",
+                                "An install is already running - wait for it to finish.")
+            return
+        gate_ok, server_root = self._mods_gate_state()
+        if not gate_ok:
+            self._mods_gate_warn()
+            return
+        mod = next((m for m in self._mods if m["id"] == self._mods_selected_id), None)
+        if not mod:
+            messagebox.showinfo("ARKIpelago Launcher", "Select a mod in the list first.")
+            return
+        # Force a fresh re-download of just this mod; leave the active list unchanged.
+        self._start_mods_worker(server_root, [mod], activate=None, force=True,
+                                title="Verify / re-download")
+
+    def on_mods_uninstall_unchecked(self):
+        if self._any_install_running():
+            messagebox.showinfo("ARKIpelago Launcher",
+                                "A mod install is running - wait for it to finish.")
+            return
+        gate_ok, server_root = self._mods_gate_state()
+        if not gate_ok:
+            self._mods_gate_warn()
+            return
+        targets = [m for m in self._mods if not m.get("enabled")
+                   and check_mod_installed(server_root, m["id"])[0]]
+        if not targets:
+            self._mods_log_line(
+                "Nothing to uninstall - no unchecked mod is currently installed.")
+            return
+        listing = "\n".join("  - %s (%s)" % (m["name"], m["id"]) for m in targets)
+        if not messagebox.askyesno(
+                "Uninstall unchecked mods",
+                "Delete the installed files for these %d unchecked mod(s)? This frees "
+                "disk space; you can re-download them later.\n\n%s" % (len(targets), listing)):
+            return
+        removed = set()
+        for mod in targets:
+            ok, msg = uninstall_mod(server_root, mod["id"])
+            self._mods_log_line(msg if ok else "! " + msg)
+            if ok:
+                removed.add(mod["id"])
+        # Defensive: never leave a just-removed mod referenced in ActiveMods (an unchecked
+        # mod shouldn't be active, but don't assume the two are in sync).
+        active = [mid for mid in read_active_mods(server_root) if mid not in removed]
+        set_active_mods(server_root, active)
+        self._refresh_mods_list()
+
+    def on_mods_open_workshop_page(self):
+        mod = next((m for m in self._mods if m["id"] == self._mods_selected_id), None)
+        if not mod:
+            messagebox.showinfo("ARKIpelago Launcher", "Select a mod in the list first.")
+            return
+        webbrowser.open(
+            "https://steamcommunity.com/sharedfiles/filedetails/?id=%s" % mod["id"])
+
+    def on_mods_copy_active_ids(self):
+        # Every CHECKED mod's id, in the list's current top-to-bottom order (= load
+        # order), comma-separated - for pasting into the plugin's YAML. Install status
+        # is irrelevant here; this is "the IDs I currently have active", supported or not.
+        ids = [m["id"] for m in self._mods if m.get("enabled")]
+        if not ids:
+            messagebox.showinfo("Copy active IDs",
+                                "No mods are checked - tick the mods you want in your YAML "
+                                "first, then copy.")
+            self._mods_log_line("Copy active IDs: nothing to copy (no mods checked).")
+            return
+        text = ", ".join(ids)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._mods_log_line("Copied %d mod ID(s) for YAML: %s" % (len(ids), text))
+
+    # ---- mod download/install worker (SteamCMD, streamed to the Mods log) ---------- #
+    def _start_mods_worker(self, server_root, to_download, activate, force, title):
+        """Kick off the background download/install of `to_download` (a list of mod dicts),
+        streaming SteamCMD output into the Mods log. `activate` is the checked-mod list to
+        write into ActiveMods afterwards (None = leave activation untouched, e.g. verify)."""
+        self._mods_queue = queue.Queue()
+        self._mods_log_line("")
+        self._mods_log_line("=== %s: %d mod(s) ===" % (title, len(to_download)))
+        self._mods_thread = threading.Thread(
+            target=self._mods_download_worker,
+            args=(server_root, to_download, activate, force), daemon=True)
+        self._mods_thread.start()
+        self._update_mods_button_states()  # reflect busy: disable the action buttons
+        self.after(100, self._poll_mods_queue)
+
+    def _mods_download_worker(self, server_root, to_download, activate, force):
+        q = self._mods_queue
+
+        def log(line):
+            q.put(("line", line))  # marshalled to the GUI thread by _poll_mods_queue
+
+        try:
+            steamcmd = self._ensure_steamcmd(q)
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            log("! Could not prepare SteamCMD: %s" % exc)
+            q.put(("done", False))
+            return
+
+        all_ok = True
+        for mod in to_download:
+            log("")
+            log("--- %s %s (%s) ---"
+                % ("Re-downloading" if force else "Downloading", mod["name"], mod["id"]))
+            if force:
+                # Clear SteamCMD's cached copy so it genuinely re-fetches every file.
+                shutil.rmtree(_workshop_download_dir(steamcmd, mod["id"]), ignore_errors=True)
+            result = download_and_install_mod(mod["id"], server_root, steamcmd, log=log)
+            if not result.ok:
+                all_ok = False
+                log("! " + result.message)
+
+        if activate is not None:
+            # ActiveMods = the checked mods that actually ended up installed, in order.
+            active_ids = [m["id"] for m in activate
+                          if is_mod_installed(server_root, m["id"])]
+            skipped = [m["id"] for m in activate
+                       if not is_mod_installed(server_root, m["id"])]
+            ok, msg = set_active_mods(server_root, active_ids)
+            log(msg if ok else "! " + msg)
+            if skipped:
+                log("! Left inactive (not installed): %s" % ", ".join(skipped))
+            log("Restart the ARK server for the change to take effect.")
+        q.put(("done", all_ok))
+
+    def _poll_mods_queue(self):
+        try:
+            while True:
+                kind, payload = self._mods_queue.get_nowait()
+                if kind == "line":
+                    self._mods_log_line(payload)
+                elif kind == "done":
+                    self._on_mods_done(payload)
+                    return
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_mods_queue)
+
+    def _on_mods_done(self, success):
+        self._mods_thread = None
+        self._mods_log_line("Done." if success
+                            else "Finished with errors - see the messages above.")
+        self._refresh_mods_list()  # re-read disk: icons + checkboxes now reflect reality
 
     # ------------------------------------------------------ Setup Status --- #
     # icon, color per item state: "ok" (check passed), "fail" (check failed - actionable),
@@ -3432,24 +4603,26 @@ class ArkAPLauncher(tk.Tk):
                     "folder and reopen - the current version is unpacked from the exe.",
         })
 
-        # Reads the FILE, not the Connector fields - so a user with server/slot/ipc_dir
-        # all filled in still fails this when no connector.ini exists to write them to
-        # (Save logs "connector.ini: not found - skipped" and the fields only ever reach
-        # the launcher's own JSON). Two different failures, so two different hints -
-        # telling someone to "fill in the fields and Save" when the fields ARE filled is
-        # what sent them in circles.
+        # Reads the FILE, not the Connector fields. The in-game integrated connector is
+        # the primary way to connect - connector.ini only matters for the optional
+        # standalone Python connector fallback, so a missing/incomplete file is an
+        # advisory (yellow "i"), never a red X, and never counts toward the overall
+        # fail state (see aggregate_status_state).
         ini_path = self.get("connector_ini")
         ok, detail = check_connector_filled(ini_path)
         items.append({
-            "label": "connector.ini filled in (server / slot / ipc_dir)",
-            "state": "ok" if ok else "fail",
+            "label": "connector.ini filled in (optional standalone connector fallback only)",
+            "state": "ok" if ok else "info",
             "detail": detail,
-            "hint": ("Point Connector tab in configurations  "
-                     "make sure you've set your server (eg. archipelago.gg:38281) "
-                     "and your slot name and password if room has one. also make sure ipc_dir has been set"
+            "hint": ("Only needed if you use the standalone Python connector instead of "
+                     "the in-game integrated connector. Point \"connector.ini file\" in "
+                     "the Configuration tab's Locations group at your ArkConnector's "
+                     "connector.ini, then fill in server/slot/ipc_dir in the Connector "
+                     "group and Save."
                      if not (ini_path and os.path.isfile(ini_path)) else
                      "Fill in server / slot / ipc_dir in the Connector group on the "
-                     "Configuration tab, then Save."),
+                     "Configuration tab, then Save - only needed for the standalone "
+                     "connector fallback."),
         })
 
         # Component/launcher version rows (yellow "i" when newer, green check for the
@@ -3561,6 +4734,8 @@ class ArkAPLauncher(tk.Tk):
             self._refresh_setup_status()
         elif current == str(self.tab_profiles):
             self._update_profile_status()
+        elif current == str(self.tab_mods):
+            self._refresh_mods_tab()
 
     # ----------------------------------------------------- Diagnostics export #
     def _redacted_config_json(self):
@@ -3768,10 +4943,12 @@ class ArkAPLauncher(tk.Tk):
 
         toolbar = ttk.Frame(wrap)
         toolbar.pack(fill="x", pady=(0, 4))
-        ttk.Button(toolbar, text="Expand all steps",
-                   command=lambda: self._set_all_instruction_steps(False)).pack(side="left")
-        ttk.Button(toolbar, text="Collapse all steps",
-                   command=lambda: self._set_all_instruction_steps(True)
+        # One pair, both levels: "Collapse all" folds every section heading AND every step
+        # (flattening the tab to just headings); "Expand all" opens both back up fully.
+        ttk.Button(toolbar, text="Expand all",
+                   command=lambda: self._set_all_instructions(False)).pack(side="left")
+        ttk.Button(toolbar, text="Collapse all",
+                   command=lambda: self._set_all_instructions(True)
                    ).pack(side="left", padx=(6, 0))
 
         txt = tk.Text(wrap, wrap="word", font=("Segoe UI", 9), borderwidth=0,
@@ -3798,12 +4975,10 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Pro tip: the Search bar (top left) searches field labels, tooltips, "
                        "and text across every tab - press Enter, then use Find Next / Find "
                        "Prev to jump between matches."),
+            ("bullet", "THIS LAUNCHER WILL NEVER TOUCH YOUR ACTUAL ARK DOWNLOAD LOCATION PLEASE DONT SET ANY PATH TO IT, i beg you"),
 
-            ("bullet", "Pro tip: each numbered step below has a checkbox. Tick it and the "
-                       "step collapses to just \"Step 1\", \"Step 2\" and so on; untick it "
-                       "to get the full text back. \"Collapse all steps\" / \"Expand all "
-                       "steps\" at the top of this tab do the lot at once - handy for "
-                       "ticking off steps as you go, or for skimming back to one step."),
+            ("bullet", "Pro tip: everything in this tab collapses and expands. Try it out by "
+                       "clicking the box beside each header, or just use the collapse and expand all buttons"),
 
             ("h1", "Start here - install in this order"),
             ("bullet", "The three installs below must happen in order: the ARK server "
@@ -3839,7 +5014,7 @@ class ArkAPLauncher(tk.Tk):
                        "Note: BattlEye must be OFF for ArkApi to work, but "
                        "start_ase_server already disables it for you - We gotchu fam."),
 
-            ("bullet", "3. Same tab -> in the \"Install ArkAP Plugin\" box, click \"Install "
+            ("bullet", "3. Same tab -> in the \"Install/update ArkAP Plugin\" box, click \"Install "
                        "Plugin\". It downloads the latest ArkAP_Plugin.zip straight from "
                        "GitHub and extracts it into Win64\\ArkApi\\Plugins\\ArkAP for you - "
                        "no manual download/unzip. Progress shows in the console box. "
@@ -3873,16 +5048,17 @@ class ArkAPLauncher(tk.Tk):
                        "the launcher stays usable while scanning."),
 
             ("bullet", "5. Setup Status tab -> click Re-check and confirm everything shows "
-                       "a checkmark before going further (you'll have an X for connector, we'll address this in step 6). Anything showing an X has a hint "
+                       "a checkmark before going further (the connector.ini row is only a "
+                       "yellow \"i\", not an X - it's just the optional standalone "
+                       "connector fallback, ignore it unless you're using that instead of "
+                       "the in-game integrated connector). Anything showing an X has a hint "
                        "telling you what to fix. This is the fastest way to catch a missed "
                        "step before you start troubleshooting in-game."),
 
             ("bullet", "6. Generate the Archipelago room. This guide won't explain how "
                        "YAMLs and Archipelago work - this isn't a beginner-friendly "
                        "Archipelago setup. Just remember to set up your yaml, remember your "
-                       "yaml name, and drop the .apworld into Archipelago's custom worlds. "
-                       "Note: it's recommended to have progression_tiers on in the yaml to "
-                       "reduce softlocks/BKs."),
+                       "yaml name, and drop the .apworld into Archipelago's custom worlds. "),
 
             ("bullet", "7. Configuration tab -> fill in the Connector settings (server, "
                        "slot, password) with your Archipelago room info. Your slot must "
@@ -3922,14 +5098,15 @@ class ArkAPLauncher(tk.Tk):
                        "older plugin version), plus the ArkConnector, which still needs "
                        "downloading by hand."),
             ("bullet", "Setup Status - a read-only checklist (server installed / ArkApi "
-                       "installed / plugin installed / plugin mode / connector.ini) with "
-                       "hints for anything showing an X. Click Re-check after fixing "
-                       "something. It also shows advisory rows (a yellow \"i\", not a red "
-                       "X) for things that are worth knowing but aren't broken - the "
-                       "BattlEye note, and \"update available\" when a newer ArkServerApi "
-                       "or ArkAP plugin release exists than the one you installed (with a "
-                       "link to the release). An older component version isn't a failure, "
-                       "so it never shows an X."),
+                       "installed / plugin installed / plugin mode) with hints for "
+                       "anything showing an X. Click Re-check after fixing something. It "
+                       "also shows advisory rows (a yellow \"i\", not a red X) for things "
+                       "that are worth knowing but aren't broken - the BattlEye note, "
+                       "connector.ini status (only relevant if you use the optional "
+                       "standalone connector instead of the in-game integrated one), and "
+                       "\"update available\" when a newer ArkServerApi or ArkAP plugin "
+                       "release exists than the one you installed (with a link to the "
+                       "release). None of these are failures, so they never show an X."),
             ("bullet", "   The Setup Status tab has a small coloured symbol next to its "
                        "name in the tab bar, so you can see your overall status from any "
                        "tab without opening it: a green check = everything passes, a "
@@ -3955,6 +5132,49 @@ class ArkAPLauncher(tk.Tk):
                        "profiles you save yourself, and can't be renamed or updated by "
                        "hand - load it if you ever need to get recent settings back."),
             ("bullet", "Instructions - this tab."),
+            ("bullet", "Mods - download and activate Steam Workshop mods for the server "
+                       "(see the \"Mods (Steam Workshop)\" section below)."),
+
+            ("h1", "Mods (Steam Workshop)"),
+            ("bullet", "The Mods tab downloads Steam Workshop mods with the bundled "
+                       "SteamCMD and installs them into "
+                       "SERVER_ROOT\\ShooterGame\\Content\\Mods for you - no manual "
+                       "unzipping or .mod-file wrangling. It needs SERVER_ROOT set and the "
+                       "ARK server already installed (the tab greys out with a note "
+                       "otherwise)."),
+            ("bullet", "Each row has a checkbox (checked = the mod should be active) and an "
+                       "install icon (green check = actually installed on disk, red X = "
+                       "not). Both reflect the real on-disk state - the checkbox mirrors "
+                       "GameUserSettings.ini's ActiveMods, the icon mirrors what's in "
+                       "Content\\Mods - and Refresh re-reads both."),
+            ("bullet", "Order matters: mods load top-to-bottom (the topmost is highest "
+                       "priority, matching the ActiveMods order ARK reads). Use the up/down "
+                       "arrows to reorder."),
+            ("bullet", "Checking/unchecking a mod only edits what's shown on screen - it "
+                       "doesn't touch the server by itself. The yellow-highlighted Save "
+                       "button (same highlight as the Configuration tab's) writes exactly "
+                       "that checked/unchecked mixture into GameUserSettings.ini's "
+                       "ActiveMods. A checked mod that isn't installed yet is left inactive "
+                       "and flagged in the log - Download checked installs it first."),
+            ("bullet", "Download checked - downloads every checked-but-not-installed mod, "
+                       "then activates the checked set (applies right away, same as Save). "
+                       "Check all / Uncheck all (above the list) - tick or untick every "
+                       "mod's checkbox, same as clicking each one by hand; nothing is "
+                       "applied until you press Save or Download checked afterwards. "
+                       "Uninstall unchecked - deletes the files for unchecked mods to free "
+                       "space. Verify/Redownload - re-fetches a selected mod if it looks "
+                       "corrupt. Restart the ARK server after any of these for it to take "
+                       "effect."),
+            ("bullet", "Copy active IDs - copies every checked mod's ID to the clipboard as "
+                       "a comma-separated list, in the list's top-to-bottom order, ready to "
+                       "paste into the plugin's YAML mod configuration. It copies whatever "
+                       "you have checked (supported or not), so what you see in the list is "
+                       "exactly what gets pasted."),
+            ("bullet", "Add mod - adds a raw Workshop ID that isn't in the supported list. "
+                       "Only the pre-populated (supported) mods are known to integrate with "
+                       "the plugin's checks/items; an added mod is tagged \"unsupported\" "
+                       "and may just run as a normal ARK mod with no Archipelago "
+                       "integration."),
 
             ("h1", "Search (top left of the window)"),
             ("bullet", "Type a term and press Enter to search field labels, tooltips, "
@@ -4016,7 +5236,10 @@ class ArkAPLauncher(tk.Tk):
                        "disagree. apply_server_config.bat keeps its own SERVER_ROOT copy. "
                        "MAP / SESSION / MAXPLAYERS / ports / TRIBUTEEXP write only into "
                        "start_ase_server.bat, since those are per-script settings."),
-            ("bullet", "Connector fields write into connector.ini."),
+            ("bullet", "Connector fields also write into connector.ini, for the optional "
+                       "standalone connector fallback - server/slot/password additionally "
+                       "feed the in-game \"Copy ARK connection command\" button, which is "
+                       "what the normal in-game integrated connector flow uses."),
             ("bullet", "Save only rewrites the one matching line for each field in each "
                        "file - everything else in the script is left untouched."),
 
@@ -4057,80 +5280,120 @@ class ArkAPLauncher(tk.Tk):
          
         ]
 
-        # The numbered install steps (1. .. 10.) each get their own collapse toggle: a
-        # step starts at a "N. " bullet and swallows any indented ("   ...") bullet
-        # lines that immediately follow it as its collapsible body. Everything else in
-        # `content` (intro text, the later h1 sections) is plain, always-visible text -
-        # grouping is inferred from the text itself so this keeps working if `content`
-        # is edited later without anyone having to maintain a separate step list.
-        # in_steps (rather than just "steps is non-empty") is what stops the LAST step
-        # swallowing every indented bullet in the later h1 sections - those continue
-        # their own preceding bullet, are nowhere near step 10, and being pulled into
-        # it both hid them on collapse and printed them out of order.
-        pre, steps, post = [], [], []
-        in_steps = False
+        # Two independent collapse levels (see the module-level rationale in the pro-tip
+        # text). SECTIONS: everything after each h1 heading, until the next h1, folds under
+        # a per-heading checkbox. STEPS: inside a section, a numbered "N. " bullet plus the
+        # indented ("   ...") bullets that follow it fold under their own checkbox.
+        #
+        # Elide can't be OR'd across tags (Tk resolves it by tag priority, last-wins), so
+        # the two levels never share an elide tag. Each collapsible range has exactly ONE
+        # elide-controlling tag whose value is recomputed as (section_collapsed OR
+        # step_state); a separate, non-eliding "section mark" tag records which section a
+        # range belongs to purely so search-reveal can re-open the right section.
+        intro = []                 # items before the first h1 - always visible, no heading
+        sections = []              # [(h1_text, [(tag, line), ...]), ...]
         for tag, line in content:
-            if tag == "bullet" and re.match(r"^\d+\.\s", line):
-                steps.append([(tag, line)])
-                in_steps = True
-            elif in_steps and tag == "bullet" and line.startswith("   "):
-                steps[-1].append((tag, line))
+            if tag == "h1":
+                sections.append((line, []))
+            elif sections:
+                sections[-1][1].append((tag, line))
             else:
-                in_steps = False
-                (post if steps else pre).append((tag, line))
+                intro.append((tag, line))
 
-        for tag, line in pre:
+        for tag, line in intro:
             txt.insert("end", line + "\n", tag)
 
-        self._instruction_step_vars = {}
-        self._instruction_step_label_vars = {}
-        for i, step_lines in enumerate(steps):
-            body_tag = "instr_step_body_%d" % i
-            label_tag = "instr_step_label_%d" % i
-            var = tk.BooleanVar(value=False)  # False = expanded (the required default)
-            self._instruction_step_vars[body_tag] = var
-            self._instruction_step_label_vars[label_tag] = var
+        self._instruction_step_vars = {}        # body_tag  -> step var  (search + set-all)
+        self._instruction_step_label_vars = {}  # label_tag -> step var  (search)
+        self._instr_section_vars = {}           # mark_tag  -> section var (search + set-all)
+        step_counter = 0
 
-            cb = ttk.Checkbutton(txt, variable=var)
-            Tooltip(cb, "Collapse this step down to its number, or expand it again.")
-            txt.window_create("end", window=cb, padx=4)
-            title_tag, title_text = step_lines[0]
-            # Two mutually-exclusive versions of the step's first line share the
-            # checkbox's display line: the short "Step N" stub shown while
-            # collapsed, and the real (long) title shown while expanded. Elide
-            # covers each line's trailing newline too, so the hidden one takes up
-            # no vertical space at all - which is the whole point: collapsing has
-            # to leave "Step N" and nothing else.
-            num = re.match(r"^(\d+)\.", title_text)
-            label_text = "Step %s" % num.group(1) if num else title_text.split(".")[0]
-            txt.insert("end", label_text + "\n", (title_tag, label_tag))
-            txt.insert("end", title_text + "\n", (title_tag, body_tag))
-            for body_line_tag, body_line_text in step_lines[1:]:
-                txt.insert("end", body_line_text + "\n", (body_line_tag, body_tag))
-            txt.tag_configure(body_tag, elide=False)
-            txt.tag_configure(label_tag, elide=True)
-            # Blank spacer line after every step so the steps read as separate
-            # blocks in both states - kept outside both toggled tags so the gap
-            # survives collapsing.
-            txt.insert("end", "\n", "step_gap")
+        for s, (h1_text, items) in enumerate(sections):
+            section_var = tk.BooleanVar(value=False)   # False = expanded
+            mark_tag = "instr_sect_%d" % s             # marker only (no elide)
+            body_tag_sect = "instr_sectbody_%d" % s    # elide = section collapsed
+            self._instr_section_vars[mark_tag] = section_var
 
-            def _make_toggle(v=var, bt=body_tag, lt=label_tag):
-                def _toggle(*_a):
-                    collapsed = v.get()
-                    txt.tag_configure(bt, elide=collapsed)
-                    txt.tag_configure(lt, elide=not collapsed)
-                return _toggle
-            var.trace_add("write", _make_toggle())
+            hcb = ttk.Checkbutton(txt, variable=section_var)
+            Tooltip(hcb, "Collapse this whole section down to its heading, or expand it.")
+            txt.window_create("end", window=hcb, padx=4)          # header cb stays visible
+            txt.insert("end", h1_text + "\n", ("h1", mark_tag))
 
-        for tag, line in post:
-            txt.insert("end", line + "\n", tag)
+            section_steps = []  # (step_var, body_tag, label_tag) in this section
+
+            i, n = 0, len(items)
+            while i < n:
+                tag, line = items[i]
+                if tag == "bullet" and re.match(r"^\d+\.\s", line):
+                    step_lines = [(tag, line)]
+                    i += 1
+                    while i < n and items[i][0] == "bullet" and items[i][1].startswith("   "):
+                        step_lines.append(items[i])
+                        i += 1
+                    body_tag = "instr_step_body_%d" % step_counter
+                    label_tag = "instr_step_label_%d" % step_counter
+                    step_counter += 1
+                    step_var = tk.BooleanVar(value=False)
+                    self._instruction_step_vars[body_tag] = step_var
+                    self._instruction_step_label_vars[label_tag] = step_var
+
+                    cb = ttk.Checkbutton(txt, variable=step_var)
+                    Tooltip(cb, "Collapse this step down to its number, or expand it again.")
+                    txt.window_create("end", window=cb, padx=4)
+                    # Tag the just-created checkbox char so it hides when the section folds.
+                    win_idx = txt.index("end-1c")
+                    txt.tag_add(mark_tag, win_idx, "%s+1c" % win_idx)
+                    txt.tag_add(body_tag_sect, win_idx, "%s+1c" % win_idx)
+
+                    title_tag, title_text = step_lines[0]
+                    # Two mutually-exclusive first-line versions share the checkbox's line:
+                    # the "Step N" stub (shown while the step is collapsed) and the full
+                    # title (shown while expanded). Their elide is (section OR step-state);
+                    # they carry mark_tag too so search can re-open the section, but NOT
+                    # body_tag_sect (that would make two elide tags fight).
+                    num = re.match(r"^(\d+)\.", title_text)
+                    label_text = "Step %s" % num.group(1) if num else title_text.split(".")[0]
+                    txt.insert("end", label_text + "\n", (title_tag, label_tag, mark_tag))
+                    txt.insert("end", title_text + "\n", (title_tag, body_tag, mark_tag))
+                    for blt, blx in step_lines[1:]:
+                        txt.insert("end", blx + "\n", (blt, body_tag, mark_tag))
+                    # Spacer after each step (folds with the section, survives step-collapse).
+                    txt.insert("end", "\n", ("step_gap", mark_tag, body_tag_sect))
+                    section_steps.append((step_var, body_tag, label_tag))
+                else:
+                    # Plain line under the heading - elide follows the section directly.
+                    txt.insert("end", line + "\n", (tag, mark_tag, body_tag_sect))
+                    i += 1
+
+            # Recompute closure: a section holds its plain body (body_tag_sect) plus each
+            # step, whose body/label elide is (section OR step-state).
+            def _apply_section(sv=section_var, sbt=body_tag_sect, steps=section_steps):
+                collapsed = sv.get()
+                txt.tag_configure(sbt, elide=collapsed)
+                for stv, bt, lt in steps:
+                    txt.tag_configure(bt, elide=collapsed or stv.get())
+                    txt.tag_configure(lt, elide=collapsed or (not stv.get()))
+            section_var.trace_add("write", lambda *_a, f=_apply_section: f())
+
+            for stv, bt, lt in section_steps:
+                def _apply_step(*_a, sv=section_var, stv=stv, bt=bt, lt=lt):
+                    collapsed = sv.get()
+                    txt.tag_configure(bt, elide=collapsed or stv.get())
+                    txt.tag_configure(lt, elide=collapsed or (not stv.get()))
+                stv.trace_add("write", _apply_step)
+
+            _apply_section()  # set the initial (fully-expanded) elide state
 
         self.instructions_text = txt
         self._tag_instruction_examples()
         txt.configure(state="disabled")
 
-    def _set_all_instruction_steps(self, collapsed):
-        """Backs the toolbar's "Expand all steps" / "Collapse all steps" buttons."""
+    def _set_all_instructions(self, collapsed):
+        """Back the toolbar's "Collapse all" / "Expand all" buttons - both levels at once:
+        every section heading and every step. Sections are set first so their per-step
+        recompute runs, then the step vars settle each step to `collapsed`."""
+        for var in self._instr_section_vars.values():
+            var.set(collapsed)
         for var in self._instruction_step_vars.values():
             var.set(collapsed)
 
@@ -4214,6 +5477,29 @@ class ArkAPLauncher(tk.Tk):
 
     def _write_theme_pref(self, name):
         self._write_config_key(THEME_KEY, name, "theme preference")
+
+    # -------------------------------------------------------------- mods --- #
+    def _load_mods_config(self):
+        """Stored mod list merged with any SUPPORTED_MODS entries not yet present, so a
+        launcher update that adds a newly-supported mod shows up for existing users
+        without touching their existing enabled/order state for the rest."""
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        stored = data.get(MODS_KEY)
+        mods = [m for m in stored if isinstance(m, dict) and m.get("id")] \
+            if isinstance(stored, list) else []
+        known_ids = {m["id"] for m in mods}
+        for supported in SUPPORTED_MODS:
+            if supported["id"] not in known_ids:
+                mods.append({"id": supported["id"], "name": supported["name"],
+                             "enabled": False, "supported": True})
+        return mods
+
+    def _save_mods_config(self):
+        self._write_config_key(MODS_KEY, self._mods, "mods list")
 
     def _theme_toggle_label(self):
         """Button text names the destination state (what clicking it does),
@@ -4324,6 +5610,12 @@ class ArkAPLauncher(tk.Tk):
         try:
             self.save_btn_halo.configure(background=t["warn_bg"],
                                          highlightbackground=t["warn_border"])
+        except tk.TclError:
+            pass
+
+        try:
+            self.mods_save_btn_halo.configure(background=t["warn_bg"],
+                                              highlightbackground=t["warn_border"])
         except tk.TclError:
             pass
 
@@ -4560,6 +5852,28 @@ class ArkAPLauncher(tk.Tk):
                                               title="Select file")
         if path:
             self.set(key, os.path.normpath(path))
+
+    def _clear_path_field(self, key):
+        """The per-field "C" button: blanks just this one field back to its greyed
+        placeholder. GUI-only - nothing on disk is touched, and the cleared value only
+        reaches paths.cmd/the scripts on the next Save, same as any other field edit."""
+        self.set(key, "")
+        self._log("%s cleared." % key)
+
+    def _on_clear_all_paths(self):
+        """"Clear all paths": blanks every PATH_GROUP_KEYS field back to a fresh,
+        never-configured state in one click. GUI-only, same as _clear_path_field - a
+        Save is still required for the cleared paths to reach paths.cmd/the scripts."""
+        if not messagebox.askyesno(
+                "Clear all paths",
+                "Clear SERVER_ROOT, SAVESROOT, CLUSTERDIR, BACKUPROOT, the ArkApi "
+                "Plugins folder, ipc_dir and game_ini back to blank?\n\n"
+                "This only clears the fields here - nothing on disk is touched. "
+                "Save afterward for the change to reach the scripts."):
+            return
+        for key in PATH_GROUP_KEYS:
+            self.set(key, "")
+        self._log("Cleared all path fields (%s)." % ", ".join(PATH_GROUP_KEYS))
 
     # ------------------------------------------------------- discovery ----- #
     def _discover_locations(self, saved):
@@ -5469,11 +6783,14 @@ class ArkAPLauncher(tk.Tk):
     def _on_scan_done(self, result, level):
         """Apply a scan result to the Configuration fields (UI thread only)."""
         filled, skipped = [], []
+        suggestions = {}
 
         # PLUGINS_DIR is derived from SERVER_ROOT and is correct even before ArkApi
-        # exists, so it is ALWAYS written back - this is the fix for it staying empty
-        # after a successful SERVER_ROOT scan. Anything already set by the user is
-        # left alone.
+        # exists, so it is ALWAYS written back when the field is empty - this is the
+        # fix for it staying empty after a successful SERVER_ROOT scan. A field that's
+        # already set to something else is never silently overwritten - it's offered
+        # via the Folder suggestions popup below instead, same as the cluster folders,
+        # so re-scanning surfaces a conflict instead of hiding it.
         for key in ("PLUGINS_DIR", "ipc_dir", "game_ini"):
             value = result.get(key) or ""
             if not value:
@@ -5481,6 +6798,7 @@ class ArkAPLauncher(tk.Tk):
             current = self.get(key)
             if current and os.path.normcase(current) != os.path.normcase(value):
                 skipped.append(key)
+                suggestions[key] = [value]
                 continue
             self.set(key, value)
             filled.append(key)
@@ -5488,8 +6806,8 @@ class ArkAPLauncher(tk.Tk):
         if filled:
             self._log("Scan for paths: filled in %s from SERVER_ROOT." % ", ".join(filled))
         if skipped:
-            self._log("Scan for paths: left %s as you had already set them."
-                      % ", ".join(skipped))
+            self._log("Scan for paths: found a different value than what's set for %s - "
+                      "see the Folder suggestions popup." % ", ".join(skipped))
         if not result.get("plugins_exists"):
             self._log("Scan for paths: the ArkApi Plugins folder doesn't exist yet - "
                       "PLUGINS_DIR has been set to where it WILL be (%s). It's created "
@@ -5513,9 +6831,11 @@ class ArkAPLauncher(tk.Tk):
                       % (stopped, result.get("visited", 0)))
 
         # Cluster folders are name-matched guesses wherever they were found, so they're
-        # always offered rather than applied. Only keys still empty are offered.
-        suggestions = {k: v for k, v in (result.get("suggestions") or {}).items()
-                       if v and not self.get(k)}
+        # always offered rather than applied - regardless of whether the field already
+        # has a value, so re-scanning can surface a better/different candidate instead
+        # of silently assuming the existing value is fine (_suggest_paths itself drops
+        # a field whose only candidate already matches what's set).
+        suggestions.update((k, v) for k, v in (result.get("suggestions") or {}).items() if v)
         summary_bits = []
         if filled:
             summary_bits.append("filled %s" % ", ".join(filled))
@@ -5542,11 +6862,13 @@ class ArkAPLauncher(tk.Tk):
         ServerCluster-style parent CLUSTERDIR itself is a sibling of) for SAVESROOT
         (a sibling matching 'saves') and BACKUPROOT (a sibling matching 'backups').
         Folder-name matching is a guess here too, so these are always surfaced as
-        suggestions to confirm - never silently filled in. BACKUPROOT especially may
-        not exist yet (some setups only create it on the first backup), so when no
-        matching sibling is found we still offer the expected sibling path as an
-        unconfirmed placeholder rather than treating that as an error. Skips any key
-        that's already set - nothing to suggest there."""
+        suggestions to confirm - never silently filled in, and offered even if the
+        field already has a value (_suggest_paths drops a field whose only candidate
+        already matches what's set, so this only prompts on an actual conflict).
+        BACKUPROOT especially may not exist yet (some setups only create it on the
+        first backup), so when no matching sibling is found we still offer the
+        expected sibling path as an unconfirmed placeholder rather than treating that
+        as an error."""
         if not cluster_dir or not os.path.isdir(cluster_dir):
             return
         if is_backup_snapshot_path(cluster_dir):
@@ -5578,8 +6900,6 @@ class ArkAPLauncher(tk.Tk):
             ("SAVESROOT", "saves", "Saves"),
             ("BACKUPROOT", "backups", "Backups"),
         ):
-            if self.get(key):
-                continue
             # classify_cluster_folder() has to agree with the name pattern: it's
             # the one place that knows which real-but-wrong ARK folders (SavedArks,
             # the Cluster-<Map> junctions, timestamped _backup_ snapshots) must
@@ -5593,33 +6913,59 @@ class ArkAPLauncher(tk.Tk):
         if suggestions:
             self._suggest_paths(suggestions)
 
+    # Every field the scan can suggest a folder for. Fixed order so the popup is
+    # consistent regardless of which caller (SERVER_ROOT scan vs. CLUSTERDIR focus-out)
+    # happened to supply which keys.
+    _SUGGESTABLE_KEYS = ("PLUGINS_DIR", "ipc_dir", "game_ini",
+                         "CLUSTERDIR", "SAVESROOT", "BACKUPROOT")
+
     def _suggest_paths(self, suggestions):
         """One dialog offering every name-matched folder the scan turned up, grouped by
         the field it would fill. Suggestions are never applied without a click, since
         folder-name matching is a guess. A path that doesn't exist yet is offered as a
-        greyed-out example (it's a suggested location, not a found folder)."""
+        greyed-out example (it's a suggested location, not a found folder).
+
+        Shown regardless of whether a field already has a value - re-scanning is often
+        deliberate, to review or correct an earlier choice - but a field is skipped if
+        every candidate found for it is just the value it already has, since there's
+        nothing to compare there. When the field's current value isn't among the
+        candidates, it's still shown (tagged "(set)") so the user can compare it
+        against the alternatives rather than only seeing the alternatives."""
+        sections = suggestion_sections(self._SUGGESTABLE_KEYS, suggestions, self.get)
+        if not sections:
+            return
+
         win = tk.Toplevel(self)
         win.title("Folder suggestions")
         win.resizable(False, False)
         win.transient(self)
         ttk.Label(win, padding=10, wraplength=520, justify="left",
-                  text="The scan found folder(s) that look like they could be your "
-                       "cluster folders. Pick one for each field to use it, or close "
-                       "this to leave those fields as they are.").pack()
-        for key in ("CLUSTERDIR", "SAVESROOT", "BACKUPROOT"):
-            matches = suggestions.get(key)
-            if not matches:
-                continue
+                  text="The scan found folder(s) that look like they could go in these "
+                       "fields. Pick one to use it, or close this to leave a field as it "
+                       "is - your current value (if any) is shown marked \"(set)\".").pack()
+        for key, current, cur_norm, matches in sections:
             ttk.Label(win, text=key, font=("Segoe UI", 9, "bold")
                       ).pack(anchor="w", padx=10, pady=(6, 0))
+            if current and cur_norm not in (os.path.normcase(os.path.normpath(m))
+                                             for m in matches):
+                ttk.Button(win, text="%s   (set)" % current, state="disabled"
+                           ).pack(fill="x", padx=10, pady=2)
             for m in matches:
+                is_current = cur_norm == os.path.normcase(os.path.normpath(m))
                 exists = os.path.isdir(m)
-                label = m if exists else "%s   (not created yet - suggested path)" % m
+                if is_current:
+                    label = "%s   (set)" % m
+                elif exists:
+                    label = m
+                else:
+                    label = "%s   (not created yet - suggested path)" % m
                 # A path that exists was really found on disk; one that doesn't is
                 # only an example of where it would go, so it's greyed out.
                 btn = ttk.Button(win, text=label,
-                                  style="TButton" if exists else "Placeholder.TButton")
-                btn.configure(command=lambda p=m, k=key, b=btn: self._pick_suggested_path(k, p, b))
+                                  style="TButton" if exists or is_current else "Placeholder.TButton",
+                                  state="disabled" if is_current else "normal")
+                if not is_current:
+                    btn.configure(command=lambda p=m, k=key, b=btn: self._pick_suggested_path(k, p, b))
                 btn.pack(fill="x", padx=10, pady=2)
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(4, 10))
 
@@ -5637,12 +6983,14 @@ class ArkAPLauncher(tk.Tk):
         self.install_log.configure(state="disabled")
 
     def _any_install_running(self):
-        """True if the SteamCMD, ArkServerApi, or ArkAP plugin install flow is active - they
-        share the install_log/install_progress/install_status_var widgets, so only one
-        may run at a time."""
+        """True if the SteamCMD, ArkServerApi, ArkAP plugin, or mod-download flow is active.
+        The first three share the install_log widgets; the mod flow has its own log but
+        still runs SteamCMD against the same SERVER_ROOT, so all four are mutually
+        exclusive - two SteamCMD runs at once would fight over the steamapps lock."""
         return ((self._install_thread is not None and self._install_thread.is_alive())
                 or (self._arkapi_thread is not None and self._arkapi_thread.is_alive())
-                or (self._plugin_thread is not None and self._plugin_thread.is_alive()))
+                or (self._plugin_thread is not None and self._plugin_thread.is_alive())
+                or (self._mods_thread is not None and self._mods_thread.is_alive()))
 
     def on_install_server(self):
         if self._any_install_running():
@@ -5869,7 +7217,19 @@ class ArkAPLauncher(tk.Tk):
         else:
             self.install_status_var.set("Failed")
         if success:
-            self._ensure_cluster_dirs(self.get("SERVER_ROOT"))
+            server_root = self.get("SERVER_ROOT")
+            if server_root:
+                # Writes the install's own SERVER_ROOT straight into the Configuration
+                # field (it's the same var as the one just used for +force_install_dir,
+                # so this is normally a no-op, but it's cheap insurance) and runs the
+                # same Quick scan that leaving the field normally triggers - self.set()
+                # doesn't fire the <FocusOut> binding on its own, so without this,
+                # PLUGINS_DIR/ipc_dir/game_ini would stay unfilled until the user
+                # clicked into and back out of the field by hand.
+                server_root = os.path.normpath(server_root)
+                self.set("SERVER_ROOT", server_root)
+                self._ensure_cluster_dirs(server_root)
+                self._scoped_scan(level=SCAN_QUICK)
             messagebox.showinfo("ARKIpelago Launcher", "ARK server install/update complete.")
         elif not self._install_cancelled:
             messagebox.showerror("ARKIpelago Launcher",
@@ -8202,10 +9562,14 @@ class ArkAPLauncher(tk.Tk):
             pass
 
     def _expand_instruction_step_for_index(self, widget, index):
-        """If `index` falls inside a collapsed instruction step's body, expand it -
-        otherwise a search match hiding under an elided (collapsed) step would be
+        """If `index` falls inside a collapsed instruction section or step, open it -
+        otherwise a search match hiding under an elided (collapsed) region would be
         "found" but never actually become visible when scrolled to."""
         for tag_name in widget.tag_names(index):
+            # Re-open the whole section first (its fold hides everything inside it).
+            svar = getattr(self, "_instr_section_vars", {}).get(tag_name)
+            if svar is not None and svar.get():
+                svar.set(False)
             var = self._instruction_step_vars.get(tag_name)
             if var is not None and var.get():
                 var.set(False)
