@@ -1,4 +1,5 @@
-# ARK:ipelago Launcher : Setup Guide
+Ghios developed the entire plugin [here](https://github.com/Jbaker16163/Ark-Survival-Archipelago). This is just a Community made launcher built to make setup as easy as possible
+# ARKipelago Launcher : Setup Guide
 
 > Pro tip: most options have tooltips if you hover over them.
 > The Search bar (top left) searches field labels, tooltips, and text across every tab. press Enter, then use Find Next / Find Prev to jump between matches.
