@@ -37,6 +37,7 @@ Open the **Configuration** tab. In the Paths group, click **"Scan for paths."** 
 
 - `SERVER_ROOT` is the folder that contains `ShooterGame`.
 - The scan shows its suggestions in a popup. Click a suggestion to accept it. If one looks wrong, close the popup and use Browse to set that path yourself.
+- The popup scrolls if the scan found a lot of folders.
 
 ### 5. Check your setup
 
@@ -44,19 +45,40 @@ Open the **Setup Status** tab. Click **Re-check**.
 
 - Every row should show a green checkmark before you carry on.
 - A yellow "i" is advisory only and is typically nothing to worry about. A red X tells you what to fix.
+- Come back here after any change. It also checks that your settings were saved into the server scripts, and that your ticked mods match what the server will really load.
 
 ### 6. Set up your Archipelago room
 
 This guide assumes you already know how Archipelago and YAMLs work.
 
 - Open the **Archipelago Setup** tab. Set your Archipelago directory, or click **"Scan for Archipelago."**
-- Click **"Update .apworld"** to install the apworld.
+- Click **"Update .apworld"** to install `ark_ase.apworld`.
 - Click **"Open Options Creator (YAML)"** to build your yaml. Pick ARK from its game list.
 - Click **"Export Options"** in the top right of the Options Creator to save your yaml.
 - Write down your slot name. You need it in step 7.
 - Click **"Open Players folder"** and put your yaml in there.
 - Click **"Generate seed."**
 - Click **"Open output folder"** to find your generated seed.
+
+#### Hosting the seed
+
+Now host that seed. Two options, pick one, not both.
+
+**Option A:** upload the `.zip` to archipelago.gg and let the website host it. Easiest. It gives you the server address for step 7.
+
+**Option B:** click **"Host local Archipelago server"** to host it on this PC. Pick the seed when it asks. It opens in its own console window, leave that window open, closing it ends the room.
+
+- Option B fills in the server field for you, so step 7 is just your slot name. It asks first if you had already typed something there.
+- Option B uses your room password from step 7, and the port from Archipelago's own `host.yaml`. Change the port there if you need a different one.
+- **Option B warning:** other players connect to your IP, not localhost. Anyone outside your home network needs you to forward port `38281` (TCP) to this PC on your router. Use archipelago.gg if that sounds like a hassle.
+
+#### Optional: a live tracker map
+
+- In the **"PopTracker (tracker)"** group on the same tab, click **"Download PopTracker"** and pick a folder. It downloads PopTracker, installs the ARK tracker pack into it, and fills in the directory for you. Click Save.
+- Already have PopTracker? Set the **"PopTracker directory"** (or click **"Scan for PopTracker"**) and click **"Install/update ARK tracker pack"** instead. Your old copy of the pack is moved aside.
+- Click **"Open PopTracker"** to open it on the ARK map.
+- If connector setting are filled in the PopTracker opens already connected.
+- If it does not connect automatically click the grey **"AP"** at the top of the poptracker, paste the address with Ctrl+V, then type your slot and password. It remembers them for next time, apart from the password.
 
 ### 7. Fill in your room details
 
@@ -70,7 +92,7 @@ Stay on the **Archipelago Setup** tab. Find the **"Archipelago room (Connector s
 
 Open the **Configuration** tab. Under Quick Launch, click **"Run start_ase_server."**
 
-- Wait for the console to finish printing its startup messages before assuming something's wrong. Don't click inside the console window while it's starting.
+- Wait for the console to finish printing its startup messages before assuming something's wrong (this can take a while.. up to 900s if ran from a hard drive.). Don't click inside the console window while it's starting.
 - If the console's title bar starts with "Select", it has frozen. Press Enter to unfreeze it.
 
 ### 9. Join the game
@@ -94,26 +116,46 @@ Level up once to send your first check.
 |---|---|
 | **Configuration** | All your settings, the Quick Launch buttons, and Save. |
 | **Install Server/Api/Plugin** | The three installers, in order. |
-| **Archipelago Setup** | Your Archipelago folder, your room details, and buttons that open Archipelago's own tools. |
+| **Archipelago Setup** | Your Archipelago folder, your room details, and buttons that open Archipelago's own tools. It remembers every field between sessions, and they travel with your profiles. The tab has its own Save button. The "PopTracker (tracker)" group at the bottom is optional. |
 | **Mods** | Download and turn on Steam Workshop mods. |
 | **Setup Status** | A checklist of your setup. Click Re-check after you fix something. |
 | **Profiles** | Save and load named copies of your settings. Click Save on the Configuration tab after you load one. |
-| **Debug Log** | A live view of the plugin log. |
-| **Instructions** | The in-app version of this guide. Use the button in the top right to switch to the Full Guide. |
+| **Debug Log** | A viewer for your logs. The "Log:" dropdown picks which one: the ArkAP plugin's log, the launcher's own log, the launcher crash log, ARK's `ShooterGame.log`, or SteamCMD's download logs. |
+| **Instructions** | The in-app version of this guide, with a Quick Guide and a Full Guide. |
+
+---
+
+## Saving your changes
+
+- A Save button glows yellow while something on screen is unsaved.
+- A plain Save button means everything already matches what is saved.
+- There are three, and each one glows only for its own fields: Configuration, Archipelago Setup, and Mods.
+- Save matters. The server and the `.bat` scripts read your settings from files, and Save is what writes them there.
+- Forget to save and Run start_ase_server refuses to start, and Setup Status shows a red X. Click Save and try again.
+
+---
+
+## Check for Updates (top of the window)
+
+- It checks the launcher, the ArkAP plugin, the `.apworld` and the ARK tracker pack.
+- It runs by itself every time you start the launcher.
+- A marker and a highlight on the button mean something newer exists. Click it to see what.
+- The launcher updates itself. For the other three the dialog names the button that installs them.
 
 ---
 
 ## Mods (Steam Workshop)
 
-The **Mods** tab installs Steam Workshop mods for you.
-
+- The **Mods** tab installs Steam Workshop mods for you.
 - Install the ARK server and set `SERVER_ROOT` first.
 - Tick a mod to mark it active.
 - Click **"Download checked"** to install and activate every ticked mod.
 - Mods load from top to bottom. Use the arrows to change the order.
 - Click **Save** to write your ticked list to the server.
+- Setup Status tells you if your ticks and the server's real mod list have drifted apart.
 - Restart the ARK server after any mod change.
-- Click **"Copy active IDs"** to copy your mod list for the plugin's yaml.
+- Click **"Copy IDs for YAML"** to copy your mod list for the plugin's yaml. Only mods tagged "apworld ✓" are copied, the others would stop your game generating. They still work on the server unless they have engrams, the engrams wont be included in the pool of possible items.
+- Click **"Rename mod"** to give a mod you added yourself a name you will recognise instead of a bare ID.
 
 ---
 
@@ -138,11 +180,22 @@ The **Mods** tab installs Steam Workshop mods for you.
 
 ---
 
+## What the path fields feed
+
+- The path fields write into the launcher's `.bat` and `.ini` files for you.
+- Click Save after you change any field.
+- The Archipelago directory field only tells the launcher where Archipelago is installed.
+- The PopTracker directory field is the same, it only says where PopTracker is, so the tracker pack goes in the right place.
+
+---
+
 ## Reporting a problem
 
 - Click **"Export diagnostics"** next to Save on the Configuration tab.
-- It saves one `.zip` and opens the folder. Your passwords are removed from it.
-- Post that zip on Discord or attach it to a GitHub issue.
+- It saves one `.zip` and opens the folder. Post that zip on Discord or attach it to a GitHub issue.
+- Your yaml is found by reading the name inside each file in your Players folder and matching it to your slot, so what the file is called does not matter.
+- The zip holds your Setup Status, your version numbers, your config, your Archipelago `.yaml`, `paths.cmd`, `Game.ini` and `GameUserSettings.ini`, the plugin's `ArkAP.config.json`, the debug, crash and ShooterGame logs, everything in your ipc folder (including each player's mailbox folder), and a list of your ipc and Mods folders. That is everything anyone would ask you for.
+- Every password in every one of those files is replaced with `[REDACTED]` before it goes in. Very long logs are cut down to their last 5000 lines, and the ipc files to their last 500, so the zip stays small.
 
 ---
 
@@ -162,7 +215,11 @@ The **Mods** tab installs Steam Workshop mods for you.
 | "Scan for paths" missed a path | Pick a higher "Scan intensity" next to the button and scan again. |
 | Your cluster folders are missing | Click "Create ServerCluster folders" in the Paths group on the Configuration tab. |
 | The connection command fails in-game | The order is `/connect server slot password`. Copy it again from the Archipelago Setup tab. |
-| Checks or items are not coming through | Open the Debug Log tab. |
+| Checks or items are not coming through | Open the Debug Log tab (it opens on the ArkAP plugin log). |
+| The server closed by itself | Debug Log tab, switch the "Log:" dropdown to "ARK server log" and search for `LowLevelFatalError`. |
+| Something the launcher did went wrong | Debug Log tab, "Log:" dropdown, "Launcher log". It lists what the app did, with times. |
+| The server will not start and it says something is unsaved | Open the Configuration tab and click Save. |
+| A mod you ticked is not loading in game | Open the Mods tab, click Save, and restart the server. |
 | Setup Status shows a red X | Read the hint on that row and fix that one thing. |
 | Still stuck | Click "Export diagnostics" and post the zip on Discord or GitHub. |
 
