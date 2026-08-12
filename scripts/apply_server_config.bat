@@ -10,7 +10,7 @@ REM Edit the values in serverconfig\*.settings to taste BEFORE running this.
 
 setlocal
 REM ---- edit if your path differs ----
-set "SERVER_ROOT=E:\ARK\Server"
+set "SERVER_ROOT=C:\ARKServer"
 REM -----------------------------------
 set "CONFIGDIR=%SERVER_ROOT%\ShooterGame\Saved\Config\WindowsServer"
 

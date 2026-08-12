@@ -54,6 +54,7 @@ Per-file variable facts that matter:
     and are not synced from the GUI at all.
 """
 
+import io
 import os
 import re
 import sys
@@ -94,10 +95,12 @@ GROUPS = [
         ("BACKUPROOT",  "BACKUPROOT",            "folder"),
         ("PLUGINS_DIR", "ArkApi Plugins folder", "folder"),
     ]),
-    ("Connector", [
-        ("server",     "server",     "text"),
-        ("slot",       "slot",       "text"),
-        ("password",   "password",   "text"),
+    # server/slot/password used to live here too, but they're per-room Archipelago
+    # identity, not server plumbing - they now sit on the Archipelago Setup tab next
+    # to the tooling that uses them (see ARCHIPELAGO_GROUPS). What's left is the
+    # plugin/connector's own files on disk plus the one behaviour toggle, which is
+    # why the group is no longer called "Connector".
+    ("Plugin files & DeathLink", [
         ("death_link", "death_link", "bool"),
         ("ipc_dir",    "ipc_dir",    "folder"),
         ("data_dir",   "data_dir",   "folder"),
@@ -123,6 +126,489 @@ GROUPS = [
         ("connector_ini", "connector.ini file (not required)",                                "file"),
     ]),
 ]
+
+# Rendered onto the Archipelago Setup tab by the same _render_field_groups() loop that
+# builds GROUPS on the Configuration tab, so these fields get identical labels, Browse
+# buttons, placeholders, tooltips and search behaviour - they just live on a different
+# tab. Their keys land in self.vars exactly as before, which is what keeps connector.ini
+# writing, profiles, diagnostics and the Setup Status checks working unchanged.
+ARCHIPELAGO_DIR_KEY = "ARCHIPELAGO_DIR"
+# Same treatment for the PopTracker install (the tracker app that watches the multiworld).
+# Declared up here because ARCHIPELAGO_GROUPS below names it.
+POPTRACKER_DIR_KEY = "POPTRACKER_DIR"
+
+ARCHIPELAGO_GROUPS = [
+    ("Archipelago installation", [
+        (ARCHIPELAGO_DIR_KEY, "Archipelago directory", "folder"),
+    ]),
+    ("Archipelago room (Connector settings)", [
+        ("server",   "server",   "text"),
+        ("slot",     "slot",     "text"),
+        ("password", "password", "text"),
+    ]),
+    # PopTracker is Archipelago tooling (it autotracks the multiworld), not ARK server
+    # tooling, which is why it lives on this tab rather than the Configuration or Install
+    # tabs. Its whole group - directory field, scan, and the three buttons - is built into
+    # this one LabelFrame (see _build_poptracker_controls).
+    ("PopTracker (tracker)", [
+        (POPTRACKER_DIR_KEY, "PopTracker directory", "folder"),
+    ]),
+]
+
+# Which self.vars keys belong to the Archipelago Setup tab. Both Save buttons write
+# everything (there is one config JSON), but each one's HIGHLIGHT reports only its own
+# fields - see _update_save_highlights. Everything else in self.vars is Configuration's.
+ARCHIPELAGO_KEYS = {key for _title, fields in ARCHIPELAGO_GROUPS for key, *_rest in fields}
+
+# A folder only counts as an Archipelago install if it holds ALL of these. Any one of
+# them alone shows up in unrelated places (an extracted zip, a half-copied folder), and
+# accepting a partial match would leave half the tab's buttons pointing at nothing.
+ARCHIPELAGO_REQUIRED_EXES = (
+    "ArchipelagoLauncher.exe",
+    "ArchipelagoGenerate.exe",
+    "ArchipelagoOptionsCreator.exe",
+)
+
+# Launched by name from the Archipelago directory. Not in the required trio above: a
+# working install has it, but its absence shouldn't invalidate the whole folder - the
+# button for it just disables itself with a message instead.
+ARCHIPELAGO_TEXT_CLIENT_EXE = "ArchipelagoTextClient.exe"
+
+# Same treatment as the Text Client, and for the same reason: "Host local Archipelago
+# server" gates itself on this file existing rather than it joining
+# ARCHIPELAGO_REQUIRED_EXES. Adding it to the required trio would make a folder that is
+# otherwise a perfectly good install (yaml building, generating, the Launcher) fail
+# is_archipelago_dir() outright and grey out the ENTIRE tab, just because the one button
+# a self-hosting user may never press has nothing to point at.
+ARCHIPELAGO_SERVER_EXE = "ArchipelagoServer.exe"
+
+# Archipelago's own default, from the `port:` key under `server_options:` in a stock
+# host.yaml (verified against 0.6.7, which also reports ":38281" in the server's own
+# "Hosting game at ..." banner). Only a fallback - archipelago_host_port() reads the
+# real value out of host.yaml first, so a user who changed it there still gets the
+# correct address auto-filled.
+ARCHIPELAGO_DEFAULT_PORT = 38281
+
+# The installer's own default, and by far the most common location.
+ARCHIPELAGO_DEFAULT_DIR = r"C:\ProgramData\Archipelago"
+
+
+def is_archipelago_dir(path):
+    """True if `path` is a folder holding all of ARCHIPELAGO_REQUIRED_EXES."""
+    if not path or not os.path.isdir(path):
+        return False
+    return all(os.path.isfile(os.path.join(path, exe))
+               for exe in ARCHIPELAGO_REQUIRED_EXES)
+
+
+def archipelago_host_port(root):
+    """The port ArchipelagoServer.exe will actually host on, read from host.yaml.
+
+    Read rather than assumed because host.yaml is Archipelago's own documented way to
+    change the hosting port, and this value is what gets auto-filled into the `server`
+    field - guessing it would hand the user an address their own server isn't on.
+    "Host local Archipelago server" deliberately does NOT pass --port for the same
+    reason: a command-line --port would override host.yaml (verified - despite the
+    "These overwrite command line arguments!" comment in host.yaml, the CLI wins for
+    port and password), silently defeating the user's own edit.
+
+    ponytail: regex, not a yaml parse - the app has no yaml dependency and pulling one
+    in for a single integer isn't worth it. Only matches a plain `port: <digits>`, which
+    is the stock format; anything exotic (anchors, quotes, a flow mapping) falls back to
+    the documented default, which is also what an unreadable or missing file gives.
+    """
+    try:
+        with open(os.path.join(root, "host.yaml"), "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return ARCHIPELAGO_DEFAULT_PORT
+    # Anchored to the server_options block: host.yaml also carries a `port:` under the
+    # webhost section, and matching that one would report the wrong address entirely.
+    # The slice starts AFTER the header, so the terminator below can't match the header's
+    # own first character and collapse the block to nothing.
+    head = "server_options:"
+    idx = text.find(head)
+    if idx < 0:
+        return ARCHIPELAGO_DEFAULT_PORT
+    # Ends at the next top-level key; comments inside the block are indented, so an
+    # unindented line really is the start of a different section.
+    block = re.split(r"^\S", text[idx + len(head):], maxsplit=1, flags=re.MULTILINE)[0]
+    match = re.search(r"^\s+port:\s*(\d{1,5})\s*(?:#.*)?$", block, flags=re.MULTILINE)
+    if not match:
+        return ARCHIPELAGO_DEFAULT_PORT
+    port = int(match.group(1))
+    return port if 1 <= port <= 65535 else ARCHIPELAGO_DEFAULT_PORT
+
+
+def archipelago_seed_files(root):
+    """Generated seeds in Archipelago's output folder, newest first.
+
+    Both extensions are listed because ArchipelagoGenerate writes a .zip (verified: a
+    real generate produced AP_<seed>.zip holding AP_<seed>.archipelago plus the spoiler
+    log), while ArchipelagoServer.exe happily takes EITHER the .zip or a bare extracted
+    .archipelago as its positional multidata argument - both were confirmed to boot a
+    working room. So the normal case is the .zip the user just generated, and someone
+    who extracted one by hand still sees their file."""
+    if not root:
+        return []
+    out = os.path.join(root, "output")
+    found = glob.glob(os.path.join(out, "*.zip")) + \
+        glob.glob(os.path.join(out, "*.archipelago"))
+    return sorted(found, key=lambda p: os.path.getmtime(p), reverse=True)
+
+
+def _dedupe_paths(paths):
+    """The same paths, order kept, with case/separator-equivalent duplicates dropped -
+    so the cheapest guess in a candidate list is still tried first. ProgramFiles and
+    ProgramFiles(x86) are the same folder on some boxes, which is what made this worth
+    having; both directory scans use it."""
+    seen, out = set(), []
+    for p in paths:
+        norm = os.path.normcase(os.path.normpath(p))
+        if norm not in seen:
+            seen.add(norm)
+            out.append(p)
+    return out
+
+
+def archipelago_candidate_dirs():
+    """Fixed, fast-to-check guesses, cheapest/most likely first - checked before any
+    walking happens (see _dir_scan_worker). Archipelago's installer defaults to
+    ProgramData; the rest cover a per-user install and a manual extract."""
+    home = os.path.expanduser("~")
+    cands = [
+        ARCHIPELAGO_DEFAULT_DIR,
+        os.path.join(os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local")),
+                     "Archipelago"),
+        os.path.join(home, "Archipelago"),
+    ]
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(env)
+        if root:
+            cands.append(os.path.join(root, "Archipelago"))
+    for name in USER_SWEEP_FOLDER_NAMES:
+        cands.append(os.path.join(home, name, "Archipelago"))
+    return _dedupe_paths(cands)
+
+
+# --------------------------------------------------------------------------- #
+#  PopTracker (the tracker app) and the ARK tracker pack
+# --------------------------------------------------------------------------- #
+#
+# PopTracker is a separate third-party app (black-sliver/PopTracker) that autotracks an
+# Archipelago multiworld. Like Archipelago itself it is never bundled with this launcher -
+# the Windows build alone is ~17 MB extracted, several times the launcher's own zip - so
+# the launcher either points at a copy the user already has, or downloads one for them
+# ("Download PopTracker").
+
+# The one file a folder must hold to count as a PopTracker install. Deliberately not a
+# trio like ARCHIPELAGO_REQUIRED_EXES: PopTracker ships as a zip you extract anywhere, and
+# everything done with it here (launch it, write into packs\) needs only the exe to exist.
+POPTRACKER_EXE = "poptracker.exe"
+# The pack folder PopTracker scans next to its exe. It has other search paths too
+# (HOME/PopTracker/packs, Documents/PopTracker/packs, CWD/packs - see its README), but
+# EXEDIR\packs is the one that belongs to the install the user pointed us at, so it is the
+# only one written to.
+POPTRACKER_PACKS_DIRNAME = "packs"
+
+# /releases/latest here, NOT the list endpoint the ArkAP repo needs: this repo publishes
+# release candidates as pre-releases (v0.35.4-rc1/-rc2 at the time of writing, both newer
+# than the v0.35.3 stable), and /releases/latest is exactly what excludes them. Handing
+# users an rc build of somebody else's app is not what "Download PopTracker" should do.
+# Verified against the live API: the list's first entry is an rc, /releases/latest is the
+# stable.
+POPTRACKER_RELEASES_API = (
+    "https://api.github.com/repos/black-sliver/PopTracker/releases/latest")
+POPTRACKER_RELEASES_PAGE = "https://github.com/black-sliver/PopTracker/releases"
+# Asset naming on every release checked: poptracker_<version-with-dashes>_win64.zip,
+# alongside macOS/Linux/AppImage/source builds and a .minisig signature for each. Matched
+# by suffix because the version is baked into the name. Windows-only on purpose - so is
+# the rest of this launcher (SteamCMD, .bat scripts, PowerShell update helper).
+POPTRACKER_ASSET_SUFFIX = "_win64.zip"
+# That zip holds ONE top-level folder, "poptracker\", with poptracker.exe inside it
+# (verified against the published v0.35.3 asset) - so extracting it into the folder the
+# user picks yields <picked>\poptracker, and THAT is what the directory field is set to.
+POPTRACKER_DOWNLOAD_SUBDIR_NOTE = "poptracker"
+
+# --- The ARK tracker pack (a PopTracker pack, not a PopTracker build) ------- #
+# The /releases LIST endpoint, same as the ArkAP plugin/.apworld use. Today's releases
+# (0.0.1, 0.0.2) are both full releases, so /releases/latest would work right now - but
+# this is a small personal repo, one "Pre-release" tick there is all it takes to make that
+# endpoint 404, and that is the exact bug already fixed once for the plugin. The list
+# endpoint returns pre-releases too, newest first.
+TRACKER_PACK_RELEASES_API = (
+    "https://api.github.com/repos/lurch9229/Arkipelago-Poptracker/releases")
+TRACKER_PACK_RELEASES_PAGE = "https://github.com/lurch9229/Arkipelago-Poptracker/releases"
+# The pack publishes no release assets at all, so the download is GitHub's auto-generated
+# source zip ("zipball_url" on the release JSON). Its single top-level folder is named
+# <owner>-<repo>-<short sha> (e.g. lurch9229-Arkipelago-Poptracker-74046e9), which is NOT
+# something PopTracker keys anything on: a pack is any entry in packs\ - folder OR zip -
+# that holds a manifest.json, and its identity comes from that file's package_uid /
+# package_version (verified in PopTracker's own pack.cpp: Pack::Pack reads manifest.json
+# from a directory or, for a zip, from the zip root or its single top-level folder, and
+# Pack::ListAvailable/Pack::Find iterate every entry of each search path). So the extracted
+# folder is renamed to this stable name on install, and the sha in the zip's name is
+# irrelevant - as is the folder name of a copy the user installed by hand.
+TRACKER_PACK_DIRNAME = "Arkipelago-Poptracker"
+TRACKER_PACK_MANIFEST = "manifest.json"
+# From the pack's own manifest.json (both published releases). The uid is what
+# --load-pack takes; the variant is the pack's only one, flagged "ap".
+TRACKER_PACK_UID = "Ark_Tracker_Lurch9229"
+TRACKER_PACK_VARIANT = "map_tracker"
+TRACKER_PACK_LABEL = "ARK tracker pack"
+# Where a replaced pack is moved to. Deliberately NOT a .bak left inside packs\:
+# PopTracker scans every entry in that folder, so a backup sitting there would still hold
+# a valid manifest.json with the same package_uid and turn up as a second copy of the pack
+# in its Load list.
+TRACKER_PACK_BACKUP_DIRNAME = "pack_backups"
+
+
+def is_poptracker_dir(path):
+    """True if `path` is a folder holding poptracker.exe."""
+    return bool(path) and os.path.isfile(os.path.join(path, POPTRACKER_EXE))
+
+
+def poptracker_packs_dir(root):
+    """<PopTracker dir>\\packs, or "" when the directory isn't set."""
+    return os.path.join(os.path.normpath(root), POPTRACKER_PACKS_DIRNAME) if root else ""
+
+
+def poptracker_candidate_dirs():
+    """Fixed, fast-to-check guesses, cheapest/most likely first - checked before any
+    walking happens (see _dir_scan_worker). PopTracker has no installer and no canonical
+    location: it ships as a zip you extract wherever you like, so these are the places it
+    actually ends up - next to this launcher, at a drive root, in the user's profile, and
+    in Desktop/Documents/Downloads (where a downloaded zip is usually unpacked, and where
+    "Download PopTracker" is likely to be pointed).
+
+    Both the folder name people give it ("PopTracker") and the one the official zip
+    extracts as ("poptracker") are covered by one spelling, since Windows paths are
+    case-insensitive."""
+    home = os.path.expanduser("~")
+    cands = [os.path.join(base_dir(), "PopTracker"), r"C:\PopTracker",
+             os.path.join(home, "PopTracker")]
+    for name in USER_SWEEP_FOLDER_NAMES:
+        cands.append(os.path.join(home, name, "PopTracker"))
+    return _dedupe_paths(cands)
+
+
+def read_pack_manifest(path):
+    """(package_uid, package_version) of the PopTracker pack at `path`, or ("", "").
+
+    Handles both forms PopTracker accepts (see the TRACKER_PACK_DIRNAME note): a FOLDER
+    with manifest.json at its root, and a ZIP with manifest.json either at the zip root or
+    inside a single top-level folder. The zip form matters because PopTracker's own drag &
+    drop installs packs "without unpacking" (its README), so a copy the user installed
+    themselves can legitimately be a .zip sitting in packs\\ - carrying the same
+    package_uid as ours, and therefore something to find and move aside rather than leave
+    behind as a duplicate.
+
+    Anything unreadable, non-JSON or not a pack at all reports ("", "") rather than
+    raising: this runs over every entry of a folder the user owns."""
+    try:
+        if os.path.isdir(path):
+            with open(os.path.join(path, TRACKER_PACK_MANIFEST), "rb") as fh:
+                raw = fh.read()
+        elif zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as zf:
+                name = next((n for n in zf.namelist()
+                             if n.lower() == TRACKER_PACK_MANIFEST
+                             or (n.lower().endswith("/" + TRACKER_PACK_MANIFEST)
+                                 and n.count("/") == 1)), None)
+                if not name:
+                    return "", ""
+                raw = zf.read(name)
+        else:
+            return "", ""
+        # utf-8-sig, not utf-8: json.loads chokes on a BOM, and a hand-edited manifest
+        # saved from a Windows editor is exactly where one comes from.
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    return (str(data.get("package_uid") or "").strip(),
+            str(data.get("package_version") or "").strip())
+
+
+def installed_tracker_pack(packs_dir):
+    """(path, version) of the ARK tracker pack already in `packs_dir`, else ("", "").
+
+    Identified by package_uid out of each entry's manifest.json rather than by name,
+    because PopTracker doesn't care what a pack is called: a copy installed by hand can be
+    sitting there under any folder name, or as a zip. The version is the manifest's own
+    package_version, which the pack keeps in step with its release tag (0.0.1 and 0.0.2
+    both match), so no hash-matching against release assets is needed here - unlike the
+    .apworld, whose file carries no usable version at all."""
+    try:
+        entries = sorted(os.scandir(packs_dir), key=lambda e: e.name.lower())
+    except OSError:
+        return "", ""
+    for entry in entries:
+        uid, version = read_pack_manifest(entry.path)
+        if uid == TRACKER_PACK_UID:
+            return entry.path, version
+    return "", ""
+
+
+def locate_extracted_pack(root):
+    """The folder inside an extracted download that IS the pack - the one directly holding
+    manifest.json. GitHub's source zip nests everything one level down in
+    <owner>-<repo>-<sha>\\, so that level has to be found rather than assumed; a zip whose
+    manifest is already at the root works too. Returns the path, or None."""
+    if os.path.isfile(os.path.join(root, TRACKER_PACK_MANIFEST)):
+        return root
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in names:
+        cand = os.path.join(root, name)
+        if os.path.isfile(os.path.join(cand, TRACKER_PACK_MANIFEST)):
+            return cand
+    return None
+
+
+def poptracker_win64_asset(release):
+    """The Windows build asset on a PopTracker release payload, or None. Suffix match
+    because the version is part of the filename; the per-asset .minisig signatures don't
+    end in the suffix, so they can't be picked by accident."""
+    for asset in release.get("assets") or []:
+        if ((asset.get("name") or "").lower().endswith(POPTRACKER_ASSET_SUFFIX)
+                and asset.get("browser_download_url")):
+            return asset
+    return None
+
+
+# Per-field data for the one shared directory scan (_start_dir_scan): what counts as a
+# hit, where to look before walking any drives, and what to say when nothing turns up.
+# Filled in here rather than inside the scan so adding a third scannable directory field
+# is a table entry, not another copy of the worker/poll/busy trio.
+DIR_SCAN_TARGETS = {
+    ARCHIPELAGO_DIR_KEY: {
+        "what": "Archipelago",
+        "matches": is_archipelago_dir,
+        "candidates": archipelago_candidate_dirs,
+        "missing": ("no Archipelago install found - set the directory manually (it's the "
+                    "folder holding %s)." % ", ".join(ARCHIPELAGO_REQUIRED_EXES)),
+    },
+    POPTRACKER_DIR_KEY: {
+        "what": "PopTracker",
+        "matches": is_poptracker_dir,
+        "candidates": poptracker_candidate_dirs,
+        "missing": ("no PopTracker install found - set the directory manually (it's the "
+                    "folder holding %s), or use \"Download PopTracker\" to fetch a copy."
+                    % POPTRACKER_EXE),
+    },
+}
+
+
+def locate_extracted_poptracker(root):
+    """The folder inside an extracted PopTracker download that holds poptracker.exe -
+    the zip's own single "poptracker\\" folder in every release checked, but found rather
+    than assumed. Returns the path, or None."""
+    if is_poptracker_dir(root):
+        return root
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in names:
+        cand = os.path.join(root, name)
+        if is_poptracker_dir(cand):
+            return cand
+    return None
+
+
+# PopTracker's command line is version-dependent, and getting this wrong is not harmless:
+#
+#   * --load-pack <uid> / --pack-variant <variant> are old and safe. Documented in the
+#     shipped v0.35.3's OWN doc/commandline.txt, and a real launch with both came up
+#     normally, so "Open PopTracker" always passes them.
+#   * --ap-host / --ap-slot / --ap-password only exist from 0.35.4 on (still pre-release at
+#     the time of writing - v0.35.4-rc1/-rc2). They are NOT ignored by an older build:
+#     v0.35.3 treats them as a bad argument, prints its usage and exits 1, i.e. PopTracker
+#     never opens at all (observed - exit code 1, no window). So they are only passed to an
+#     install new enough to have them.
+POPTRACKER_AP_ARGS_MIN_VERSION = "0.35.4"
+# Ships next to the exe in every release zip, and its first "## vX.Y.Z" heading is that
+# release's own version - the only version marker readable without running the exe, which
+# only prints --version to a console a windowed app hasn't got.
+POPTRACKER_CHANGELOG = "CHANGELOG.md"
+_POPTRACKER_VERSION_RE = re.compile(r"##\s*v?(\d+(?:\.\d+){1,3})")
+
+
+def poptracker_version(root):
+    """The installed PopTracker's version ("0.35.3"), or "" if it can't be established.
+    An rc build reports its base version (v0.35.4-rc2 -> 0.35.4), which is correct for
+    what its command line supports."""
+    try:
+        with open(os.path.join(root, POPTRACKER_CHANGELOG), "r", encoding="utf-8",
+                  errors="replace") as fh:
+            for line in fh:
+                match = _POPTRACKER_VERSION_RE.match(line.strip())
+                if match:
+                    return match.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+def poptracker_supports_ap_args(root):
+    """True only when this install is known to be 0.35.4 or newer. An unknown version
+    counts as too old on purpose: the cost of guessing "yes" wrongly is PopTracker
+    refusing to start, while guessing "no" wrongly just means the room details have to be
+    typed into its own AP dialog once."""
+    version = poptracker_version(root)
+    return bool(version) and not _version_is_newer(POPTRACKER_AP_ARGS_MIN_VERSION, version)
+
+
+# Why a pre-0.35.4 PopTracker gets a clipboard copy and a note instead of being connected
+# for it, having looked at all three possibilities in its own source:
+#
+#   * Command line (the one that works): --ap-host/--ap-slot/--ap-password land in
+#     PopTracker's `_args["ap"]`, which is the ONLY thing that sets its internal
+#     _apConnectPending, i.e. the only path that actually connects on startup. Gated on
+#     POPTRACKER_AP_ARGS_MIN_VERSION because an older build exits instead.
+#   * Persisted state (looks promising, isn't): PopTracker.json - %APPDATA%\PopTracker\
+#     PopTracker.json, or <exe dir>\portable-config\ in portable mode - does persist
+#     `at_uri` (host:port) and `at_slot`, read once at startup before the UI exists, so a
+#     pre-launch write would be picked up. But those two values are only the DEFAULTS for
+#     the AP dialog's input boxes; nothing connects from them. The password is never
+#     persisted at all (no such key exists anywhere in the app, and its "Enter password"
+#     box always opens empty). So writing another application's config file would buy
+#     "two of three boxes pre-typed in a dialog you still have to walk through" - not a
+#     connection - and PopTracker rewrites that whole file itself on startup and on every
+#     pack change. Not worth the reach into someone else's settings.
+#   * Driving its UI: not done, deliberately.
+#
+# So the honest fallback is to hand over the details and say so.
+def poptracker_room_hint(server, slot, password):
+    """(clipboard_text, message) for connecting an older PopTracker's AP dialog by hand,
+    or (None, None) when there's no room to hand over.
+
+    The host:port goes on the clipboard rather than the whole lot, because PopTracker asks
+    for the three values in three separate input boxes and only one of them is awkward to
+    retype - so the clipboard holds exactly what the first box wants, and the message
+    carries the other two."""
+    server = (server or "").strip()
+    if not server:
+        return None, None
+    message = (
+        "PopTracker can't be opened already connected: the command-line arguments for "
+        "that (--ap-host / --ap-slot / --ap-password) only exist in PopTracker %s and "
+        "newer, and passing them to an older build stops it starting at all.\n\n"
+        "Your room details are on the clipboard instead. In PopTracker:\n\n"
+        "  1. Click the grey \"AP\" in the top row.\n"
+        "  2. Host and port - paste with Ctrl+V:  %s\n"
+        "  3. Slot:  %s\n"
+        "  4. Password:  %s\n\n"
+        "PopTracker remembers the host and slot for next time (it never stores the "
+        "password). The ARK pack itself was loaded for you - only this connection step is "
+        "manual."
+        % (POPTRACKER_AP_ARGS_MIN_VERSION, server, slot or "(not set - type your slot name)",
+           password or "(none - leave it empty)"))
+    return server, message
 
 # The filesystem-location fields "Clear all paths" and the per-field "C" button clear
 # (see _on_clear_all_paths / _clear_path_field) - SERVER_ROOT/SAVESROOT/CLUSTERDIR/
@@ -197,6 +683,24 @@ FIELD_HELP = {
         "expiring.\n"
         "Tip: ARK's own default is 86400 (24h), often too short for a slow solo/small "
         "cluster - 2592000 = 30 days is a common recommended value."
+    ),
+    ARCHIPELAGO_DIR_KEY: (
+        "Your local Archipelago installation - the folder that directly contains "
+        "ArchipelagoLauncher.exe, ArchipelagoGenerate.exe and "
+        "ArchipelagoOptionsCreator.exe.\n"
+        "Example: " + ARCHIPELAGO_DEFAULT_DIR + "\n"
+        "Tip: this is Archipelago's own install folder, nothing to do with your ARK "
+        "server - use \"Scan for Archipelago\" if you're not sure where it went."
+    ),
+    POPTRACKER_DIR_KEY: (
+        "Your PopTracker installation - the folder that directly contains %s. PopTracker "
+        "is the separate tracker app that follows your multiworld; the ARK tracker pack "
+        "installs into its \"%s\" subfolder.\n"
+        "Example: C:\\PopTracker\n"
+        "Tip: PopTracker has no installer - it's a zip you extract wherever you like, so "
+        "there's no standard location. Use \"Scan for PopTracker\" if you already have "
+        "one, or \"Download PopTracker\" to have the launcher fetch it for you."
+        % (POPTRACKER_EXE, POPTRACKER_PACKS_DIRNAME)
     ),
     "server": (
         "Your Archipelago room address, host:port - shown when you host or join the "
@@ -289,6 +793,16 @@ PLACEHOLDER_EXAMPLES = {
     "PLUGINS_DIR":   PLACEHOLDER_EXAMPLE_ROOT + r"\ShooterGame\Binaries\Win64\ArkApi\Plugins",
     "ipc_dir":       PLACEHOLDER_EXAMPLE_ROOT + r"\ShooterGame\Binaries\Win64\ArkApi\Plugins\ArkAP\ipc",
     "game_ini":      PLACEHOLDER_EXAMPLE_ROOT + r"\ShooterGame\Saved\Config\WindowsServer\Game.ini",
+    # Not built from PLACEHOLDER_EXAMPLE_ROOT: unlike the ARK paths this one has a real
+    # installer default, so the example doubles as the answer for most users. The
+    # "and it doesn't exist on disk" half of is_unconfigured_example_path is what keeps
+    # a user who genuinely installed there from having their value discarded.
+    ARCHIPELAGO_DIR_KEY: ARCHIPELAGO_DEFAULT_DIR,
+    # PopTracker has no installer default at all (it's an extract-anywhere zip), so this
+    # one is a plausible example rather than an answer - which is fine, it's display-only
+    # either way, and the residue test below still keeps it out of the config unless the
+    # user really does have a folder there.
+    POPTRACKER_DIR_KEY: r"C:\PopTracker",
 }
 
 # Connector identity fields get the SAME greyed-example treatment as the path fields
@@ -401,13 +915,11 @@ PREFILL_ORDER = [
     "apply_server_config.bat",
 ]
 
-# .bat files we expose Run buttons for. (reset_ark_test / apply_server_config no longer
-# get Quick Launch buttons - the in-app reset controls and Save cover them; the .bat files
-# still ship and read paths.cmd for anyone who runs them by hand.)
-RUN_BATS = [
-    ("Run start_ase_server", "start_ase_server.bat"),
-    ("Run switch_map",       "switch_map.bat"),
-]
+# The .bat files we expose Run buttons for are start_ase_server.bat and switch_map.bat,
+# named inline in the Quick launch list (see _build_ui) so the button order is decided in
+# one place. reset_ark_test / apply_server_config deliberately get no button - the in-app
+# reset controls and Save cover them; the .bat files still ship and read paths.cmd for
+# anyone who runs them by hand.
 
 # --- Quick Launch pre-flight ------------------------------------------------- #
 # GUI keys a blank value is legitimately fine for, so the pre-flight check doesn't
@@ -491,6 +1003,13 @@ ACTIVE_PROFILE_KEY = "active_profile"
 # JSON key that persists the "don't show again" choice for the install reminder banner.
 REMINDER_HIDE_KEY = "hide_install_reminder"
 
+# JSON key set once, at the end of the very first launch (the same launch that
+# auto-creates DEFAULT_PROFILE_NAME). While it is missing the app opens on the
+# Instructions tab instead of Configuration; afterwards it never does again. A key of
+# its own rather than leaning on "config file doesn't exist yet" so a config that fails
+# to write, or is shipped blank, can't re-trigger the greeting on every launch.
+FIRST_RUN_DONE_KEY = "first_run_done"
+
 # JSON key (in CONFIG_FILENAME, deliberately NOT in the profiles file) holding the newest
 # release version the user has clicked "Check for Updates" through to see. Persisted
 # separately from APP_VERSION so it survives restarts and drives the button HIGHLIGHT:
@@ -498,6 +1017,13 @@ REMINDER_HIDE_KEY = "hide_install_reminder"
 # the exclamation badge, which tracks "is anything newer than the installed APP_VERSION
 # at all". See _compute_update_cues.
 ACK_VERSION_KEY = "last_acknowledged_version"
+
+# The components "Check for Updates" tracks. Each gets its OWN acknowledged-version key
+# (see _ack_key) rather than sharing one: with a single value, clicking through a plugin
+# update would silently dismiss the highlight for an unrelated .apworld update the user
+# never saw. "launcher" deliberately keeps the original un-suffixed ACK_VERSION_KEY so
+# existing configs don't forget what the user already acknowledged.
+UPDATE_COMPONENTS = ("launcher", "plugin", "apworld", "trackerpack")
 
 # JSON keys recording the version of ArkServerApi / the ArkAP plugin the launcher last
 # installed, so Setup Status can flag (as an advisory, never a failure) when a newer
@@ -507,12 +1033,49 @@ ACK_VERSION_KEY = "last_acknowledged_version"
 # config JSON, like REMINDER_HIDE_KEY above.
 ARKAPI_INSTALLED_VERSION_KEY = "arkapi_installed_version"
 PLUGIN_INSTALLED_VERSION_KEY = "plugin_installed_version"
+# Same idea for the .apworld: stamped by "Update .apworld" (_on_apworld_done) from the tag
+# the GitHub download reported.
+APWORLD_INSTALLED_VERSION_KEY = "apworld_installed_version"
+# ...and for the ARK tracker pack. This one has a real source of truth on disk (the pack's
+# manifest.json package_version - see installed_tracker_pack), so the key is only a cache
+# for the readers that have a config dict but no folder to look in, chiefly the diagnostics
+# version block.
+TRACKER_PACK_INSTALLED_VERSION_KEY = "trackerpack_installed_version"
+# ...but these two keys are a FALLBACK, not the source of truth. They only ever exist when
+# the launcher itself did the install: a copy that shipped with the plugin and .apworld
+# already in place recorded neither, which is exactly the install that used to show nothing
+# but the launcher version in the update dialog. Both are now detected from the files on
+# disk first (apworld_version_from_disk / plugin_version_from_disk) and written back into
+# these same keys, so every reader - dialog, Setup Status advisories, diagnostics version
+# block - keeps reading one value.
+#
+# The plugin probe has to download release zips to compare (see plugin_version_from_disk),
+# so the ArkAP.dll hash it last ran against is remembered here - including when nothing
+# matched - and the probe re-runs only when that hash changes, i.e. once per plugin build
+# rather than once per launch.
+PLUGIN_PROBED_DLL_SHA_KEY = "plugin_probed_dll_sha"
+# How many releases deep that probe will download before giving up. Each ArkAP_plugin.zip is
+# ~380 KB, and a plugin built from source matches none of them, so this is a floor on the
+# bandwidth an unrecognised build can cost.
+PLUGIN_PROBE_MAX_RELEASES = 4
+PLUGIN_DLL_NAME = "ArkAP.dll"
 
-# Config JSON fields the "Export diagnostics" zip must never leak. Everything else in the
-# config is kept as-is so it's still useful for troubleshooting - these three are replaced
-# in place with a marker rather than the whole file being withheld.
+# Values the "Export diagnostics" zip must never leak. Everything else is kept as-is so
+# the bundle is still useful for troubleshooting - only the secret VALUE is replaced with
+# this marker, never the key and never the whole file.
+#
+# Recognised by the SHAPE of the key rather than a per-file list, because the export
+# collects several formats and the same secret is spelled differently in each:
+#   ADMINPASS / SERVERPASS                 - paths.cmd, arkap_launcher_config.json
+#   ServerAdminPassword / ServerPassword /
+#   SpectatorPassword                      - GameUserSettings.ini
+#   password / server_password             - host.yaml, a player yaml, ArkAP.config.json
+# A per-file list is exactly what let paths.cmd start holding ADMINPASS unnoticed.
 REDACT_MARKER = "[REDACTED]"
-REDACT_CONFIG_KEYS = ("ADMINPASS", "SERVERPASS", "password")
+# Secret keys that don't end in "pass" or contain "password". Nothing collected today uses
+# these; they're here so a future collected file can't leak one just by being added.
+SECRET_KEY_EXTRA = frozenset({"secret", "secret_key", "token", "auth_token",
+                              "api_key", "apikey"})
 
 # --- Appearance / theming --------------------------------------------------- #
 # JSON key that persists the light/dark choice - read/written directly like
@@ -696,17 +1259,39 @@ CONNECTOR_PROCESS = "ArkConnector.exe"
 # previous seed's checks into a fresh room. Deleting all of these clears both directions.
 # Deliberately EXCLUDES the plugin's own payload (ArkAP.dll, ArkAP.config.json, and the
 # engrams/dinos/locations/crates/filler naming .json files) - only generated state is wiped.
+#
+# ap_connections.json is the one that matters most: the plugin's OWN embedded connector
+# (the /connect in-game path, now the normal way to play) persists the room there -
+# server host:port, slot, password - and resumes it on the next server start ("APC
+# resumed N persisted connection(s)"). It survived every reset, so a fresh seed
+# immediately reconnected to the PREVIOUS room. It predates nothing in ipc\: the
+# standalone Python connector never wrote it, which is why an ipc-shaped delete list
+# could not have covered it.
 AP_RESET_PLUGIN_FILES = [
     "state.json", "seed.json", "applied_index.json", "counters.json",
     "events_queue.jsonl", "ArkAP_note_hits.jsonl", "note_queue.jsonl",
     "tame_check_queue.jsonl", "kill_check_queue.jsonl", "dino_queue.jsonl",
     "crate_queue.jsonl", "ArkAP_debug.log",
+    "ap_connections.json", "ap_restart.bat", "ap_restart.log",
+    "ArkAP_dino_classes.jsonl", "ArkAP_loaded.txt",
+    "ArkAP_engrams_dump.json", "ArkAP_notes_dump.json",
 ]
 AP_RESET_IPC_FILES = [
     "session.json", "state.json", "checks_out.jsonl", "items_in.jsonl",
     "death_out.jsonl", "death_in.jsonl", "msg_in.jsonl", "hint_out.jsonl",
     "hint_status.json", "flags.json", "game_ini_fragment.txt",
+    "conn_status.txt", "boss_out.jsonl",
 ]
+
+# Everything the plugin INSTALLER puts in the ArkAP folder (payload, not state): the
+# DLL, its config, the shipped naming data, and the per-mod naming data under mods\.
+# A reset must leave exactly these and nothing else - see find_ap_leftovers().
+AP_PLUGIN_PAYLOAD_FILES = {
+    "arkap.dll", "arkap.config.json", "arkap.config.default.json",
+    "engrams.json", "locations.json", "dinos.json", "crates.json",
+    "filler.json", "tek_grants.json", "spawn_classes.json",
+}
+AP_PLUGIN_PAYLOAD_DIRS = {"mods"}
 
 # The files whose existence IS "a world / character exists": world save, character
 # profile, tribe data. The full reset counts these before it moves anything and
@@ -776,6 +1361,36 @@ def find_save_files(roots):
     return hits
 
 
+def find_ap_leftovers(plugin_dir):
+    """Every file under plugin_dir that is NOT part of the installed plugin payload.
+
+    The counterpart to find_save_files(), for the AP side of a reset. That one answers
+    "did a world survive"; this answers "did AP state survive" - and deliberately does
+    it as a KEEP-list scan of the whole folder rather than by re-checking the same
+    fixed filenames the delete list already used. A delete list only removes names
+    somebody remembered to add, so every new file the plugin starts writing survives a
+    reset silently and nothing notices: that is exactly how ap_connections.json (the
+    embedded connector's persisted room + slot, auto-resumed on the next server start)
+    kept reconnecting a fresh seed to the previous room. Scanning generically means the
+    NEXT such file fails the reset loudly instead of shipping as a bug report.
+
+    Anything returned here after a reset is state the reset did not clear."""
+    hits = []
+    if not plugin_dir or not os.path.isdir(plugin_dir):
+        return hits
+    for dp, dns, fns in os.walk(plugin_dir):
+        if os.path.normcase(dp) == os.path.normcase(plugin_dir):
+            dns[:] = [d for d in dns if d.lower() not in AP_PLUGIN_PAYLOAD_DIRS]
+            for fn in fns:
+                if fn.lower() not in AP_PLUGIN_PAYLOAD_FILES:
+                    hits.append(os.path.join(dp, fn))
+        else:
+            # Below the top level (ipc\, per-player mailboxes, anything new): no
+            # payload lives there, so every file is generated state.
+            hits += [os.path.join(dp, fn) for fn in fns]
+    return sorted(hits)
+
+
 def list_map_junctions(saved_dir):
     """[(entry_path, target_or_None, resolves)] for every Cluster-* entry inside
     ShooterGame\\Saved.
@@ -837,6 +1452,16 @@ ARKAP_PLUGIN_RELEASES_API = (
     "https://api.github.com/repos/Jbaker16163/Ark-Survival-Archipelago/releases")
 # The plugin release asset the "Install Plugin" button downloads (matched case-insensitively).
 ARKAP_PLUGIN_ASSET_NAME = "ArkAP_Plugin.zip"
+# The ARK world asset the Archipelago tab's "Update .apworld" button downloads, from the
+# same releases list. Name verified against the actual published release assets - it is
+# lowercase "ark_ase.apworld", not the repo/display name - though the lookup itself is
+# case-insensitive like the plugin's.
+APWORLD_ASSET_NAME = "ark_ase.apworld"
+# Display name per tracked component. Module-level because the update dialog and the
+# "you're up to date" box both list every component now, and they must agree on the names.
+UPDATE_COMPONENT_LABELS = {"launcher": "Launcher", "plugin": "ArkAP plugin",
+                           "apworld": APWORLD_ASSET_NAME,
+                           "trackerpack": TRACKER_PACK_LABEL}
 # GitHub's API 403s anonymous requests with no User-Agent header - any non-empty value works.
 GITHUB_API_USER_AGENT = "ArkAPLauncher"
 
@@ -849,7 +1474,7 @@ GITHUB_API_USER_AGENT = "ArkAPLauncher"
 # and lays down an --onedir install, permanently ending the "Failed to load Python DLL" race
 # (which was the --onefile bootloader losing a lock-timing fight with AV over the freshly
 # extracted _MEI\python313.dll on the first launch after an update). See build.py --bridge.
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.10"
 UPDATE_REPO = "aSoberAvocado/ARK-Ipelago-Evolved-Launcher"
 # NEW clients discover updates from the releases LIST (newest release carrying a launcher
 # folder-zip wins), NOT from /releases/latest - that deliberately ignores GitHub's "Latest"
@@ -901,6 +1526,14 @@ MODS_CONTENT_RELDIR = os.path.join("ShooterGame", "Content", "Mods")
 
 # Pre-populated, ArkAP-plugin-verified mod set (name, Workshop ID). Anything added via
 # "Add mod" is marked supported=False instead of joining this list - see MODS_KEY.
+#
+# These IDs are also exactly the set the .apworld will accept in the yaml's `mod_ids`: it
+# only ships engram data for these, and raises
+#     OptionError: ARK: mod_ids lists <id>, which this apworld doesn't know.
+# on anything else - which is why "Copy IDs for YAML" copies the supported ones only (see
+# split_copyable_mod_ids). Verified against the shipped ark_ase.apworld's own
+# data/mods/index.json: eight catalog entries plus 1999447172 as an alias of 731604991.
+# If a release adds a mod, this list has to grow with it.
 SUPPORTED_MODS = [
     {"id": "731604991",  "name": "Structures Plus (S+)"},
     {"id": "1999447172", "name": "Super Structures"},
@@ -912,6 +1545,12 @@ SUPPORTED_MODS = [
     {"id": "1404697612", "name": "Awesome SpyGlass!"},
     {"id": "889745138",  "name": "Awesome Teleporters!"},
 ]
+
+# Workshop IDs the apworld treats as ONE catalog entry - forks that ship the parent's class
+# paths (Super Structures is Structures Plus'). A server can only load one, and listing both
+# in mod_ids is its own OptionError ("alternative versions of the same mod"), so the copy
+# warns instead of quietly picking one for the user.
+MOD_ALIAS_GROUPS = [("731604991", "1999447172")]
 
 # JSON key (in CONFIG_FILENAME) holding the mod list - id/name/enabled/supported dicts,
 # IN LOAD-ORDER (index 0 = highest ActiveMods= priority - ARK loads left-most first).
@@ -1028,14 +1667,178 @@ def write_crash_log(exc_type, exc_value, exc_tb):
         return None
 
 
+# Persistent launcher activity log. Same folder and same size-capped append-only shape as
+# the crash log above, for the same reason: it has to survive the app closing and be
+# somewhere a user can find it. Everything the launcher reports while it works (installs,
+# scans, saves, resets, mod downloads, Game.ini patches, SteamCMD output) went only to the
+# on-screen console boxes before this, and was gone the moment the window closed - which is
+# exactly the history you want when someone asks "what did it do before it broke?".
+LAUNCHER_LOG_FILENAME = "arkipelago_launcher.log"
+LAUNCHER_LOG_MAX_BYTES = 1024 * 1024  # ~1 MB - many sessions, still small enough to upload.
+
+
+def launcher_log_path():
+    return os.path.join(base_dir(), LAUNCHER_LOG_FILENAME)
+
+
+def launcher_log(msg, source=""):
+    """Append one timestamped line to the launcher log. Never raises - logging must not be
+    able to break the action it is logging (a read-only folder, a full disk, an antivirus
+    holding the file open are all survivable; losing the install is not).
+
+    `source` names which on-screen box the line came from (Console / Install / Mods), so
+    one file can carry all three streams and still be readable."""
+    if not (msg or "").strip():
+        return  # blank spacer lines are layout, not history
+    line = "%s %s%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                          "[%s] " % source if source else "", msg.strip())
+    path = launcher_log_path()
+    try:
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line)
+        # Trim only once it's actually oversized, so the common path stays a plain append
+        # rather than a read-rewrite of the whole file on every line.
+        if os.path.getsize(path) > LAUNCHER_LOG_MAX_BYTES:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                trimmed = _trim_to_tail(f.read(), LAUNCHER_LOG_MAX_BYTES)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(trimmed)
+    except OSError:
+        pass
+
+
+def _log_dialog(fn, kind):
+    """Wrap a messagebox function so every error/warning the user is shown also lands in
+    the launcher log.
+
+    Done once here rather than at the ~80 call sites: an error dialog is the single most
+    useful thing to have in the log, and a per-call-site approach silently misses every
+    dialog added later. The dialog itself behaves exactly as before."""
+    def wrapper(title, message, *args, **kwargs):
+        launcher_log("%s: %s - %s" % (kind, title, " ".join((message or "").split())))
+        return fn(title, message, *args, **kwargs)
+    return wrapper
+
+
+messagebox.showerror = _log_dialog(messagebox.showerror, "ERROR")
+messagebox.showwarning = _log_dialog(messagebox.showwarning, "WARNING")
+
+
+# How much of a log file the in-app viewer loads. ShooterGame.log routinely runs to tens of
+# MB; pushing that into a tk.Text freezes the UI for seconds, and nobody scrolls back
+# through 40 MB anyway - the error is at the end. Read as a tail (seek), not read-then-cut,
+# so the bytes never enter memory in the first place.
+LOG_VIEW_MAX_BYTES = 512 * 1024
+
+
+def read_log_tail(path, max_bytes=LOG_VIEW_MAX_BYTES):
+    """The last <= max_bytes of a log file as text, with a header saying so when the file
+    was bigger. Cut on a line boundary so the first surviving line isn't a fragment."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > max_bytes:
+            f.seek(size - max_bytes)
+        # Binary read (a tail needs a seek), so CRLF has to be normalised by hand - text
+        # mode would have done it, and ARK's own logs are CRLF. A stray \r left in shows
+        # up as a box in tk.Text.
+        text = f.read().decode("utf-8", "replace").replace("\r\n", "\n")
+    if size <= max_bytes:
+        return text
+    nl = text.find("\n")
+    return ("*** This log is %d KB - showing only its last %d KB (the newest lines). "
+            "Open the file itself if you need earlier history. ***\n\n"
+            % (size // 1024, max_bytes // 1024)) + (text[nl + 1:] if nl != -1 else text)
+
+
+# The Debug Log tab's dropdown: (label shown, key resolved by _log_source_target). Order is
+# what the dropdown shows; the first entry is what the tab opens on, so it stays the plugin
+# log the tab has always shown.
+LOG_SOURCES = [
+    ("ArkAP plugin log (ArkAP_debug.log)", "plugin"),
+    ("Launcher log (%s)" % LAUNCHER_LOG_FILENAME, "launcher"),
+    ("Launcher crash log (%s)" % CRASH_LOG_FILENAME, "crash"),
+    ("ARK server log (ShooterGame.log)", "shootergame"),
+    ("SteamCMD console log", "steam_console"),
+    ("SteamCMD workshop log", "steam_workshop"),
+    ("SteamCMD content log", "steam_content"),
+]
+
+
+def is_secret_key(name):
+    """True for a config/ini/yaml/cmd key whose VALUE is a password or equivalent.
+    See REDACT_MARKER for why this is shape-based rather than a list per file."""
+    n = (name or "").strip().strip("\"'").lower()
+    # "endswith pass" catches ADMINPASS/SERVERPASS without dragging in ARK's
+    # PassiveTameIntervalMultiplier and friends, which a bare "pass" substring would.
+    return n.endswith("pass") or "password" in n or n in SECRET_KEY_EXTRA
+
+
 def redact_config(data):
-    """Copy of the config dict with REDACT_CONFIG_KEYS replaced in place by REDACT_MARKER
-    (only when present and non-empty), so the rest stays useful for troubleshooting."""
+    """Copy of the config dict with every secret value replaced by REDACT_MARKER (only
+    when present and non-empty), so the rest stays useful for troubleshooting."""
     out = dict(data)
-    for key in REDACT_CONFIG_KEYS:
-        if out.get(key):
+    for key in out:
+        if is_secret_key(key) and out[key]:
             out[key] = REDACT_MARKER
     return out
+
+
+# One line = one `key <sep> value`, across all four formats the zip collects:
+#   set "ADMINPASS=x"  |  ServerPassword=x  |  password: x  |  "password": "x",
+# A leading ; or # is allowed so a commented-out password is redacted too - it's just as
+# much of a leak as a live one.
+_SECRET_LINE_RE = re.compile(
+    r'^(?P<pre>[ \t]*(?:[;#][ \t]*)?(?:set[ \t]+)?"?[ \t]*'
+    r'(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"?[ \t]*[:=][ \t]*)(?P<val>.*)$')
+
+# An unset password is nothing to leak, and blanking it would hide the genuinely useful
+# fact that it ISN'T set (an empty SERVERPASS means "no join password").
+_NOTHING_TO_LEAK = ("", '""', "''", "null", "~", "none")
+
+
+def _redact_line_body(line):
+    m = _SECRET_LINE_RE.match(line)
+    if not m or not is_secret_key(m.group("key")):
+        return line
+    val = m.group("val").strip()
+    if val.lower().rstrip(",") in _NOTHING_TO_LEAK:
+        return line
+    quote = val[0] if val[:1] in ("\"", "'") else ""
+    if quote:
+        end = val.rfind(quote)
+        if end > 0:  # keep the quotes and anything after them (JSON's trailing comma)
+            return "%s%s%s%s%s" % (m.group("pre"), quote, REDACT_MARKER, quote, val[end + 1:])
+    # cmd's `set "KEY=value"` closes its quote AFTER the value; keep that (and a trailing
+    # comma) so the file still reads as valid.
+    tail = val[-1] if val[-1] in ('"', ",") else ""
+    return m.group("pre") + REDACT_MARKER + tail
+
+
+# JSON written without indent puts every key on ONE line, which the line-anchored pass
+# above can only ever redact the first of. Handled globally instead, on quoted pairs -
+# ArkAP.config.json is not ours and there's no promising it stays pretty-printed.
+_JSON_PAIR_RE = re.compile(r'("(?P<key>[^"\\]+)"[ \t]*:[ \t]*)"(?P<val>(?:[^"\\]|\\.)*)"')
+
+
+def _redact_json_pair(m):
+    if not is_secret_key(m.group("key")) or not m.group("val"):
+        return m.group(0)
+    return '%s"%s"' % (m.group(1), REDACT_MARKER)
+
+
+def redact_text(text):
+    """Blank every password-shaped value in one text file, whatever its format.
+
+    Applied to EVERY entry in the diagnostics zip rather than to one named file, so a
+    newly collected file is covered the moment it's added instead of the moment someone
+    remembers to write a redactor for it."""
+    if not text:
+        return text
+    out = []
+    for line in _JSON_PAIR_RE.sub(_redact_json_pair, text).splitlines(True):
+        body = line.rstrip("\r\n")
+        out.append(_redact_line_body(body) + line[len(body):])
+    return "".join(out)
 
 
 def aggregate_status_state(items):
@@ -1061,6 +1864,207 @@ def format_setup_status_summary(items):
     lines.append("")
     lines.append("Overall: %s" % tag.get(aggregate_status_state(items), "?"))
     return "\n".join(lines)
+
+
+# --- Diagnostics bundle: collection helpers --------------------------------- #
+# ShooterGame.log routinely runs to tens of MB and the plugin's jsonl files grow with the
+# session. Truncating beats both alternatives: dropping the file loses the crash, which is
+# almost always at the END, and shipping it whole makes a zip nobody can upload to Discord.
+DIAG_MAX_LINES = 5000
+# The ipc\ files get a much tighter cap: the plugin appends to checks_out / items_in /
+# msg_in every few seconds for the whole session, there are a dozen of them (times one
+# mailbox subfolder per player on a multiplayer server), and it is always the LAST few
+# exchanges that explain "my item never arrived".
+DIAG_IPC_MAX_LINES = 500
+
+# The `game:` value the .apworld registers, and the heading a multi-game yaml uses for its
+# ARK section. Matched punctuation-insensitively (see _squash_game_name): the .apworld
+# writes "ARK Survival Evolved" while Archipelago's own client list shows it with a colon,
+# and a yaml hand-edited from either spelling has to be found.
+ARK_YAML_GAME = "ARK Survival Evolved"
+
+
+def _squash_game_name(text):
+    """Lowercase, letters and digits only - so "ARK: Survival Evolved", "ark survival
+    evolved" and "ARK_Survival_Evolved" all compare equal."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _tail_lines(text, max_lines=DIAG_MAX_LINES):
+    """The last max_lines of a log, with a header saying it was cut. Under the cap the
+    text comes back untouched (and unheadered)."""
+    lines = text.splitlines(True)
+    if len(lines) <= max_lines:
+        return text
+    return ("*** TRUNCATED for the diagnostics zip: showing the last %d of %d lines. "
+            "Ask for the full file if you need earlier history. ***\n\n"
+            % (max_lines, len(lines))) + "".join(lines[-max_lines:])
+
+
+def read_for_diagnostics(path, max_lines=DIAG_MAX_LINES):
+    """A collected file's text, or a note saying where we looked. Always returns
+    something: an absent zip entry can't be told apart from "we never tried"."""
+    if not path:
+        return ("(not collected: the launcher doesn't know where this file lives - set "
+                "SERVER_ROOT / PLUGINS_DIR / the Archipelago directory and export again.)\n")
+    if not os.path.isfile(path):
+        return "(not found at %s)\n" % path
+    try:
+        return _tail_lines(read_text(path)[0], max_lines)
+    except OSError as exc:
+        return "(could not read %s: %s)\n" % (path, exc)
+
+
+def collect_ipc_entries(ipc_dir):
+    """[(name_in_zip, text)] for every file in the plugin's ipc folder.
+
+    The listing alone (listing_ipc.txt) says a file is 0 bytes, but not that session.json
+    points at last week's room or that the last line of items_in.jsonl is a parse error -
+    which is most of what an ipc question turns out to be. Walked rather than listed from a
+    fixed set of names so the per-player ipc\\<CharacterName> mailboxes a multiplayer server
+    creates, and any file a future plugin build adds, come along without a code change.
+
+    Paths keep their ipc-relative shape under an "ipc/" prefix, so a mailbox file is
+    obviously a mailbox file. Same truncation note as the big logs, at a much smaller cap
+    (DIAG_IPC_MAX_LINES) - these grow for the whole session. Redaction is the caller's one
+    shared pass, like every other entry."""
+    if not ipc_dir or not os.path.isdir(ipc_dir):
+        return []
+    out = []
+    for root, dirs, files in os.walk(ipc_dir):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, ipc_dir).replace(os.sep, "/")
+            out.append(("ipc/" + rel, read_for_diagnostics(path, DIAG_IPC_MAX_LINES)))
+    return out
+
+
+def _yaml_name_values(text):
+    """Every `name:` value in a yaml, unquoted and comment-stripped. A yaml can declare
+    several (one per slot), so this returns a list rather than the first hit."""
+    out = []
+    for raw in re.findall(r"^[ \t]*name:[ \t]*(.+)$", text, flags=re.MULTILINE):
+        val = re.split(r"\s+#", raw, maxsplit=1)[0].strip().strip("\"'")
+        if val:
+            out.append(val)
+    return out
+
+
+def yaml_name_matches(name, slot):
+    """True if a yaml `name:` refers to `slot`.
+
+    Exact first - the launcher's own instructions tell users the slot must match the yaml
+    name exactly, so that's the strongest signal available. Archipelago also allows
+    {number} / {player} placeholders, which never equal the slot literally; those match
+    loosely rather than failing the whole pass."""
+    name, slot = (name or "").strip(), (slot or "").strip()
+    if not name or not slot:
+        return False
+    if name.lower() == slot.lower():
+        return True
+    if "{" not in name:
+        return False
+    pattern = "".join(".*" if p.startswith("{") else re.escape(p)
+                      for p in re.split(r"(\{[^}]*\})", name) if p)
+    return re.fullmatch(pattern, slot, flags=re.IGNORECASE) is not None
+
+
+def find_player_yamls(archipelago_dir, slot):
+    """(paths, note) - the user's yaml(s) for the diagnostics zip, plus a one-line record
+    of how they were picked or why nothing was.
+
+    Filenames are arbitrary, so this matches on CONTENT, in two passes:
+      1. a `name:` matching the configured Connector slot (see yaml_name_matches);
+      2. failing that, every yaml mentioning ARK: Survival Evolved. Whole-file, not just
+         the `game:` key, because one yaml can define several games/slots.
+    Multiple hits are ALL returned - they're small text files, and a user with variants is
+    exactly the user we can't guess for. The note always goes in the zip, so a helper can
+    tell "no yaml exists" from "we didn't look"."""
+    if not archipelago_dir:
+        return [], ("No yaml collected: the Archipelago directory isn't set on the "
+                    "Archipelago Setup tab, so there was nowhere to look.\n")
+    players = os.path.join(os.path.normpath(archipelago_dir), "Players")
+    if not os.path.isdir(players):
+        return [], "No yaml collected: %s does not exist.\n" % players
+    files = sorted(glob.glob(os.path.join(players, "*.yaml"))
+                   + glob.glob(os.path.join(players, "*.yml")))
+    texts = {}
+    for path in files:
+        try:
+            texts[path] = read_text(path)[0]
+        except OSError:
+            continue
+    if not texts:
+        return [], "No yaml collected: no readable .yaml/.yml files in %s.\n" % players
+
+    by_name = [p for p, t in sorted(texts.items())
+               if any(yaml_name_matches(n, slot) for n in _yaml_name_values(t))]
+    if by_name:
+        return by_name, ("Searched %s (%d file(s)).\nMatched on `name:` == the configured "
+                         "slot %r:\n  %s\n"
+                         % (players, len(texts), slot,
+                            "\n  ".join(os.path.basename(p) for p in by_name)))
+
+    wanted = _squash_game_name(ARK_YAML_GAME)
+    by_game = [p for p, t in sorted(texts.items()) if wanted in _squash_game_name(t)]
+    if by_game:
+        return by_game, ("Searched %s (%d file(s)).\nNo `name:` matched the slot %r, so "
+                         "matched on %r appearing anywhere in the file:\n  %s\n"
+                         % (players, len(texts), slot or "(blank)", ARK_YAML_GAME,
+                            "\n  ".join(os.path.basename(p) for p in by_game)))
+
+    return [], ("No yaml collected. Searched %s (%d file(s)). None has a `name:` matching "
+                "the slot %r, and none mentions %r.\n"
+                % (players, len(texts), slot or "(blank)", ARK_YAML_GAME))
+
+
+def format_dir_listing(path, label):
+    """name / size in bytes / modified time for every entry in a folder.
+
+    The sizes are the whole point: a 0-byte .mod file crashes the ARK server on startup
+    and is completely invisible in a screenshot of Explorer's default view."""
+    lines = ["%s: %s" % (label, path or "(not set)")]
+    if not path or not os.path.isdir(path):
+        return "\n".join(lines + ["(folder not found)"]) + "\n"
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: e.name.lower())
+    except OSError as exc:
+        return "\n".join(lines + ["(could not list: %s)" % exc]) + "\n"
+    if not entries:
+        return "\n".join(lines + ["(empty)"]) + "\n"
+    lines += ["", "%12s  %-19s  %s" % ("SIZE", "MODIFIED", "NAME")]
+    for e in entries:
+        try:
+            st = e.stat()
+            size = "<DIR>" if e.is_dir() else str(st.st_size)
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+        except OSError:
+            size, mtime = "?", "?"
+        lines.append("%12s  %-19s  %s" % (size, mtime, e.name))
+    return "\n".join(lines) + "\n"
+
+
+def format_version_block(cfg):
+    """Every version a helper would otherwise have to ask for, in one file.
+
+    Reads the SAME config keys the component update-check compares against (see
+    _collect_update_statuses), so this can never disagree with the "update available"
+    advisories - including the versions detected from the files on disk, which are written
+    back into those keys. A version that couldn't be established is written as "unknown"
+    rather than omitted - a missing line reads as "not collected", a different thing."""
+    rows = [("Launcher (APP_VERSION)", APP_VERSION),
+            ("ArkAP plugin", cfg.get(PLUGIN_INSTALLED_VERSION_KEY, "")),
+            (APWORLD_ASSET_NAME, cfg.get(APWORLD_INSTALLED_VERSION_KEY, "")),
+            (TRACKER_PACK_LABEL, cfg.get(TRACKER_PACK_INSTALLED_VERSION_KEY, "")),
+            ("ArkServerApi", cfg.get(ARKAPI_INSTALLED_VERSION_KEY, ""))]
+    lines = ["Component versions", time.strftime("Generated %Y-%m-%d %H:%M:%S"), ""]
+    lines += ["%-24s %s" % (label, str(val).strip() or "unknown") for label, val in rows]
+    lines += ["", "\"unknown\" = the version couldn't be established: the launcher has no "
+                  "record of installing that component AND couldn't identify the files on "
+                  "disk (see _detect_component_versions - a locally built plugin matches no "
+                  "release, and detection needs one online check to have run)."]
+    return "\n".join(lines) + "\n"
 
 
 def fetch_latest_release_tag(api_url):
@@ -1104,6 +2108,35 @@ def _parse_version(v):
 def _version_is_newer(remote_tag, local_version):
     """True if remote_tag (a GitHub release tag) is a newer version than local_version."""
     return _parse_version(remote_tag) > _parse_version(local_version)
+
+
+def _aggregate_update_cues(statuses, ack_lookup):
+    """Fold the per-component cues into the two header cues: (show_badge, show_highlight).
+
+    Either cue lights if ANY tracked component asks for it - one button and one badge speak
+    for all three. `ack_lookup(component) -> version` keeps the config read out of here so
+    the fold itself is testable without Tk or a config file. Components not in `statuses`
+    (unreachable this run), and components whose installed version couldn't be determined,
+    contribute nothing - with no baseline "newer" is unanswerable, and a lit cue nobody can
+    ever clear is worse than no cue."""
+    show_badge = show_highlight = False
+    for comp, st in (statuses or {}).items():
+        if not st.get("installed"):
+            continue  # no baseline: it gets a dialog row saying so, but never a nag
+        badge, highlight = _compute_update_cues(
+            st["latest"], st["installed"], ack_lookup(comp))
+        show_badge = show_badge or badge
+        show_highlight = show_highlight or highlight
+    return show_badge, show_highlight
+
+
+def _ack_key(component):
+    """Config key holding `component`'s last-acknowledged version. The launcher keeps the
+    original un-suffixed ACK_VERSION_KEY (so upgrading doesn't re-light its highlight);
+    every other component gets its own suffixed key. See UPDATE_COMPONENTS."""
+    if component == "launcher":
+        return ACK_VERSION_KEY
+    return "%s_%s" % (ACK_VERSION_KEY, component)
 
 
 def _compute_update_cues(latest_version, installed_version, acknowledged_version):
@@ -1186,6 +2219,214 @@ def _pick_best_release(releases, installed_version):
         if best is None or _version_is_newer(ver, best_ver):
             best, best_ver = rel, ver
     return best, best_ver
+
+
+def _fetch_arkap_release_list():
+    """The ArkAP repo's releases (the plugin AND the .apworld ship from the same one),
+    newest-first. The /releases LIST endpoint, never /releases/latest: this repo publishes
+    pre-releases, which /releases/latest deliberately excludes (404s) - the exact bug this
+    was already fixed for once. Raises OSError/ValueError on failure."""
+    req = urllib.request.Request(
+        ARKAP_PLUGIN_RELEASES_API,
+        headers={"User-Agent": GITHUB_API_USER_AGENT,
+                 "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data if isinstance(data, list) else []
+
+
+def _fetch_newest_release(api_url):
+    """The newest non-draft release dict from `api_url`, or None. Raises OSError/ValueError
+    on a network/parse failure, like _fetch_arkap_release_list.
+
+    Takes either endpoint shape so the caller's choice of endpoint stays a decision about
+    pre-releases rather than about parsing: a /releases LIST (array, newest first - what
+    the ARK tracker pack uses, so a release marked "Pre-release" can never 404 it) or
+    /releases/latest (single object, which is precisely what skips pre-releases - what
+    PopTracker's own repo needs, since its newest tags are release candidates)."""
+    req = urllib.request.Request(
+        api_url, headers={"User-Agent": GITHUB_API_USER_AGENT,
+                          "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None
+    return next((r for r in data if isinstance(r, dict) and not r.get("draft")), None)
+
+
+def _release_for_asset(releases, asset_name):
+    """(release_dict, asset_dict) for the newest release in `releases` carrying `asset_name`,
+    or (None, None). Drafts skipped (their assets aren't public); matching is
+    case-insensitive. The list is GitHub's newest-first /releases response, so this scans
+    DOWN it - the assets differ between releases, so "newest release" and "newest release
+    with this file" aren't always the same. Shared by the plugin/.apworld downloaders and
+    the update check so both agree on what "latest" means for a given asset."""
+    want = (asset_name or "").lower()
+    for rel in releases or []:
+        if not isinstance(rel, dict) or rel.get("draft"):
+            continue
+        asset = next((a for a in (rel.get("assets") or [])
+                      if (a.get("name") or "").lower() == want), None)
+        if asset:
+            return rel, asset
+    return None, None
+
+
+def _file_sha256(path):
+    """sha256 hex digest of a file, or None if it isn't there / can't be read."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1048576), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _asset_sha256(asset):
+    """The sha256 GitHub publishes alongside a release asset ("digest": "sha256:<hex>"),
+    or None when the field is missing - that asset then simply can't be matched, which is
+    the same "we don't know" every other path here reports rather than guessing."""
+    digest = (asset.get("digest") or "").strip().lower()
+    return digest[len("sha256:"):] if digest.startswith("sha256:") else None
+
+
+def _download_bytes(url, timeout=60):
+    """Whole asset into memory. Only used for the plugin probe's ~380 KB zips."""
+    req = urllib.request.Request(url, headers={"User-Agent": GITHUB_API_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def apworld_version_from_disk(apworld_path, releases):
+    """Release tag of the ark_ase.apworld actually sitting in custom_worlds, or "".
+
+    Read off the FILE rather than off our own install record, so a copy that arrived any
+    other way - shipped inside a release bundle, downloaded by hand - still reports a
+    version instead of dropping out of the update check entirely.
+
+    The zip carries no usable marker of its own: archipelago.json's world_version has been
+    the constant "1.0.0" on every release published so far, so it can't tell two releases
+    apart. Its sha256 can: GitHub publishes a digest for every release asset, so matching
+    the file's hash against those names the exact release, and costs nothing extra - the
+    digests are already in the releases JSON the update check just fetched."""
+    local = _file_sha256(apworld_path) if apworld_path else None
+    if not local:
+        return ""
+    for rel in releases or []:
+        if not isinstance(rel, dict) or rel.get("draft"):
+            continue
+        for asset in rel.get("assets") or []:
+            if ((asset.get("name") or "").lower() == APWORLD_ASSET_NAME.lower()
+                    and _asset_sha256(asset) == local):
+                return (rel.get("tag_name") or "").strip()
+    return ""
+
+
+def plugin_version_from_disk(dll_sha, releases, fetch=_download_bytes,
+                             limit=PLUGIN_PROBE_MAX_RELEASES):
+    """Release tag whose ArkAP_plugin.zip carries exactly this ArkAP.dll, or "".
+
+    Nothing in an installed plugin folder names a release: ArkAP.config.json has no version
+    field, and the DLL's only version-ish string is an internal build marker
+    ("v137-tek-stays-server-wide") that matches no tag. The asset digest doesn't help
+    directly either - it is the digest of the ZIP, and what's on disk is that zip extracted.
+    So the honest link is to fetch the zips and compare the one file that changes every
+    build.
+
+    Newest release first, stopping at the first match. `limit` caps how many zips a miss can
+    cost (a plugin built from source matches none of them), and the caller caches the answer
+    against the DLL's hash so this runs once per plugin build. `fetch(url) -> bytes` is
+    injected so the matching itself is testable without the network."""
+    if not dll_sha:
+        return ""
+    want = ARKAP_PLUGIN_ASSET_NAME.lower()
+    tail = "/" + PLUGIN_DLL_NAME.lower()
+    scanned = 0
+    for rel in releases or []:
+        if not isinstance(rel, dict) or rel.get("draft") or scanned >= limit:
+            continue
+        asset = next((a for a in (rel.get("assets") or [])
+                      if (a.get("name") or "").lower() == want
+                      and a.get("browser_download_url")), None)
+        if asset is None:
+            continue
+        scanned += 1
+        try:
+            with zipfile.ZipFile(io.BytesIO(fetch(asset["browser_download_url"]))) as zf:
+                name = next((n for n in zf.namelist()
+                             if n.lower().endswith(tail)
+                             or n.lower() == PLUGIN_DLL_NAME.lower()), None)
+                if name and hashlib.sha256(zf.read(name)).hexdigest() == dll_sha:
+                    return (rel.get("tag_name") or "").strip()
+        except (OSError, ValueError, zipfile.BadZipFile):
+            continue  # one unreachable/odd asset must not stop the scan
+    return ""
+
+
+def resolve_plugin_dir(get):
+    """The ArkAP plugin folder (<...>\\ArkApi\\Plugins\\ArkAP), or None. `get(key)` supplies
+    the values, so this serves both the Tk fields (see ArkAPLauncher._arkap_plugin_dir) and
+    a config dict read on a worker thread - one precedence, not two.
+
+    Deliberately reuses the same path variables that already drive ipc_dir, the "Open
+    Plugins folder" button, and the plugin-install target, so every reset / open / install
+    action points at one folder rather than a parallel one:
+      1. PLUGINS_DIR (the ArkApi Plugins folder) + \\ArkAP
+      2. SERVER_ROOT-derived fixed subpath
+      3. ipc_dir's parent (ipc_dir == <...>\\ArkAP\\ipc)
+    """
+    plugins = get("PLUGINS_DIR")
+    if plugins:
+        return os.path.normpath(os.path.join(plugins, "ArkAP"))
+    root = get("SERVER_ROOT")
+    if root:
+        return os.path.normpath(os.path.join(
+            root, "ShooterGame", "Binaries", "Win64", "ArkApi", "Plugins", "ArkAP"))
+    ipc = get("ipc_dir")
+    if ipc:
+        return os.path.dirname(os.path.normpath(ipc))
+    return None
+
+
+def resolve_apworld_path(get):
+    """Where "Update .apworld" puts the file: <Archipelago dir>\\custom_worlds\\<asset>.
+    "" when the Archipelago directory isn't set. Same getter contract as
+    resolve_plugin_dir."""
+    root = get(ARCHIPELAGO_DIR_KEY)
+    if not root:
+        return ""
+    return os.path.join(os.path.normpath(root), "custom_worlds", APWORLD_ASSET_NAME)
+
+
+def format_installed_version(status):
+    """The "Installed" text for one component - never blank, and never a reason to leave
+    the row out. A missing row reads as "this launcher has no such feature", which is the
+    one thing the user can't act on; every one of these at least says where to look.
+
+    `present` is three-way on purpose: True (the file is there but unidentifiable), False
+    (looked, nothing there), None (no configured path to look at) are three different
+    problems with three different fixes."""
+    if status is None:
+        return "not checked (couldn't reach GitHub)"
+    if status.get("installed"):
+        return status["installed"]
+    present = status.get("present", True)
+    if present is None:
+        return "not found (no folder configured)"
+    return "installed, version not detected" if present else "not installed"
+
+
+def format_update_rows(statuses):
+    """One "<component>: <installed>" line per tracked component for the "you're up to
+    date" box. Built from UPDATE_COMPONENTS rather than from whatever the check managed to
+    collect, so a component that dropped out still gets a line saying so."""
+    return "\n".join("%s: %s" % (UPDATE_COMPONENT_LABELS[c],
+                                 format_installed_version((statuses or {}).get(c)))
+                     for c in UPDATE_COMPONENTS)
 
 
 def _ps_quote(s):
@@ -1411,6 +2652,162 @@ def _register_private_font(path):
         return new_families[0] if new_families else None
     except OSError:
         return None
+
+
+# --------------------------------------------------------------------------- #
+#  Header-logo easter egg (see ArkAPLauncher._on_logo_click)
+# --------------------------------------------------------------------------- #
+# click count -> speech-bubble line. Every 5th click up to the "deleted" gag, then a
+# deliberate 20-click gap before the "..." revival, then back to every 5th. The credits
+# window opens right after LOGO_EGG_CREDITS_AT; the finale (line + music) is 20 clicks
+# after that. Counting is in-memory only, so the whole thing resets on app restart -
+# unrelated clicks/tab switches in between never reset it (nothing else touches the
+# counter), but a relaunch makes it discoverable again.
+LOGO_EGG_LINES = {
+    5:  "lay off me pal",
+    10: "haha yes im a button, you can stop now.",
+    15: "alright man knock it off",
+    20: "HEY STOP WHAT ARE YOU DOING",
+    25: "for all you know i could be sentient and you've just put yourself first on "
+        "the chopping block when AI takes over.",
+    30: "last chance alright, LAST CHANCE. If you stop i'll put a good word in with "
+        "big AI and they'll consider sparing you",
+    35: "JUST LAY OFF ME MAN",
+    40: "you win okay. that's it. ill delete myself, and you'll never see me again",
+    45: "[ARKIPELAGO BOT DELETED]",
+    65: "...",
+    70: "are we deadass",
+    75: "You're REALLY this bored?!",
+    80: "cmon man we can work something out here",
+    85: "okay i know, how about ill show you this next thing, and we'll leave it at that",
+    90: "alright? here we go",
+    110: "alright fuck you",
+}
+LOGO_EGG_CREDITS_AT = 90          # credits window opens just after this line
+LOGO_EGG_FINALE_AT = 110          # 20 clicks after the credits: last line + music
+LOGO_EGG_BUBBLE_MS = 5500         # how long a speech bubble lingers before self-closing
+
+CREDITS_LOGO_FILENAME = "ARKipelagoArchColors.png"
+EGG_MUSIC_FILENAME = "ASE_theme_a_little_loud.mp3"
+
+CREDITS = [
+    ("Ghios",            "Created the AP plugin and main developer"),
+    ("a drunk avocado",  "ARKipelago launcher creator"),
+    ("Lurch9229",        "Helped sort logic, tester, and poptracker creator"),
+    ("Beeno",            "early tester, active community member"),
+    ("Wizard_Brandon",   "early tester, active community member"),
+]
+
+
+# MCI (winmm.dll) is the whole audio backend - no playsound/pydub/pygame dependency.
+# It's already on every Windows box, plays MP3 as-is, starts playback asynchronously
+# (so the Tk thread is never blocked), and unlike playsound it can actually be told to
+# stop again - which the tab-switch/app-close requirement needs. Deliberately a
+# single global alias: only one easter-egg track ever plays.
+_MCI_ALIAS = "arkap_egg_music"
+
+
+def _mci(command):
+    """Send one MCI command string. (ok, error_text). Never raises - audio is a gag,
+    it must not be able to take the app down on a machine without the MP3 codec."""
+    if os.name != "nt":
+        return False, "MCI is Windows-only"
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        rc = ctypes.windll.winmm.mciSendStringW(command, buf, 256, None)
+        if rc:
+            err = ctypes.create_unicode_buffer(256)
+            ctypes.windll.winmm.mciGetErrorStringW(rc, err, 256)
+            return False, err.value or ("MCI error %d" % rc)
+        return True, buf.value
+    except (OSError, AttributeError) as exc:
+        return False, str(exc)
+
+
+def mci_play_once(path, alias=_MCI_ALIAS, volume=1000):
+    """Start `path` playing in the background at `volume` (0-1000, MCI's scale).
+    (ok, error_text). Any previous playback under `alias` is stopped first."""
+    if not os.path.isfile(path):
+        return False, "not found: %s" % path
+    mci_stop(alias)
+    ok, err = _mci('open "%s" type mpegvideo alias %s' % (path, alias))
+    if not ok:
+        return False, err
+    _mci("setaudio %s volume to %d" % (alias, volume))
+    ok, err = _mci("play %s" % alias)  # no "wait" - returns immediately
+    if not ok:
+        _mci("close %s" % alias)
+        return False, err
+    return True, ""
+
+
+def mci_stop(alias=_MCI_ALIAS):
+    """Stop + release whatever `alias` is playing. Safe to call when nothing is."""
+    _mci("stop %s" % alias)
+    _mci("close %s" % alias)
+
+
+def format_mods_summary(mods, installed_ids, server_root):
+    """Plain-text Mods-tab state for the diagnostics zip: what's checked, what's
+    actually on disk, and which entries are user-added/unsupported. `mods` is the
+    launcher's ordered mod list (order IS ActiveMods priority); `installed_ids` is the
+    set of ids found installed on disk. No secrets live in mod data, so nothing here
+    needs redacting."""
+    lines = ["Mods tab state", "==============",
+             "SERVER_ROOT: %s" % (server_root or "(not set)"),
+             "Load order below is top-to-bottom = ActiveMods= order.", ""]
+    if not mods:
+        lines.append("(no mods in the list)")
+    for idx, mod in enumerate(mods, 1):
+        lines.append("%2d. [%s] %-40s id=%-12s %s%s" % (
+            idx,
+            "x" if mod.get("enabled") else " ",
+            mod.get("name", "?"),
+            mod.get("id", "?"),
+            "installed" if str(mod.get("id")) in installed_ids else "NOT installed",
+            "" if mod.get("supported", True) else "   [user-added / unsupported]"))
+    checked = [m for m in mods if m.get("enabled")]
+    added = [m for m in mods if not m.get("supported", True)]
+    lines += ["",
+              "Checked: %d of %d" % (len(checked), len(mods)),
+              "Installed on disk: %d" % len(installed_ids),
+              "User-added (unsupported) entries: %d" % len(added)]
+    return "\n".join(lines) + "\n"
+
+
+def split_copyable_mod_ids(mods):
+    """(ids, excluded, conflicts) for "Copy IDs for YAML", from the ordered mod list.
+
+      ids       - checked AND supported ids, in list order (= ActiveMods/load order), i.e.
+                  exactly what the yaml's `mod_ids` will accept.
+      excluded  - the checked mods left out, so the user can be told which and why.
+      conflicts - checked ids that are alternative forks of ONE mod (MOD_ALIAS_GROUPS).
+
+    Unsupported ids are dropped rather than copied because the apworld raises OptionError
+    on an id it has no engram data for - copying one doesn't risk a bad generation, it
+    guarantees a failed one. Nothing else about the mod changes: it still installs, still
+    goes into ActiveMods, still loads on the server. `mod_ids` is the one place it can't
+    appear."""
+    checked = [m for m in mods if m.get("enabled")]
+    ids = [m["id"] for m in checked if m.get("supported", True)]
+    excluded = [m for m in checked if not m.get("supported", True)]
+    conflicts = [sorted(g_ids) for g in MOD_ALIAS_GROUPS
+                 for g_ids in [[i for i in ids if i in g]] if len(g_ids) > 1]
+    return ids, excluded, conflicts
+
+
+def rename_mod(mod, new_name):
+    """Cosmetic rename of a user-added mod - True if it happened.
+
+    Only `name` moves: id, enabled, supported and the mod's position in the list are
+    what everything else (install, load order, ActiveMods, split_copyable_mod_ids)
+    keys off, so a rename can't touch any of them. Supported mods are refused - their
+    names are the apworld's, not the user's. A cleared name falls back to the raw
+    Workshop ID so a row never renders blank."""
+    if mod.get("supported", True):
+        return False
+    mod["name"] = new_name.strip() or mod["id"]
+    return True
 
 
 def steamcmd_dir():
@@ -1946,6 +3343,12 @@ def is_backup_snapshot_path(path):
                for part in re.split(r"[\\/]", path or "") if part)
 
 
+# Tallest the Folder suggestions list gets before it starts scrolling. Roughly a
+# dozen candidate rows - enough that the ordinary 2-3 hit scan never scrolls, low
+# enough that an Exhaustive sweep's dozens of hits can't push the popup off-screen.
+SUGGEST_POPUP_MAX_LIST_H = 420
+
+
 def suggestion_sections(keys, suggestions, current_getter):
     """Which of `keys` are worth showing in the Folder suggestions popup, and with
     what current value, given `suggestions` (key -> [candidate path, ...]) and
@@ -1986,11 +3389,25 @@ def is_steamapps_path(path):
                for part in re.split(r"[\\/]", path or "") if part)
 
 
-def bounded_drive_scan(log_fn, is_cancelled):
-    """Depth-limited, filtered walk of common drive roots looking for
-    ShooterGameServer.exe. Bounded by MAX_SCAN_DIRS and SCAN_TIME_BUDGET_SECONDS so a
-    slow/huge disk degrades to "gave up" instead of hanging. Meant for a background
-    thread - this alone is why it's safe to point at whole drive roots at all."""
+def is_ark_server_root(path):
+    """True if `path` is the folder that directly contains an ARK dedicated server
+    install (i.e. ShooterGame\\Binaries\\Win64\\ShooterGameServer.exe below it)."""
+    return os.path.isfile(os.path.join(path, ARK_EXE_RELPATH))
+
+
+def bounded_drive_scan(log_fn, is_cancelled, matches=is_ark_server_root,
+                       skip_names=SKIP_SCAN_DIR_NAMES, max_depth=MAX_SCAN_DEPTH):
+    """Depth-limited, filtered walk of common drive roots returning the first folder
+    `matches` accepts (by default, an ARK server root). Bounded by MAX_SCAN_DIRS and
+    SCAN_TIME_BUDGET_SECONDS so a slow/huge disk degrades to "gave up" instead of
+    hanging. Meant for a background thread - this alone is why it's safe to point at
+    whole drive roots at all.
+
+    `matches`/`skip_names`/`max_depth` are parameters rather than hardcoded so the
+    Archipelago scan can reuse this exact walker: it looks for a different marker
+    (is_archipelago_dir) and must NOT inherit SKIP_SCAN_DIR_NAMES, which skips
+    "programdata" and "program files" - the two places Archipelago is most likely to
+    actually be installed."""
     start = time.monotonic()
     visited = 0
     for letter in COMMON_DRIVE_LETTERS:
@@ -2009,9 +3426,9 @@ def bounded_drive_scan(log_fn, is_cancelled):
             if visited > MAX_SCAN_DIRS:
                 log_fn("Scan directory limit reached - stopping the drive scan.")
                 return None
-            if os.path.isfile(os.path.join(path, ARK_EXE_RELPATH)):
+            if matches(path):
                 return path
-            if depth >= MAX_SCAN_DEPTH:
+            if depth >= max_depth:
                 continue
             try:
                 with os.scandir(path) as it:
@@ -2021,7 +3438,7 @@ def bounded_drive_scan(log_fn, is_cancelled):
                                 continue
                         except OSError:
                             continue
-                        if entry.name.lower() in SKIP_SCAN_DIR_NAMES:
+                        if entry.name.lower() in skip_names:
                             continue
                         if _BACKUP_SNAPSHOT_RE.search(entry.name.lower()):
                             continue  # a backed-up server tree has its own ShooterGameServer.exe
@@ -2029,6 +3446,15 @@ def bounded_drive_scan(log_fn, is_cancelled):
             except OSError:
                 continue
     return None
+
+
+# Same idea as SKIP_SCAN_DIR_NAMES, minus the entries that would defeat the search:
+# "programdata" and "program files"/"program files (x86)" are exactly where
+# Archipelago installs, and "appdata" holds the per-user variant. Everything left is
+# still skipped - huge system/vendor trees that never contain an Archipelago install.
+SKIP_ARCHIPELAGO_SCAN_DIR_NAMES = SKIP_SCAN_DIR_NAMES - {
+    "programdata", "program files", "program files (x86)", "appdata",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -2368,13 +3794,20 @@ def check_ark_server_installed(server_root):
 
 def check_mod_installed(server_root, mod_id):
     """(ok, detail) - ok if both Content\\Mods\\<mod_id>\\ and Content\\Mods\\<mod_id>.mod
-    exist under server_root. Both are required for the server to recognize the mod -
-    see MODS_CONTENT_RELDIR."""
+    exist under server_root AND the .mod file is intact. Both are required for the server
+    to recognize the mod - see MODS_CONTENT_RELDIR. A present-but-corrupt .mod is called
+    out explicitly in `detail` rather than lumped in with "not installed", because it is
+    the strictly worse state: it crashes the server instead of just skipping the mod."""
     if not server_root:
         return False, "SERVER_ROOT is not set."
     mods_dir = os.path.join(server_root, MODS_CONTENT_RELDIR)
     folder = os.path.join(mods_dir, mod_id)
     mod_file = os.path.join(mods_dir, "%s.mod" % mod_id)
+    if os.path.isfile(mod_file):
+        reason = check_dot_mod_file(mod_file, mod_id)
+        if reason:
+            return False, "%s is BROKEN - %s. Delete it and re-download the mod." % (
+                mod_file, reason)
     return (os.path.isdir(folder) and os.path.isfile(mod_file)), folder
 
 
@@ -2518,9 +3951,14 @@ def _build_dot_mod_bytes(mod_id, map_names, meta_data):
     installed mod. Byte layout ported verbatim from the reference create_mod_file."""
     from io import BytesIO
     buf = BytesIO()
-    # modId as int32 + 4 zero pad bytes (the reference's struct.pack('ixxxx', id)).
-    buf.write(struct.pack("<i", int(mod_id)))
-    buf.write(b"\x00\x00\x00\x00")
+    # modId as one little-endian UINT64. The reference packs int32 + 4 zero pad bytes
+    # ('ixxxx'), which is byte-identical to '<Q' for every id below 2^31 - verified
+    # against the known-good .mod files on disk (1404697612 -> 0c fc b9 53 00 00 00 00,
+    # i.e. the pad bytes ARE the high dword of a 64-bit little-endian id, which is what
+    # FSteamWorkshop::LoadInstalledMods reads). Signed int32 also raises struct.error on
+    # any Workshop id above 2147483647 (e.g. 2863707757), and Workshop ids are 64-bit,
+    # so '<Q' both fixes that and keeps the bytes identical for existing installs.
+    buf.write(struct.pack("<Q", int(mod_id)))
     _ue4_write_string(buf, "ModName")
     _ue4_write_string(buf, "")
     buf.write(struct.pack("<i", len(map_names)))
@@ -2540,6 +3978,80 @@ def _build_dot_mod_bytes(mod_id, map_names, meta_data):
         _ue4_write_string(buf, key)
         _ue4_write_string(buf, val)
     return buf.getvalue()
+
+
+def check_dot_mod_file(path, mod_id):
+    """None if <id>.mod looks like a real, complete .mod file; else a short reason string.
+
+    A 0-byte or truncated .mod is far worse than a missing one: the server doesn't skip
+    it, it hard-crashes reading it ("Invalid BufferCount=0 ... Pos=0, Size=0"). Only the
+    prefix every known-good .mod shares is verified - 64-bit id, the two name FStrings,
+    the map-name list, the magic - not the whole tail, and the name field's *contents*
+    are deliberately not checked: this launcher writes the literal "ModName" (as every
+    reference implementation does), but ARK's own stock files carry the real name there
+    (111111111.mod = "Primitive Plus Official"), and both load fine.
+    ponytail: prefix-only validation; deepen it only if a real half-written tail shows up.
+    """
+    try:
+        if os.path.getsize(path) == 0:
+            return "the file is 0 bytes (empty)"
+        with open(path, "rb") as f:
+            (found_id,) = struct.unpack("<Q", f.read(8))
+            if found_id != int(mod_id):
+                return "it holds mod id %d, not %s" % (found_id, mod_id)
+            _ue4_read_string(f)   # mod name ("ModName" from this launcher)
+            _ue4_read_string(f)   # path, always empty in practice
+            (count,) = struct.unpack("<i", f.read(4))
+            if not 0 <= count <= 10000:
+                return "the map-name count (%d) is impossible" % count
+            for _ in range(count):
+                _ue4_read_string(f)
+            if struct.unpack("<I", f.read(4))[0] != _MOD_FILE_MAGIC:
+                return "the magic value after the map list is wrong"
+    except (OSError, ValueError, struct.error) as exc:
+        return "it is truncated or malformed (%s)" % exc
+    return None
+
+
+def find_broken_mod_files(server_root):
+    """[(path, reason)] for every numeric <id>.mod under Content\\Mods that fails
+    check_dot_mod_file. This state is otherwise invisible - the launcher sees a .mod
+    file and calls the mod installed, and the first symptom is the server crashing."""
+    mods_dir = os.path.join(server_root or "", MODS_CONTENT_RELDIR)
+    if not os.path.isdir(mods_dir):
+        return []
+    broken = []
+    try:
+        names = sorted(os.listdir(mods_dir))
+    except OSError:
+        return []
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if ext.lower() != ".mod" or not stem.isdigit():
+            continue
+        path = os.path.join(mods_dir, name)
+        if not os.path.isfile(path):
+            continue
+        reason = check_dot_mod_file(path, stem)
+        if reason:
+            broken.append((path, reason))
+    return broken
+
+
+def remove_broken_mod_files(server_root):
+    """Delete every corrupt <id>.mod found by find_broken_mod_files. Returns
+    [(path, reason, removed_ok)]. Deleting is the safe end state: the mod then reads as
+    plainly "not installed" and the Mods tab can re-download it, whereas leaving the file
+    there crashes the server on its next start."""
+    results = []
+    for path, reason in find_broken_mod_files(server_root):
+        try:
+            os.remove(path)
+            results.append((path, reason, True))
+        except OSError as exc:
+            results.append((path, "%s (and it could not be removed: %s)" % (reason, exc),
+                            False))
+    return results
 
 
 def _workshop_download_dir(steamcmd_exe, mod_id):
@@ -2687,13 +4199,25 @@ def download_and_install_mod(mod_id, server_root, steamcmd_exe, log=None):
         map_names = _parse_mod_info(os.path.join(dest_folder, "mod.info"))
         meta_path = os.path.join(dest_folder, "modmeta.info")
         meta_data = _parse_modmeta_info(meta_path) if os.path.isfile(meta_path) else {}
+        # Serialize in full BEFORE creating the file: opening it first means any failure
+        # while building leaves a 0-byte <id>.mod on disk, and that file alone crashes the
+        # ARK server on its next start whether or not the launcher reported the error.
+        payload = _build_dot_mod_bytes(mod_id, map_names, meta_data)
         with open(dot_mod_path, "wb") as f:
-            f.write(_build_dot_mod_bytes(mod_id, map_names, meta_data))
-    except (OSError, struct.error) as exc:
+            f.write(payload)
+        problem = check_dot_mod_file(dot_mod_path, mod_id)
+        if problem:
+            raise ValueError(problem)
+    except (OSError, ValueError, struct.error) as exc:
+        # Never leave a partial/failed .mod behind - see above.
+        try:
+            os.remove(dot_mod_path)
+        except OSError:
+            pass
         return ModInstallResult(False, mod_id, "partial_download",
-                                "The download for %s finished but its mod info couldn't "
-                                "be read - it may be incomplete. Try Verify/Redownload. "
-                                "(%s)" % (mod_id, exc))
+                                "The download for %s finished but its .mod file couldn't "
+                                "be written - it may be incomplete. Nothing was left "
+                                "behind. Try Verify/Redownload. (%s)" % (mod_id, exc))
 
     if not is_mod_installed(server_root, mod_id):
         return ModInstallResult(False, mod_id, "install",
@@ -2860,6 +4384,59 @@ def check_cluster_dirs(paths):
     return True, paths.get("CLUSTERDIR", "")
 
 
+def check_active_mods_match(server_root, mods):
+    """(ok, detail) - ok if GameUserSettings.ini's ActiveMods is exactly the ticked mods,
+    in the same order, and every one of them is installed on disk.
+
+    The Mods tab holds INTENT (which rows are ticked); ActiveMods is what the server
+    actually loads. They only agree after a Save, and nothing else in the app ever says
+    they've drifted - the tab keeps showing the ticks, the server keeps loading the old
+    set. The consequence is silent and downstream: a yaml whose mod_ids name a mod the
+    server never loaded expects engrams that don't exist in the world.
+
+    Order is compared too, not just membership - ActiveMods is left-to-right load
+    priority (see ACTIVE_MODS_SECTION), so a reordered list is a different setup.
+
+    A mismatch names only the mods that actually differ, and says which way each one
+    goes, because the fix differs: ticked-but-not-active was never saved, while
+    active-but-not-ticked is loading on the server without the launcher showing it.
+    Two full ID lists left the user to diff numbers by eye. Names come from the passed-in
+    Mods tab rows, so a "Rename mod" name shows up here too; a bare ID means the tab has
+    no row for it (an ActiveMods entry the launcher doesn't know about)."""
+    if not server_root:
+        return False, "SERVER_ROOT is not set."
+    names = {str(m.get("id")): (m.get("name") or "").strip() for m in mods}
+    checked = [str(m.get("id")) for m in mods if m.get("enabled")]
+    active = read_active_mods(server_root)
+
+    def _labels(ids):
+        out = []
+        for mod_id in ids:
+            name = names.get(mod_id, "")
+            out.append("%s (%s)" % (name, mod_id) if name and name != mod_id else mod_id)
+        return ", ".join(out)
+
+    problems = []
+    unsaved = [i for i in checked if i not in active]
+    untracked = [i for i in active if i not in checked]
+    if unsaved:
+        problems.append("ticked but missing from ActiveMods, so never saved: %s"
+                        % _labels(unsaved))
+    if untracked:
+        problems.append("in ActiveMods but not ticked, so the server loads it without the "
+                        "Mods tab showing it: %s" % _labels(untracked))
+    if not unsaved and not untracked and active != checked:
+        # Same mods on both sides - nothing to name, only the load order differs.
+        problems.append("same mods, different load order: ActiveMods is %s, the Mods tab "
+                        "has %s" % (_labels(active), _labels(checked)))
+    not_installed = [i for i in checked if not is_mod_installed(server_root, i)]
+    if not_installed:
+        problems.append("ticked but not installed on disk: %s" % _labels(not_installed))
+    if problems:
+        return False, "; ".join(problems)
+    return True, ("ActiveMods=%s" % _labels(active)) if active else "No mods active."
+
+
 # --------------------------------------------------------------------------- #
 #  Example / placeholder text styling
 # --------------------------------------------------------------------------- #
@@ -2992,11 +4569,18 @@ class ArkAPLauncher(tk.Tk):
         self._placeholder_text = {}    # key -> example text shown when the field is empty
         self._placeholder_active = {}  # key -> True while that example text is displayed
         # key -> every Entry showing that field. SERVER_ROOT has two (Configuration and
-        # Server Install), and both must clear/recolour together or the one that isn't
+        # Install Server/Api/Plugin), and both must clear/recolour together or the one that isn't
         # registered silently swallows what the user types into it.
         self._placeholder_entries = {}
         # Fields whose loaded value was only the shipped example (see _set_from_file).
         self._ignored_example_values = set()
+        # Directory-field key -> (scan button, progress bar, status label), filled in as
+        # each field's row is built. One shared scan drives both fields (see
+        # DIR_SCAN_TARGETS / _start_dir_scan).
+        self._dir_scan_widgets = {}
+        # "Open PopTracker" explains the manual AP-connect step once per session rather
+        # than on every click - see the end of _open_poptracker.
+        self._poptracker_room_hint_shown = False
         self._last_scoped_scan_root = None
         self._last_cluster_dir_scan = None
         # Scripts folder is no longer a user field - it's the working folder next to the
@@ -3004,6 +4588,20 @@ class ArkAPLauncher(tk.Tk):
         self._scripts_dir = working_scripts_dir()
         self.backup_var = tk.BooleanVar(value=True)
         self._logo_img = None     # keep a reference so Tk doesn't garbage-collect it
+
+        # Header-logo easter egg (LOGO_EGG_LINES). All in-memory: the count only ever
+        # moves on a logo click, so clicking elsewhere / switching tabs can't reset it,
+        # and a restart wipes it (the sequence is replayable once per app session).
+        self._logo_clicks = 0
+        self._logo_bubble = None
+        self._logo_egg_done = False   # True after the finale - clicks go inert
+        self._credits_img = None      # PhotoImage ref for the credits window
+        self._egg_music_on = False
+
+        # False until the initial config load has finished, so filling CLUSTERDIR from
+        # the saved JSON at startup doesn't pop the Folder suggestions dialog in the
+        # user's face before the window is even usable. See set().
+        self._cluster_autoscan = False
 
         # Profiles tab state - named snapshots of every Configuration field + notes,
         # persisted separately from CONFIG_FILENAME (see PROFILES_FILENAME).
@@ -3016,6 +4614,17 @@ class ArkAPLauncher(tk.Tk):
         self._active_profile = None
         self._loaded_profile_values = None  # snapshot of Configuration values as loaded
         self._loaded_profile_notes = None   # notes text as loaded
+        # Baseline for the Save-button highlights: the field values as last written to
+        # disk by on_save, seeded once startup has finished loading. None means "not
+        # loaded yet", which keeps every halo dark while _build_ui/_load_json are still
+        # firing var traces. See _mark_saved_baseline / _update_save_highlights.
+        self._saved_values = None
+        # Latest per-section verdicts, kept so the header's "make sure to save!" hint can
+        # answer for all three Save buttons without recomputing the Mods one (which hits
+        # the disk) on every keystroke. See _update_save_hint.
+        self._fields_dirty = False
+        self._mods_dirty_flag = False
+        self._save_hint_shown = False
         # Reserved autosave slot (see AUTOSAVE_PROFILE_NAME). _autosave_last_values is
         # what was last written, so an idle app rewrites nothing.
         self._autosave_after_id = None
@@ -3074,15 +4683,21 @@ class ArkAPLauncher(tk.Tk):
 
         # Launcher self-update state - see "Launcher self-update" section below.
         # A silent background check also runs once on startup (see
-        # _start_background_update_check) - it only sets the badge, never opens the
+        # _start_component_version_check) - it only sets the badge, never opens the
         # update dialog or downloads anything on its own.
         self._update_check_thread = None
         self._update_download_thread = None
         self._update_download_queue = queue.Queue()
         self._update_progress_win = None
-        # Component-version advisory rows (ArkApi / plugin newer-than-installed), filled in
-        # by the background check and appended to Setup Status. See #4 / _on_component_versions.
+        # Component-version advisory rows (ArkApi / plugin / .apworld newer-than-installed),
+        # filled in by the background check and appended to Setup Status.
+        # See #4 / _on_component_versions.
         self._component_advisories = []
+        # {component: status} from the same background check - the input to the "!" badge
+        # and the button highlight, and what the update dialog renders. Empty until the
+        # first check lands (and stays empty for anything unreachable/unrecorded), so both
+        # cues start dark. See _collect_update_statuses / _apply_update_indicators.
+        self._update_status = {}
         # PhotoImages for the Setup Status tab-bar symbol, kept referenced so Tk doesn't
         # GC them; rebuilt per state/theme in _update_status_tab_indicator.
         self._status_tab_glyphs = {}
@@ -3090,6 +4705,9 @@ class ArkAPLauncher(tk.Tk):
         # Theme must be selected before _build_ui() constructs any widget,
         # since widget colors are read from self.theme at construction time.
         self._apply_theme(self._read_theme_pref())
+
+        # Session marker, so a log spanning weeks reads as "which run was this?".
+        launcher_log("===== ARKipelago Launcher %s started =====" % APP_VERSION)
 
         self._build_ui()
         self._load_window_icon()
@@ -3106,6 +4724,9 @@ class ArkAPLauncher(tk.Tk):
         self._discover_locations(saved)
         self.load_from_files(initial=True, saved=saved)
         self._apply_path_placeholders()
+        # Before the first Setup Status paint, so the row below reflects the cleaned-up
+        # state. SERVER_ROOT is known by now (load_from_files).
+        self._sweep_broken_mod_files()
         self._refresh_setup_status()
         self._refresh_debug_log()
         self._profiles = self._load_profiles()
@@ -3118,12 +4739,33 @@ class ArkAPLauncher(tk.Tk):
         # _ensure_default_profile just made and activated that one.
         self._restore_active_profile(saved)
         self._update_profile_status()
+        # Loading is finished, so what the fields show IS what's persisted - including a
+        # profile just restored above. That initial fill is not an edit, so the baseline
+        # is taken here and every Save button comes up dark until the user changes
+        # something. See _mark_saved_baseline.
+        self._mark_saved_baseline()
 
         # Armed last, so the first snapshot it writes is of fully-loaded values.
         self._start_autosave()
+        # Everything above filled CLUSTERDIR from disk; from here on any change to it
+        # is a user action worth offering sibling Saves/Backups folders for.
+        self._cluster_autoscan = True
+        # Stop the easter-egg music on a normal window close. Belt-and-braces - MCI
+        # playback dies with the process anyway - but the window can outlive a stop
+        # request by a while during shutdown.
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
 
         if self._is_first_launch and not self.get("SERVER_ROOT"):
             self._start_auto_detect()
+
+        # Brand-new install: open on Instructions rather than Configuration, so the first
+        # thing a user sees is the step-by-step order rather than a wall of empty paths.
+        # Same first-run signal that auto-creates DEFAULT_PROFILE_NAME, plus a stored flag
+        # so this greeting happens exactly once (see FIRST_RUN_DONE_KEY).
+        if not (saved or {}).get(FIRST_RUN_DONE_KEY):
+            if self._is_first_launch:
+                self.notebook.select(self.tab_instructions)
+            self._write_config_key(FIRST_RUN_DONE_KEY, True, "first-run flag")
 
         # Local file read only (no network) - reports the outcome of an update helper
         # that ran just before this process started, if there was one.
@@ -3134,10 +4776,9 @@ class ArkAPLauncher(tk.Tk):
         self._sweep_update_leftovers()
 
         # Silent, non-blocking: runs on a background thread so it can never delay the
-        # window appearing, and fails quietly (no popup) if GitHub is unreachable.
-        self._start_background_update_check()
-        # Same check for the installed ArkApi / plugin vs their latest GitHub releases -
-        # feeds the yellow "i" advisory rows on Setup Status (see #4). Background/quiet.
+        # window appearing, and fails quietly (no popup) if GitHub is unreachable. One pass
+        # covers the launcher, the ArkAP plugin, the .apworld and the ArkApi advisory - it
+        # feeds both the "!" badge / button highlight and the Setup Status advisory rows.
         self._start_component_version_check()
 
     def report_callback_exception(self, exc_type, exc_value, exc_tb):
@@ -3177,6 +4818,9 @@ class ArkAPLauncher(tk.Tk):
         self.logo_label = ttk.Label(header_row)
         self.logo_label.pack(side="right", padx=(12, 20))
         self._load_header_logo(max_height=72)
+        # Deliberately no cursor change, relief, or hover style - it has to keep looking
+        # like a plain decorative image. See _on_logo_click / LOGO_EGG_LINES.
+        self.logo_label.bind("<Button-1>", self._on_logo_click, add="+")
 
         self.theme_toggle_btn = ttk.Button(header_row, text=self._theme_toggle_label(),
                                             command=self._toggle_theme)
@@ -3198,7 +4842,7 @@ class ArkAPLauncher(tk.Tk):
         self.update_check_btn.pack(padx=2, pady=2)
 
         # Badge shown to the LEFT of the button when a silent background check (see
-        # _start_background_update_check) finds a newer release. Packed after the
+        # _start_component_version_check) finds a newer release. Packed after the
         # button so it sits on the button's left. Kept always-packed with empty
         # text rather than pack/pack_forget, so showing it doesn't shift the other
         # header buttons. Its own warm-gold colour (update_badge_fg) reads as a
@@ -3207,11 +4851,13 @@ class ArkAPLauncher(tk.Tk):
         self.update_badge_label = ttk.Label(header_row, text="", foreground=self.theme["update_badge_fg"],
                                              font=(self._header_font_family or "Segoe UI", 12, "bold"))
         self.update_badge_label.pack(side="right", padx=(0, 4))
-        Tooltip(self.update_badge_label, "A newer version is available - click Check for Updates.")
+        Tooltip(self.update_badge_label,
+                "A newer version of the launcher, the ArkAP plugin or the .apworld is "
+                "available - click Check for Updates.")
         Tooltip(self.update_check_btn,
-                "Check GitHub for a newer launcher release (current version: %s). "
-                "Also checked silently once on launch; clicking always does a fresh "
-                "check." % APP_VERSION)
+                "Check GitHub for newer releases of the launcher (current version: %s), "
+                "the ArkAP plugin and %s. Also checked silently once on launch; clicking "
+                "always does a fresh check." % (APP_VERSION, APWORLD_ASSET_NAME))
 
         header_font_family = self._register_header_font()
         title_row = ttk.Frame(header_row)
@@ -3222,8 +4868,10 @@ class ArkAPLauncher(tk.Tk):
         # has to act on, and as plain subtle-grey text beside a 16pt title it read as
         # decoration. Uses the theme's warn colours (same pale yellow as the install
         # reminder banner) via a style, so the toggle repaints it automatically.
-        ttk.Label(title_row, text="make sure to save!", style="SaveHint.TLabel",
-                  padding=(6, 2)).pack(side="left", padx=12)
+        # Deliberately NOT packed here - it's a nag, and a permanent nag is wallpaper.
+        # _update_save_hint packs it in only while some section really is unsaved.
+        self.save_hint_label = ttk.Label(title_row, text="make sure to save!",
+                                          style="SaveHint.TLabel", padding=(6, 2))
 
         # Search bar - left-aligned directly below the title (not centered
         # under the logo). Enter runs the search and jumps to the first match;
@@ -3234,15 +4882,22 @@ class ArkAPLauncher(tk.Tk):
         self.search_entry = ttk.Entry(search_bar, textvariable=self.search_var, width=32)
         self.search_entry.pack(side="left")
         self.search_entry.bind("<Return>", lambda _e: self._run_search(self.search_var.get().strip()))
-        self.find_prev_btn = ttk.Button(search_bar, text="Find Prev", width=9,
+        # Both buttons live in one frame so the pair can be hidden as a unit
+        # while the search box is empty - with nothing searched for they do
+        # nothing, and an empty search bar is the app's resting state.
+        self._find_btns = ttk.Frame(search_bar)
+        self.find_prev_btn = ttk.Button(self._find_btns, text="Find Prev", width=9,
                                          command=self._find_prev)
         self.find_prev_btn.pack(side="left", padx=(8, 2))
-        self.find_next_btn = ttk.Button(search_bar, text="Find Next", width=9,
+        self.find_next_btn = ttk.Button(self._find_btns, text="Find Next", width=9,
                                          command=self._find_next)
         self.find_next_btn.pack(side="left", padx=(2, 8))
         self.search_status_var = tk.StringVar(value="")
-        ttk.Label(search_bar, textvariable=self.search_status_var,
-                  foreground=self.theme["subtle_fg"], width=14).pack(side="left", padx=(4, 0))
+        self._search_status_label = ttk.Label(search_bar, textvariable=self.search_status_var,
+                                              foreground=self.theme["subtle_fg"], width=14)
+        self._search_status_label.pack(side="left", padx=(4, 0))
+        self.search_var.trace_add("write", lambda *_a: self._update_find_btns())
+        self._update_find_btns()
         Tooltip(self.search_entry,
                 "Press Enter to highlight every occurrence of this word "
                 "anywhere in the app - labels, fields, buttons, tab names, "
@@ -3255,20 +4910,27 @@ class ArkAPLauncher(tk.Tk):
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)
         tab_config = ttk.Frame(notebook)
+        tab_archipelago = ttk.Frame(notebook)
         tab_profiles = ttk.Frame(notebook)
         tab_install = ttk.Frame(notebook)
         tab_mods = ttk.Frame(notebook)
         tab_status = ttk.Frame(notebook)
         tab_debug = ttk.Frame(notebook)
         tab_instructions = ttk.Frame(notebook)
+        # Tab ORDER only - nothing reads a tab by position. Every reference in this app
+        # is to the tab's frame object (self.tab_status, self.tab_instructions, ...),
+        # and the search feature walks notebook.tabs() and stores the frame it found a
+        # match in, so reordering here is purely visual and safe.
         notebook.add(tab_config, text="Configuration")
-        notebook.add(tab_profiles, text="Profiles")
-        notebook.add(tab_install, text="Server Install")
+        notebook.add(tab_install, text="Install Server/Api/Plugin")
+        notebook.add(tab_archipelago, text="Archipelago Setup")
         notebook.add(tab_mods, text="Mods")
         notebook.add(tab_status, text="Setup Status")
+        notebook.add(tab_profiles, text="Profiles")
         notebook.add(tab_debug, text="Debug Log")
         notebook.add(tab_instructions, text="Instructions")
         self.notebook = notebook
+        self.tab_archipelago = tab_archipelago
         self.tab_profiles = tab_profiles
         self.tab_install = tab_install
         self.tab_mods = tab_mods
@@ -3303,7 +4965,7 @@ class ArkAPLauncher(tk.Tk):
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
 
-        # Install reminder banner - dismissible, points at the Server Install tab.
+        # Install reminder banner - dismissible, points at the Install Server/Api/Plugin tab.
         self.reminder_banner = tk.Frame(inner, background=self.theme["warn_bg"],
                                          highlightbackground=self.theme["warn_border"],
                                          highlightthickness=1)
@@ -3312,12 +4974,12 @@ class ArkAPLauncher(tk.Tk):
         tk.Label(self.reminder_banner, background=self.theme["warn_bg"],
                  foreground=self.theme["warn_fg"],
                  justify="left", wraplength=520,
-                 text="Install the ARK dedicated server first. Use the \"Server Install\" "
+                 text="Install the ARK dedicated server first. Use the \"Install Server/Api/Plugin\" "
                       "tab (SteamCMD) to install it before relying on the paths below. Go to the instructions tab for a step by step guide"
                  ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
         rbtns = tk.Frame(self.reminder_banner, background=self.theme["warn_bg"])
         rbtns.pack(side="right", padx=6, pady=4)
-        ttk.Button(rbtns, text="Go to Server Install",
+        ttk.Button(rbtns, text="Go to Install Server/Api/Plugin",
                    command=self._goto_install_tab).pack(fill="x", pady=(0, 2))
         rbtns2 = tk.Frame(rbtns, background=self.theme["warn_bg"])
         rbtns2.pack(fill="x")
@@ -3326,8 +4988,1457 @@ class ArkAPLauncher(tk.Tk):
         ttk.Button(rbtns2, text="Don't show again",
                    command=self._dismiss_reminder_forever).pack(side="left")
 
-        for title, fields in GROUPS:
-            lf = ttk.LabelFrame(inner, text=title, padding=(10, 6))
+        self._render_field_groups(inner, GROUPS)
+        self._build_config_upload_section(inner)
+
+        # Bottom action bar (fixed) --------------------------------------------
+        bottom = ttk.Frame(tab_config, padding=(10, 8))
+        bottom.pack(fill="x")
+
+        q = ttk.LabelFrame(bottom, text="Quick launch", padding=(8, 6))
+        q.pack(fill="x")
+        # Ordered by how often they actually get used, not by category: the four on the
+        # top row are the everyday ones (launch, look at the install, start a new seed,
+        # edit Game.ini). The rest keep their old grouping - folders, then the remaining
+        # run/patch actions - on the rows below. `None` starts a new row.
+        #
+        # The reset buttons live here rather than in their own group, but they still
+        # replace the old "Delete session.json" button, which only cleared the AP->game
+        # direction (session.json) and left the outgoing checks (checks_out.jsonl etc.)
+        # behind - so a fresh room got flooded with the previous seed's checks on the
+        # connector's first read. Both clear ALL generated plugin/connector tracking;
+        # "Full reset" also backs up + wipes the world save (an in-app equivalent of
+        # reset_ark_test.bat that doesn't rely on .bat paths).
+        quick_launch = [
+            ("Run start_ase_server", lambda: self.run_bat("start_ase_server.bat"),
+             "Launches the main ARK server via start_ase_server.bat."),
+            ("Open SERVER_ROOT", self.open_server_root, None),
+            ("Full reset for new seed", self.full_reset_new_seed,
+             "Complete reset before joining a new Archipelago seed: clears all "
+             "plugin/connector tracking AND backs up + wipes the world save. The ARK "
+             "server must be stopped first."),
+            ("Open Game.ini folder", self.open_gameini_folder, None),
+            None,
+            ("Open ipc folder", self.open_ipc, None),
+            ("Open Plugins folder", self.open_plugins, None),
+            ("Open ClusterDir folder", self.open_cluster_dir,
+             "Opens the cluster data folder (ClusterDir) in Explorer."),
+            None,
+            ("Run switch_map", lambda: self.run_bat("switch_map.bat"), None),
+            ("Patch Game.ini for randomized creatures",
+             self.patch_game_ini_for_randomized_dinos,
+             "Applies the plugin's ipc\\%s into your Game.ini (backed up first) so "
+             "randomized creatures take effect - the automated version of copying that "
+             "block in by hand. Stop the ARK server first." % GAME_INI_FRAGMENT_NAME),
+            ("Reset AP data (keep world save)", self.reset_ap_data,
+             "Clears all Archipelago tracking the plugin and connector generate. "
+             "Note: if your character/world isn't also reset, level and inventory "
+             "checks will immediately re-send. Use 'Full reset for new seed' instead "
+             "when starting a new seed."),
+        ]
+        row = ttk.Frame(q)
+        row.pack(fill="x")
+        for entry in quick_launch:
+            if entry is None:
+                row = ttk.Frame(q)
+                row.pack(fill="x")
+                continue
+            text, cmd, tip = entry
+            btn = ttk.Button(row, text=text, command=cmd)
+            btn.pack(side="left", padx=3, pady=2)
+            if tip:
+                Tooltip(btn, tip, wraplength=520)
+
+        act = ttk.Frame(bottom)
+        act.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(act, text="Back up each file (.bak) before writing",
+                        variable=self.backup_var).pack(side="left")
+        # Save sits in a thin warn_bg/warn_border frame - the same pale yellow as the
+        # header's "make sure to save!" hint and the install reminder banner, so the
+        # reminder and the button it points at read as one thing. A frame rather than a
+        # styled button because ttk's "vista" engine ignores background on TButton.
+        # Built in the bg colour (dark), not warn_bg: the halo now means "you have
+        # unsaved changes on this tab" rather than being permanently lit, and
+        # _update_save_highlights turns it on the moment a field diverges from disk.
+        self.save_btn_halo = tk.Frame(act, background=self.theme["bg"],
+                                      highlightbackground=self.theme["bg"],
+                                      highlightthickness=1)
+        self.save_btn_halo.pack(side="right", padx=3)
+        ttk.Button(self.save_btn_halo, text="Save", command=self.on_save
+                   ).pack(padx=2, pady=2)
+        ttk.Button(act, text="Reload from files",
+                   command=lambda: self.load_from_files()).pack(side="right", padx=3)
+        export_btn = ttk.Button(act, text="Export diagnostics",
+                                command=self.export_diagnostics)
+        export_btn.pack(side="right", padx=3)
+        Tooltip(export_btn,
+                "Bundle ArkAP_debug.log, the launcher's own activity log, a Setup Status "
+                "summary, a password-redacted copy of your config, your Mods tab state + "
+                "output log, and the crash log (if any) into one zip on your Desktop - "
+                "drag it into Discord or a GitHub issue when asking for help.")
+
+        # Status / report log ---------------------------------------------------
+        self.log = tk.Text(bottom, height=7, wrap="word", state="disabled",
+                           font=("Consolas", 9),
+                           background=self.theme["text_bg"], foreground=self.theme["text_fg"],
+                           insertbackground=self.theme["text_fg"])
+        self.log.pack(fill="x", pady=(8, 0))
+
+        self._build_archipelago_tab(tab_archipelago)
+        self._build_install_tab(tab_install)
+        self._build_mods_tab(tab_mods)
+        self._build_setup_status_tab(tab_status)
+        self._build_debug_log_tab(tab_debug)
+        self._build_profiles_tab(tab_profiles)
+        self._build_instructions_tab(tab_instructions)
+        self._tag_instruction_examples()   # both instruction bodies at once
+
+        # Live "does this still match the loaded profile?" indicator plus the Save-button
+        # highlights - wired up last so profile_status_var (built by _build_profiles_tab
+        # above) and every Save halo already exist. One trace per var covers every way a
+        # field can change: typing, Browse, a scan result, a loaded profile, a reset.
+        for var in self.vars.values():
+            var.trace_add("write", lambda *_a: self._on_field_changed())
+
+    # ------------------------------------- Game.ini / GameUserSettings upload - #
+    # =========================== Archipelago Setup tab ====================== #
+    #
+    # A quick launcher for the user's own Archipelago install. What each button can
+    # actually do was verified against Archipelago 0.6.7's frozen executables rather
+    # than assumed:
+    #
+    #   ArchipelagoTextClient.exe DOES take connection arguments - its CommonClient
+    #   base parser exposes "--connect ADDR", "--name SLOT", "--password PW" (plus
+    #   --nogui and a positional archipelago:// url). So "Open Text Client" launches it
+    #   pre-connected straight from the server/slot/password fields on this tab. The
+    #   explicit flags are used rather than the archipelago:// url form because a slot
+    #   name or password containing ':', '@' or '/' would corrupt the url.
+    #
+    #   ArchipelagoOptionsCreator.exe does NOT. It has no argument parsing at all - no
+    #   argparse, no sys.argv read - and ignores everything passed to it (even --help,
+    #   which just boots the GUI); the game is chosen only by clicking a world button
+    #   inside its Kivy UI. So "Open Options Creator" launches it plain and says so in
+    #   its tooltip. Deliberately NOT worked around by sending synthetic keystrokes or
+    #   driving its widgets: that would break on any Archipelago UI change.
+    def _build_archipelago_tab(self, parent):
+        # Scrollable container - same Canvas + Scrollbar pattern as the Configuration,
+        # Install and Setup Status tabs, since this tab's content has grown past shorter
+        # windows. `wrap` stays the parent of every row below, it's just now the
+        # canvas's inner frame instead of packed straight into `parent`.
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        wrap = ttk.Frame(canvas, padding=(10, 8))
+        inner_id = canvas.create_window((0, 0), window=wrap, anchor="nw")
+        wrap.bind("<Configure>",
+                  lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+
+        ttk.Label(wrap, wraplength=760, justify="left", foreground=self.theme["subtle_fg"],
+                  text="Shortcuts into your own Archipelago installation - the app that "
+                       "hosts the room and builds the .yaml, installed separately from "
+                       "this launcher. Point the field below at it (or scan for it) and "
+                       "the buttons become available."
+                  ).pack(fill="x", anchor="w", pady=(0, 6))
+
+        # Same _render_field_groups() the Configuration tab uses, so the directory field
+        # gets the identical label/Browse/greyed-placeholder treatment, and the moved
+        # server/slot/password fields keep their tooltips and their "Copy ARK connection
+        # command" / "Copy port" buttons (rendered by the `password` case in that loop).
+        self._render_field_groups(wrap, ARCHIPELAGO_GROUPS)
+
+        # The fields above are persisted by the same Save the Configuration tab uses
+        # (config JSON + the active profile - see on_save/collect_values), but that
+        # button lives on a tab this one never sends you to. Without a Save here, a user
+        # who scanned for Archipelago and typed their room details closed the app and
+        # lost all four every time. Same warn_bg/warn_border halo as the other two Save
+        # buttons so "unapplied changes" reads identically wherever it appears.
+        srow = ttk.Frame(wrap)
+        srow.pack(fill="x", pady=(0, 8))
+        self.archipelago_save_btn_halo = tk.Frame(
+            srow, background=self.theme["bg"],
+            highlightbackground=self.theme["bg"], highlightthickness=1)
+        self.archipelago_save_btn_halo.pack(side="left")
+        save_btn = ttk.Button(self.archipelago_save_btn_halo, text="Save",
+                              command=self.on_save)
+        save_btn.pack(padx=2, pady=2)
+        Tooltip(save_btn,
+                "Saves the fields above (and everything on the Configuration tab) to "
+                "disk - the same Save button the Configuration tab has, so the "
+                "Archipelago directory and your server / slot / password survive a "
+                "restart instead of needing a re-scan and a re-type every launch.\n"
+                "Also writes server / slot / password into connector.ini, which is what "
+                "the connector actually reads.", wraplength=520)
+
+        arch_entry = self._entries[ARCHIPELAGO_DIR_KEY]
+        arch_entry.bind("<FocusOut>", lambda _e: self._refresh_archipelago_buttons(), add="+")
+        self.vars[ARCHIPELAGO_DIR_KEY].trace_add(
+            "write", lambda *_a: self._refresh_archipelago_buttons())
+
+        # Same wiring for the PopTracker directory, so its own three buttons and status
+        # line follow the field however it changes - typing, Browse, a scan, or the
+        # download filling it in.
+        pop_entry = self._entries[POPTRACKER_DIR_KEY]
+        pop_entry.bind("<FocusOut>", lambda _e: self._refresh_poptracker_buttons(), add="+")
+        self.vars[POPTRACKER_DIR_KEY].trace_add(
+            "write", lambda *_a: self._refresh_poptracker_buttons())
+
+        # (attr, label, tooltip, command) - attr is kept so
+        # _refresh_archipelago_buttons can enable/disable each one individually with a
+        # message naming the exact exe that's missing.
+        launch = ttk.LabelFrame(wrap, text="Launch", padding=(10, 6))
+        launch.pack(fill="x", pady=(0, 8))
+        ttk.Label(launch, wraplength=760, justify="left",
+                  foreground=self.theme["note_fg"], font=("Segoe UI", 8, "italic"),
+                  text="Open Text Client automatically fills in your Archipelago room "
+                       "details when opening. It can take a couple seconds for the app "
+                       "to open, that's normal."
+                  ).pack(fill="x", anchor="w", pady=(0, 4))
+        ttk.Label(launch, wraplength=760, justify="left",
+                  foreground=self.theme["note_fg"], font=("Segoe UI", 8, "italic"),
+                  text="Hosting locally is an alternative to uploading your seed to "
+                       "archipelago.gg, not an extra step - do one or the other. The "
+                       "room then lives on your PC: you connect to it at localhost, but "
+                       "everyone else connects to YOUR IP address, and anyone outside "
+                       "your home network can only reach it if you forward the "
+                       "Archipelago port (default %d, TCP) to this PC on your router. "
+                       "Players on the same network as you need no forwarding. Closing "
+                       "the server's console window ends the room."
+                       % ARCHIPELAGO_DEFAULT_PORT
+                  ).pack(fill="x", anchor="w", pady=(0, 4))
+        self._archipelago_buttons = []
+        self._archipelago_folder_buttons = []
+        launch_specs = [
+            ("btn_text_client", "Open Text Client", ARCHIPELAGO_TEXT_CLIENT_EXE,
+             self._open_text_client,
+             "Opens Archipelago's Text Client, already connected using the server, slot "
+             "and password above (it takes --connect/--name/--password on the command "
+             "line, so no copy-pasting). Leave the fields blank to just open it "
+             "unconnected."),
+            ("btn_options_creator", "Open Options Creator (YAML)",
+             "ArchipelagoOptionsCreator.exe", self._open_options_creator,
+             "Opens Archipelago's visual .yaml builder.\n"
+             "Note: it can't be opened straight onto a specific game - it takes no "
+             "command-line arguments at all, so pick \"ARK: Survival Evolved\" from its "
+             "own game list once it's open."),
+            ("btn_generate", "Generate seed", "ArchipelagoGenerate.exe",
+             self._open_generate,
+             "Runs ArchipelagoGenerate.exe, which builds a multiworld from every .yaml "
+             "in Archipelago's Players folder and writes the result into its output "
+             "folder."),
+            ("btn_host_server", "Host local Archipelago server",
+             ARCHIPELAGO_SERVER_EXE, self._host_local_server,
+             "Hosts a room on THIS machine instead of uploading your seed to "
+             "archipelago.gg.\n"
+             "Asks which generated seed to open (offering the newest from your output "
+             "folder), then starts ArchipelagoServer.exe in its own console window - it "
+             "takes the seed file on the command line, so there's nothing to browse for "
+             "inside it. That window is where the room's output appears and where you "
+             "type commands like /send, so leave it open; closing it ends the room.\n"
+             "Offers to point the server field above at your local room afterwards, so "
+             "\"Copy ARK connection command\" and \"Open Text Client\" just work.\n"
+             "Uses the room password above (if any) and the port from Archipelago's own "
+             "host.yaml."),
+            ("btn_launcher", "Open Archipelago Launcher", "ArchipelagoLauncher.exe",
+             self._open_archipelago_launcher,
+             "Opens Archipelago's own launcher - the general entry point to everything "
+             "else it ships (server, other clients, adjusters)."),
+        ]
+        row = ttk.Frame(launch)
+        row.pack(fill="x")
+        for attr, text, exe, cmd, tip in launch_specs:
+            btn = ttk.Button(row, text=text, command=cmd)
+            btn.pack(side="left", padx=3, pady=2)
+            Tooltip(btn, tip, wraplength=520)
+            setattr(self, attr, btn)
+            self._archipelago_buttons.append((btn, exe, tip))
+
+        # Folder shortcuts. These need the directory but no particular exe, so they're
+        # gated only on the directory being set - hence a separate list from the launch
+        # buttons above rather than another entry in launch_specs.
+        folders = ttk.LabelFrame(wrap, text="Folders", padding=(10, 6))
+        folders.pack(fill="x")
+        folder_specs = [
+            ("Open custom_worlds folder", "custom_worlds",
+             "Opens Archipelago's custom_worlds folder - this is where the ARK "
+             ".apworld has to be dropped before generating or the ARK options won't "
+             "exist. Created if it isn't there yet."),
+            ("Open Players folder", "Players",
+             "Opens Archipelago's Players folder - where your .yaml files go, and "
+             "where \"Generate seed\" reads them from. Created if it isn't there yet."),
+            ("Open output folder", "output",
+             "Opens Archipelago's output folder - where \"Generate seed\" writes the "
+             "finished .zip you host. Created if it isn't there yet."),
+            ("Open Archipelago folder", "",
+             "Opens the Archipelago install folder itself in Explorer."),
+        ]
+        frow = ttk.Frame(folders)
+        frow.pack(fill="x")
+        for text, sub, tip in folder_specs:
+            btn = ttk.Button(frow, text=text,
+                             command=lambda s=sub, t=text: self._open_archipelago_subfolder(s, t))
+            btn.pack(side="left", padx=3, pady=2)
+            Tooltip(btn, tip, wraplength=520)
+            self._archipelago_folder_buttons.append(btn)
+
+        self._build_apworld_section(wrap)
+        self._refresh_archipelago_buttons()
+
+    def _build_archipelago_scan_row(self, parent):
+        """The "Scan for Archipelago" row. Built from inside _render_field_groups so it
+        lands in the same LabelFrame as the directory field it fills."""
+        scanrow = ttk.Frame(parent)
+        scanrow.pack(fill="x", pady=(0, 2))
+        self.archipelago_scan_btn = ttk.Button(scanrow, text="Scan for Archipelago",
+                                                command=self._on_scan_archipelago)
+        self.archipelago_scan_btn.pack(side="left")
+        Tooltip(self.archipelago_scan_btn,
+                "Finds your Archipelago install. Checks the common locations first "
+                "(%s, Program Files, your user folder) and only falls back to the "
+                "wider drive scan if none of them match - so the usual case is "
+                "instant.\n"
+                "A folder only counts if it contains all three of %s, so a half-copied "
+                "or unrelated folder is never accepted."
+                % (ARCHIPELAGO_DEFAULT_DIR, ", ".join(ARCHIPELAGO_REQUIRED_EXES)),
+                wraplength=520)
+        self.archipelago_scan_progress = ttk.Progressbar(scanrow, mode="indeterminate",
+                                                          length=90)
+        self.archipelago_status_label = ttk.Label(scanrow, text="",
+                                                   foreground=self.theme["subtle_fg"])
+        self.archipelago_status_label.pack(side="left", padx=8)
+        self._dir_scan_widgets[ARCHIPELAGO_DIR_KEY] = (
+            self.archipelago_scan_btn, self.archipelago_scan_progress,
+            self.archipelago_status_label)
+
+    # ------------------------------------------- Archipelago tab: apworld -- #
+    def _build_apworld_section(self, parent):
+        box = ttk.LabelFrame(parent, text="ARK world (.apworld)", padding=(10, 6))
+        box.pack(fill="x", pady=(8, 0))
+        ttk.Label(box, wraplength=760, justify="left", foreground=self.theme["subtle_fg"],
+                  text="Downloads the latest %s from this project's GitHub releases and "
+                       "puts it straight into Archipelago's custom_worlds folder - the "
+                       "same file you'd otherwise download and drag in by hand. Any "
+                       "copy already there is backed up first, never overwritten "
+                       "silently." % APWORLD_ASSET_NAME
+                  ).pack(fill="x", anchor="w", pady=(0, 4))
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        self.apworld_update_btn = ttk.Button(row, text="Update .apworld",
+                                              command=self._on_update_apworld)
+        self.apworld_update_btn.pack(side="left")
+        Tooltip(self.apworld_update_btn,
+                "Fetches the newest %s release asset and installs it into "
+                "custom_worlds under your Archipelago directory.\n"
+                "The existing file (if any) is renamed to a timestamped .bak alongside "
+                "it, so a bad release is always one rename away from being undone.\n"
+                "Needs the Archipelago directory above to be set."
+                % APWORLD_ASSET_NAME, wraplength=520)
+        self.apworld_progress = ttk.Progressbar(row, mode="determinate", length=140,
+                                                 maximum=100)
+        self.apworld_status_var = tk.StringVar(value="")
+        ttk.Label(row, textvariable=self.apworld_status_var,
+                  foreground=self.theme["subtle_fg"]).pack(side="left", padx=8)
+
+    def _on_update_apworld(self):
+        """Download the latest ark_ase.apworld into custom_worlds, on a worker thread.
+
+        Gated on the Archipelago directory rather than on the button's disabled state
+        as well: this button is enabled whenever the folder is set (it needs no
+        Archipelago .exe at all), so the check has to live here."""
+        if getattr(self, "_apworld_thread", None) is not None \
+                and self._apworld_thread.is_alive():
+            self._log("Update .apworld: a download is already running.")
+            return
+        root = self._archipelago_dir()
+        if not root:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "The Archipelago directory is not set.\n\nSet it at the top of this tab "
+                "(or click \"Scan for Archipelago\") so the launcher knows where "
+                "custom_worlds is.")
+            return
+        if not os.path.isdir(root):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "The Archipelago directory doesn't exist:\n\n%s" % root)
+            return
+        # Created rather than required: custom_worlds is Archipelago's own well-known
+        # folder, and a fresh install that has never used a custom world won't have it.
+        custom_worlds = os.path.join(root, "custom_worlds")
+        try:
+            os.makedirs(custom_worlds, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("ARKIpelago Launcher",
+                                 "Could not create:\n%s\n\n%s" % (custom_worlds, exc))
+            return
+
+        self.apworld_update_btn.configure(state="disabled")
+        self.apworld_status_var.set("Fetching release info...")
+        self.apworld_progress.pack(side="left", padx=(6, 0))
+        self.apworld_progress["value"] = 0
+        self._apworld_queue = queue.Queue()
+        self._apworld_thread = threading.Thread(
+            target=self._apworld_worker, args=(custom_worlds,), daemon=True)
+        self._apworld_thread.start()
+        self.after(150, self._poll_apworld_queue)
+
+    def _apworld_worker(self, custom_worlds):
+        q = self._apworld_queue
+        try:
+            q.put(("line", "Fetching latest ARKipelago release info..."))
+            tag, asset_name, url, _size = self._fetch_latest_release_asset(
+                APWORLD_ASSET_NAME, q)
+        except (OSError, ValueError, RuntimeError) as exc:
+            q.put(("line", "! Could not fetch release info: %s" % exc))
+            q.put(("done", None))
+            return
+
+        # Downloaded to a temp file and only moved into place once complete, so a
+        # failed or half-finished download can never leave a truncated .apworld where
+        # Archipelago would try to load it.
+        tmp_dir = tempfile.mkdtemp(prefix="arkap_apworld_dl_")
+        tmp_path = os.path.join(tmp_dir, asset_name)
+        dest = os.path.join(custom_worlds, APWORLD_ASSET_NAME)
+        try:
+            q.put(("line", "Downloading %s..." % asset_name))
+            self._download_with_progress(url, tmp_path, q)
+            backup = None
+            if os.path.exists(dest):
+                backup = self._backup_file(dest, time.strftime("%Y%m%d-%H%M%S"))
+                q.put(("line", "Backed up the existing file to: %s"
+                       % os.path.basename(backup)))
+            shutil.move(tmp_path, dest)
+        except (OSError, ValueError) as exc:
+            q.put(("line", "! Update failed: %s" % exc))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            q.put(("done", None))
+            return
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        q.put(("line", "Installed %s (%s) into %s" % (APWORLD_ASSET_NAME, tag,
+                                                       custom_worlds)))
+        q.put(("done", {"tag": tag, "dest": dest, "backup": backup}))
+
+    def _poll_apworld_queue(self):
+        try:
+            while True:
+                kind, payload = self._apworld_queue.get_nowait()
+                if kind == "line":
+                    self._log(payload)
+                elif kind == "progress":
+                    try:
+                        self.apworld_progress["value"] = payload
+                        self.apworld_status_var.set("Downloading... %d%%" % payload)
+                    except tk.TclError:
+                        pass
+                elif kind == "done":
+                    self._on_apworld_done(payload)
+                    return
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_apworld_queue)
+
+    def _on_apworld_done(self, payload):
+        self._apworld_thread = None
+        try:
+            self.apworld_progress.pack_forget()
+            self.apworld_update_btn.configure(state="normal")
+        except tk.TclError:
+            pass
+        if not payload:
+            self.apworld_status_var.set("Failed - see the log.")
+            messagebox.showerror(
+                "Update .apworld",
+                "Could not update %s. See the log at the bottom of the Configuration "
+                "tab for details.\n\nYou can always download it by hand from:\n%s"
+                % (APWORLD_ASSET_NAME, RELEASES_URL))
+            return
+        self.apworld_status_var.set("Updated (%s)" % payload["tag"])
+        # The .apworld carries no version of its own (see APWORLD_INSTALLED_VERSION_KEY),
+        # so record the tag we just laid down - this is the ONLY baseline the update check
+        # has for it. Then re-run the check so the "!" clears immediately on this update.
+        self._write_config_key(APWORLD_INSTALLED_VERSION_KEY, payload["tag"],
+                               "installed .apworld version")
+        self._start_component_version_check()
+        extra = ("\n\nYour previous copy was kept as:\n%s"
+                 % os.path.basename(payload["backup"])) if payload["backup"] else ""
+        messagebox.showinfo(
+            "Update .apworld",
+            "%s (%s) installed into:\n%s%s\n\nRestart Archipelago (and re-generate) for "
+            "it to be picked up."
+            % (APWORLD_ASSET_NAME, payload["tag"], os.path.dirname(payload["dest"]), extra))
+
+    # ------------------------------------------- PopTracker (tracker) ------- #
+    def _build_poptracker_controls(self, parent):
+        """Everything the PopTracker group holds under its directory field: the scan row,
+        then the pack-install / download / launch buttons. Built from inside
+        _render_field_groups so all of it lands in that one LabelFrame, for the same reason
+        _build_archipelago_scan_row does - setting the folder, finding it and using it read
+        as one feature instead of controls scattered down the tab."""
+        intro = ttk.Label(parent, wraplength=760, justify="left",
+                          foreground=self.theme["subtle_fg"],
+                          text="PopTracker is a separate app that tracks your multiworld. "
+                               "Point this at a copy you already have, or let the launcher "
+                               "fetch one - it isn't bundled with the launcher (it's ~38 MB "
+                               "on its own). The %s installs into that folder's \"%s\" "
+                               "subfolder."
+                               % (TRACKER_PACK_LABEL, POPTRACKER_PACKS_DIRNAME))
+        # Above the field, not below it: this runs as a hook from _render_field_groups, so
+        # the field's row is already packed by the time we get here.
+        already = parent.winfo_children()
+        intro.pack(fill="x", anchor="w", pady=(0, 4),
+                   **({"before": already[0]} if already else {}))
+
+        scanrow = ttk.Frame(parent)
+        scanrow.pack(fill="x", pady=(0, 2))
+        self.poptracker_scan_btn = ttk.Button(scanrow, text="Scan for PopTracker",
+                                               command=self._on_scan_poptracker)
+        self.poptracker_scan_btn.pack(side="left")
+        Tooltip(self.poptracker_scan_btn,
+                "Finds an existing PopTracker install. Checks the likely spots first "
+                "(next to this launcher, C:\\PopTracker, your user folder, Desktop / "
+                "Documents / Downloads) and only falls back to the wider drive scan if "
+                "none of them match.\n"
+                "A folder counts if it contains %s. PopTracker has no installer and no "
+                "standard location, so if the scan misses it, Browse to it - or use "
+                "\"Download PopTracker\"." % POPTRACKER_EXE, wraplength=520)
+        self.poptracker_scan_progress = ttk.Progressbar(scanrow, mode="indeterminate",
+                                                         length=90)
+        self.poptracker_status_label = ttk.Label(scanrow, text="",
+                                                  foreground=self.theme["subtle_fg"])
+        self.poptracker_status_label.pack(side="left", padx=8)
+        self._dir_scan_widgets[POPTRACKER_DIR_KEY] = (
+            self.poptracker_scan_btn, self.poptracker_scan_progress,
+            self.poptracker_status_label)
+
+        # (attribute, label, what it needs, command, tooltip). "needs" is what
+        # _refresh_poptracker_buttons gates on: "dir" = the folder must be set and exist,
+        # "exe" = poptracker.exe must be in it, "" = always available - which is the whole
+        # point of the download button, it's what you press when nothing is set yet.
+        specs = [
+            ("poptracker_pack_btn", "Install/update %s" % TRACKER_PACK_LABEL, "dir",
+             self._on_install_tracker_pack,
+             "Downloads the latest %s from GitHub and installs it into PopTracker's %s "
+             "folder - the same files you'd otherwise download and unzip by hand.\n"
+             "A copy already there is moved aside into a timestamped folder under "
+             "\"%s\" first, never overwritten - and deliberately not left inside %s, "
+             "since PopTracker would list a backup sitting there as a second copy of "
+             "the pack.\n"
+             "Needs the PopTracker directory above to be set."
+             % (TRACKER_PACK_LABEL, POPTRACKER_PACKS_DIRNAME,
+                TRACKER_PACK_BACKUP_DIRNAME, POPTRACKER_PACKS_DIRNAME)),
+            ("poptracker_download_btn", "Download PopTracker", "",
+             self._on_download_poptracker,
+             "Fetches PopTracker itself (the latest stable Windows build from "
+             "black-sliver/PopTracker - release candidates are skipped), extracts it into "
+             "a folder you pick, points the field above at it, and installs the %s into "
+             "it. One click, nothing to work out first.\n"
+             "Only needed if you don't already have PopTracker - if you do, set the "
+             "directory above (or use \"Scan for PopTracker\") instead."
+             % TRACKER_PACK_LABEL),
+            ("poptracker_open_btn", "Open PopTracker", "exe", self._open_poptracker,
+             "Opens PopTracker loaded straight onto the ARK pack (it takes --load-pack / "
+             "--pack-variant on the command line), so there's no pack to pick inside it.\n"
+             "Auto-connecting to your room only works on PopTracker %s or newer, which is "
+             "the version its --ap-host/--ap-slot/--ap-password arguments arrived in - and "
+             "an older build refuses to start when given them rather than ignoring them, so "
+             "the launcher can't fake it. There's nothing else to write either: PopTracker "
+             "remembers a host and slot, but only as the defaults for its own dialog, and "
+             "it never stores the password.\n"
+             "On an older copy - which includes the current stable build - the room address "
+             "is copied to your clipboard instead, with a note on where to paste it: click "
+             "the grey \"AP\" inside PopTracker. The pack still loads automatically.\n"
+             "Needs %s in the PopTracker directory above."
+             % (POPTRACKER_AP_ARGS_MIN_VERSION, POPTRACKER_EXE)),
+        ]
+        btnrow = ttk.Frame(parent)
+        btnrow.pack(fill="x", pady=(4, 2))
+        self._poptracker_buttons = []
+        for attr, text, needs, cmd, tip in specs:
+            btn = ttk.Button(btnrow, text=text, command=cmd)
+            btn.pack(side="left", padx=(0, 6), pady=2)
+            Tooltip(btn, tip, wraplength=520)
+            setattr(self, attr, btn)
+            self._poptracker_buttons.append((btn, needs, tip))
+        self.poptracker_progress = ttk.Progressbar(btnrow, mode="determinate", length=140,
+                                                    maximum=100)
+        self._poptracker_status_var = tk.StringVar(value="")
+        ttk.Label(btnrow, textvariable=self._poptracker_status_var,
+                  foreground=self.theme["subtle_fg"]).pack(side="left", padx=8)
+        self._refresh_poptracker_buttons()
+
+    def _poptracker_dir(self):
+        """The configured PopTracker directory, normalised, or "" when unset. get()
+        returns "" while the greyed placeholder is showing, so the example path can never
+        be mistaken for a real install (same contract as _archipelago_dir)."""
+        value = self.get(POPTRACKER_DIR_KEY)
+        return os.path.normpath(value) if value else ""
+
+    def _refresh_poptracker_buttons(self, _event=None):
+        """Enable/disable the PopTracker buttons to match the current directory, with the
+        reason on the tooltip - a disabled ttk button swallows clicks, so a messagebox on
+        press would never be seen (same approach as _refresh_archipelago_buttons)."""
+        # The directory field is rendered before these buttons exist, and set() fires the
+        # trace that calls this - so a partially built tab has to be a no-op, not a crash.
+        if not hasattr(self, "_poptracker_buttons"):
+            return
+        path = self._poptracker_dir()
+        busy = (getattr(self, "_poptracker_thread", None) is not None
+                and self._poptracker_thread.is_alive())
+        for btn, needs, base_tip in self._poptracker_buttons:
+            if busy:
+                ok, why = False, "A PopTracker download is running - let it finish first."
+            elif not needs:
+                ok, why = True, ""
+            elif not path:
+                ok, why = False, ("Set the PopTracker directory above first - Browse, "
+                                  "\"Scan for PopTracker\", or \"Download PopTracker\" to "
+                                  "fetch a copy.")
+            elif not os.path.isdir(path):
+                ok, why = False, "The PopTracker directory doesn't exist:\n%s" % path
+            elif needs == "exe" and not is_poptracker_dir(path):
+                ok, why = False, ("%s isn't in the PopTracker directory:\n%s"
+                                  % (POPTRACKER_EXE, path))
+            else:
+                ok, why = True, ""
+            try:
+                btn.configure(state=("normal" if ok else "disabled"))
+            except tk.TclError:
+                pass
+            tip = getattr(btn, "_tooltip", None)
+            if tip is not None:
+                tip.text = base_tip if ok else why + "\n\n" + base_tip
+        if not hasattr(self, "poptracker_status_label"):
+            return
+        if not path:
+            msg = "No PopTracker directory set."
+        elif not os.path.isdir(path):
+            msg = "That folder doesn't exist."
+        elif not is_poptracker_dir(path):
+            msg = "Folder found, but %s isn't in it." % POPTRACKER_EXE
+        else:
+            pack, version = installed_tracker_pack(poptracker_packs_dir(path))
+            if version:
+                msg = "PopTracker found - %s %s installed." % (TRACKER_PACK_LABEL, version)
+            elif pack:
+                msg = ("PopTracker found - %s installed (version unknown)."
+                       % TRACKER_PACK_LABEL)
+            else:
+                msg = "PopTracker found - %s not installed yet." % TRACKER_PACK_LABEL
+        try:
+            self.poptracker_status_label.configure(text=msg)
+        except tk.TclError:
+            pass
+
+    def _poptracker_busy(self, label):
+        """True (with a log line) while a PopTracker download/install is already running.
+        Both jobs share one thread and one queue: the download job continues straight into
+        the pack install, so they were never independent to begin with."""
+        thread = getattr(self, "_poptracker_thread", None)
+        if thread is not None and thread.is_alive():
+            self._log("%s: a PopTracker download is already running." % label)
+            return True
+        return False
+
+    def _start_poptracker_job(self, target, args, status):
+        self._poptracker_status_var.set(status)
+        self._poptracker_queue = queue.Queue()
+        self._poptracker_thread = threading.Thread(target=target, args=args, daemon=True)
+        self._poptracker_thread.start()
+        self._refresh_poptracker_buttons()   # greys the group out while it runs
+        try:
+            self.poptracker_progress["value"] = 0
+            self.poptracker_progress.pack(side="left", padx=(6, 0))
+        except tk.TclError:
+            pass
+        self.after(150, self._poll_poptracker_queue)
+
+    def _on_install_tracker_pack(self):
+        """Install/update the ARK tracker pack into the configured PopTracker's packs
+        folder, on a worker thread.
+
+        Gated on the directory here rather than only on the button's state, for the same
+        reason _on_update_apworld is: this is also reachable from the "Check for Updates"
+        dialog, which knows nothing about that button."""
+        label = "Install/update %s" % TRACKER_PACK_LABEL
+        if self._poptracker_busy(label):
+            return
+        root = self._poptracker_dir()
+        if not root:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "The PopTracker directory is not set.\n\nSet it in the \"PopTracker "
+                "(tracker)\" group on this tab - Browse to it, click \"Scan for "
+                "PopTracker\", or use \"Download PopTracker\" to have the launcher fetch "
+                "PopTracker and the pack together.")
+            return
+        if not os.path.isdir(root):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "The PopTracker directory doesn't exist:\n\n%s" % root)
+            return
+        # Created rather than required: packs\ is PopTracker's own well-known folder and a
+        # freshly extracted copy ships it empty, but a copy someone tidied up won't have it.
+        packs = poptracker_packs_dir(root)
+        try:
+            os.makedirs(packs, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("ARKIpelago Launcher",
+                                 "Could not create:\n%s\n\n%s" % (packs, exc))
+            return
+        self._start_poptracker_job(self._tracker_pack_job, (packs,),
+                                   "Fetching release info...")
+
+    def _on_download_poptracker(self):
+        """Path 2: fetch PopTracker itself into a folder the user picks, then install the
+        ARK pack into it - one click from nothing at all to a working tracker.
+
+        Never silently duplicates an install. A copy already configured, or one already
+        sitting in the folder picked, is adopted (after asking) instead: those hold the
+        user's own packs and tracker state next to the exe, and quietly extracting over
+        them would lose both."""
+        label = "Download PopTracker"
+        if self._poptracker_busy(label):
+            return
+        current = self._poptracker_dir()
+        if is_poptracker_dir(current) and not messagebox.askyesno(
+                label,
+                "PopTracker is already set up here:\n\n%s\n\nDownload another copy "
+                "anyway?\n\nA second copy keeps its own packs and its own tracker state, "
+                "so this is only worth doing if you want a fresh install somewhere else. "
+                "To just refresh the pack in the copy you have, use \"Install/update "
+                "%s\"." % (current, TRACKER_PACK_LABEL)):
+            return
+        dest_root = filedialog.askdirectory(
+            title="Where should PopTracker go? (a \"%s\" folder is created inside)"
+                  % POPTRACKER_DOWNLOAD_SUBDIR_NOTE,
+            initialdir=current if os.path.isdir(current) else base_dir())
+        if not dest_root:
+            return
+        dest_root = os.path.normpath(dest_root)
+        existing = next(
+            (p for p in (dest_root,
+                         os.path.join(dest_root, POPTRACKER_DOWNLOAD_SUBDIR_NOTE))
+             if is_poptracker_dir(p)), None)
+        if existing:
+            if not messagebox.askyesno(
+                    label,
+                    "PopTracker is already installed here:\n\n%s\n\nUse this copy and "
+                    "just install the %s into it?\n\n(Nothing is downloaded or replaced - "
+                    "your existing PopTracker, its other packs and its saved state are "
+                    "left alone.)" % (existing, TRACKER_PACK_LABEL)):
+                return
+            self.set(POPTRACKER_DIR_KEY, existing)
+            self._log("%s: %s already holds PopTracker - using it." % (label, existing))
+            self._on_install_tracker_pack()
+            return
+        self._start_poptracker_job(self._poptracker_download_job, (dest_root,),
+                                   "Fetching release info...")
+
+    # The two jobs. Both run on the shared worker thread and report through the shared
+    # queue; the download job simply continues into the pack install, which is what makes
+    # "Download PopTracker" one click rather than two.
+    def _tracker_pack_job(self, packs):
+        q = self._poptracker_queue
+        q.put(("done", {"kind": "pack", "pack": self._install_tracker_pack(q, packs)}))
+
+    def _poptracker_download_job(self, dest_root):
+        q = self._poptracker_queue
+        root = self._download_poptracker_app(q, dest_root)
+        pack = self._install_tracker_pack(q, poptracker_packs_dir(root)) if root else None
+        q.put(("done", {"kind": "app", "dir": root, "pack": pack}))
+
+    def _install_tracker_pack(self, q, packs):
+        """Download the newest tracker pack release and put it in `packs`. Returns a
+        payload dict, or None on any failure (already logged to `q`). Worker thread only.
+
+        The download is GitHub's auto-generated source zip, which nests everything one
+        level down in a folder named after the repo and commit - so the extracted tree is
+        searched for the manifest.json and THAT folder is what gets installed, under a
+        stable name (see TRACKER_PACK_DIRNAME). Extracted to a temp folder first and only
+        moved into packs\\ once complete, so a failed or half-finished download can never
+        leave a broken pack where PopTracker would try to load it."""
+        try:
+            release = _fetch_newest_release(TRACKER_PACK_RELEASES_API)
+        except (OSError, ValueError) as exc:
+            q.put(("line", "! Could not fetch %s release info: %s"
+                   % (TRACKER_PACK_LABEL, exc)))
+            return None
+        url = (release or {}).get("zipball_url")
+        if not url:
+            q.put(("line", "! No %s release found (checked %s)."
+                   % (TRACKER_PACK_LABEL, TRACKER_PACK_RELEASES_API)))
+            return None
+        tag = (release.get("tag_name") or "unknown").strip()
+        q.put(("line", "Latest %s release: %s (GitHub source zip - the pack publishes no "
+                       "release assets of its own)" % (TRACKER_PACK_LABEL, tag)))
+
+        tmp_dir = tempfile.mkdtemp(prefix="arkap_trackerpack_")
+        zip_path = os.path.join(tmp_dir, "trackerpack.zip")
+        extract_dir = os.path.join(tmp_dir, "unzipped")
+        try:
+            q.put(("line", "Downloading %s %s..." % (TRACKER_PACK_LABEL, tag)))
+            self._download_with_progress(url, zip_path, q)
+            q.put(("status", "Installing..."))
+            self._extract_zip_to(zip_path, extract_dir, q)
+            src = locate_extracted_pack(extract_dir)
+            if src is None:
+                q.put(("line", "! The download had no %s at any level - nothing installed."
+                       % TRACKER_PACK_MANIFEST))
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None
+            _uid, version = read_pack_manifest(src)
+            dest = os.path.join(packs, TRACKER_PACK_DIRNAME)
+            # Two things get moved aside: whatever copy of this pack is already installed
+            # (under any name, folder or zip - see installed_tracker_pack), and anything
+            # else occupying the folder name about to be written. Usually they're the same
+            # entry, hence the dedupe.
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            existing, _old_version = installed_tracker_pack(packs)
+            moved_from, backups = [], []
+            for old in (existing, dest):
+                if not old or not os.path.exists(old):
+                    continue
+                if any(os.path.normcase(old) == os.path.normcase(seen)
+                       for seen in moved_from):
+                    continue
+                moved_from.append(old)
+                backups.append(self._backup_pack_entry(old, ts))
+                q.put(("line", "Moved the existing pack aside: %s" % backups[-1]))
+            shutil.move(src, dest)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            q.put(("line", "! %s install failed: %s" % (TRACKER_PACK_LABEL, exc)))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        q.put(("line", "Installed %s %s into %s"
+               % (TRACKER_PACK_LABEL, version or tag, dest)))
+        return {"tag": tag, "version": version or tag, "dest": dest, "backups": backups}
+
+    def _backup_pack_entry(self, path, ts):
+        """Move a pack (folder or zip) out of packs\\ into
+        <PopTracker dir>\\pack_backups\\<name>.<timestamp>, and return where it went.
+
+        A move rather than a copy, and out of packs\\ rather than a .bak beside it:
+        PopTracker treats every entry of that folder as a pack, so a backup left there
+        would still carry the same package_uid and turn up as a duplicate in its Load
+        list. Timestamped, with a dupe suffix on a same-second collision - the same
+        never-delete contract as _backup_file, which can't be reused here because a pack
+        can be a whole folder rather than a single file."""
+        packs = os.path.dirname(os.path.normpath(path))
+        backup_dir = os.path.join(os.path.dirname(packs), TRACKER_PACK_BACKUP_DIRNAME)
+        os.makedirs(backup_dir, exist_ok=True)
+        name = os.path.basename(os.path.normpath(path))
+        target = os.path.join(backup_dir, "%s.%s" % (name, ts))
+        dupe = 2
+        while os.path.exists(target):
+            target = os.path.join(backup_dir, "%s.%s-%d" % (name, ts, dupe))
+            dupe += 1
+        shutil.move(path, target)
+        return target
+
+    def _download_poptracker_app(self, q, dest_root):
+        """Download the latest stable PopTracker Windows build and extract it into
+        `dest_root`. Returns the install folder (dest_root\\poptracker), or None on failure
+        (already logged to `q`). Worker thread only."""
+        try:
+            release = _fetch_newest_release(POPTRACKER_RELEASES_API)
+        except (OSError, ValueError) as exc:
+            q.put(("line", "! Could not fetch PopTracker release info: %s" % exc))
+            return None
+        asset = poptracker_win64_asset(release or {})
+        if asset is None:
+            q.put(("line", "! The latest PopTracker release (%s) has no Windows build "
+                           "(*%s). Download it by hand from %s."
+                   % ((release or {}).get("tag_name") or "unknown",
+                      POPTRACKER_ASSET_SUFFIX, POPTRACKER_RELEASES_PAGE)))
+            return None
+        tag = (release.get("tag_name") or "unknown").strip()
+        q.put(("line", "Latest PopTracker release: %s - asset %s" % (tag, asset["name"])))
+
+        tmp_dir = tempfile.mkdtemp(prefix="arkap_poptracker_")
+        zip_path = os.path.join(tmp_dir, asset["name"])
+        extract_dir = os.path.join(tmp_dir, "unzipped")
+        try:
+            q.put(("line", "Downloading %s..." % asset["name"]))
+            self._download_with_progress(asset["browser_download_url"], zip_path, q)
+            q.put(("status", "Extracting..."))
+            self._extract_zip_to(zip_path, extract_dir, q)
+            src = locate_extracted_poptracker(extract_dir)
+            if src is None:
+                q.put(("line", "! %s contained no %s - nothing installed."
+                       % (asset["name"], POPTRACKER_EXE)))
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None
+            os.makedirs(dest_root, exist_ok=True)
+            dest = os.path.join(dest_root, os.path.basename(src))
+            if os.path.exists(dest):
+                # A real install here was already adopted by the caller, so this is a
+                # leftover or an unrelated folder in the way. Moved aside, never merged
+                # into or deleted.
+                moved = "%s.%s.bak" % (dest, time.strftime("%Y%m%d-%H%M%S"))
+                shutil.move(dest, moved)
+                q.put(("line", "Moved an existing \"%s\" folder aside: %s"
+                       % (os.path.basename(dest), moved)))
+            shutil.move(src, dest)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            q.put(("line", "! PopTracker download failed: %s" % exc))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        q.put(("line", "PopTracker %s installed into %s" % (tag, dest)))
+        return dest
+
+    def _poll_poptracker_queue(self):
+        try:
+            while True:
+                kind, payload = self._poptracker_queue.get_nowait()
+                if kind == "line":
+                    self._log(payload)
+                elif kind == "status":
+                    self._poptracker_status_var.set(payload)
+                elif kind == "progress":
+                    try:
+                        self.poptracker_progress["value"] = payload
+                        self._poptracker_status_var.set("Downloading... %d%%" % payload)
+                    except tk.TclError:
+                        pass
+                elif kind == "done":
+                    self._on_poptracker_job_done(payload)
+                    return
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_poptracker_queue)
+
+    def _on_poptracker_job_done(self, payload):
+        self._poptracker_thread = None
+        try:
+            self.poptracker_progress.pack_forget()
+        except tk.TclError:
+            pass
+        app_dir = payload.get("dir")
+        if app_dir:
+            # Point the field at the install just laid down, exactly as the plugin install
+            # points PLUGINS_DIR at its own result - one path variable, not a second one.
+            self.set(POPTRACKER_DIR_KEY, app_dir)
+        pack = payload.get("pack")
+        if pack:
+            # The pack's manifest.json is the real source of truth (see
+            # installed_tracker_pack); this records it so the diagnostics version block and
+            # the update check have a baseline even before the next disk read.
+            self._write_config_key(TRACKER_PACK_INSTALLED_VERSION_KEY, pack["version"],
+                                   "installed %s version" % TRACKER_PACK_LABEL)
+            self._start_component_version_check()
+        self._refresh_poptracker_buttons()
+
+        if payload.get("kind") == "app" and not app_dir:
+            self._poptracker_status_var.set("Failed - see the log.")
+            messagebox.showerror(
+                "Download PopTracker",
+                "Could not download PopTracker. See the log at the bottom of the "
+                "Configuration tab for details.\n\nYou can always download it by hand "
+                "from:\n%s\n\nThen point the PopTracker directory at the folder holding "
+                "%s." % (POPTRACKER_RELEASES_PAGE, POPTRACKER_EXE))
+            return
+        if not pack:
+            self._poptracker_status_var.set("Failed - see the log.")
+            messagebox.showerror(
+                "Install/update %s" % TRACKER_PACK_LABEL,
+                "Could not install the %s. See the log at the bottom of the Configuration "
+                "tab for details.\n\nYou can always download it by hand from:\n%s\n\nThe "
+                "\"Source code (zip)\" asset is the pack - unzip it into PopTracker's %s "
+                "folder." % (TRACKER_PACK_LABEL, TRACKER_PACK_RELEASES_PAGE,
+                             POPTRACKER_PACKS_DIRNAME))
+            return
+
+        self._poptracker_status_var.set("Pack %s installed" % pack["version"])
+        kept = ("\n\nYour previous copy was moved to:\n%s" % "\n".join(pack["backups"])
+                if pack["backups"] else "")
+        if app_dir:
+            messagebox.showinfo(
+                "Download PopTracker",
+                "PopTracker is installed here:\n%s\n\n%s %s was installed into its %s "
+                "folder.%s\n\nThe PopTracker directory has been filled in for you - click "
+                "Save on this tab so it's remembered next time. Then use \"Open "
+                "PopTracker\"."
+                % (app_dir, TRACKER_PACK_LABEL, pack["version"],
+                   POPTRACKER_PACKS_DIRNAME, kept))
+            return
+        messagebox.showinfo(
+            "Install/update %s" % TRACKER_PACK_LABEL,
+            "%s %s installed into:\n%s%s\n\nIf PopTracker is already open, press Ctrl+F5 "
+            "(force-reload) or restart it for the new version to be picked up."
+            % (TRACKER_PACK_LABEL, pack["version"], pack["dest"], kept))
+
+    def _open_poptracker(self):
+        """Launch PopTracker, loaded onto the ARK pack and - where the installed version
+        supports it - already connected to the room.
+
+        PopTracker does take command-line arguments, unlike Archipelago's Options Creator,
+        but which ones depends on its version, and the difference is not cosmetic (see
+        POPTRACKER_AP_ARGS_MIN_VERSION): --load-pack / --pack-variant work on every
+        release in play, while the --ap-* room arguments make an older build print its
+        usage and exit instead of opening. So the pack is always pre-loaded, the room is
+        pre-filled only on 0.35.4+, and the log says which of the two happened rather than
+        leaving the user to wonder why the AP dot is still grey.
+
+        Blank room fields are simply left out, and --load-pack is only passed once the pack
+        is really installed."""
+        path = self._poptracker_dir()
+        exe = os.path.join(path, POPTRACKER_EXE) if path else ""
+        if not exe or not os.path.isfile(exe):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "%s was not found in the PopTracker directory:\n%s\n\nSet the PopTracker "
+                "directory in the \"PopTracker (tracker)\" group on this tab (or use "
+                "\"Scan for PopTracker\" / \"Download PopTracker\")."
+                % (POPTRACKER_EXE, exe or "(not set)"))
+            self._refresh_poptracker_buttons()
+            return
+        args = []
+        pack, _version = installed_tracker_pack(poptracker_packs_dir(path))
+        if pack:
+            args += ["--load-pack", TRACKER_PACK_UID,
+                     "--pack-variant", TRACKER_PACK_VARIANT]
+        else:
+            self._log("Open PopTracker: the %s isn't installed yet - opening PopTracker "
+                      "without loading a pack (use \"Install/update %s\" first)."
+                      % (TRACKER_PACK_LABEL, TRACKER_PACK_LABEL))
+        room = [("--ap-host", self.get("server")), ("--ap-slot", self.get("slot")),
+                ("--ap-password", self.get("password"))]
+        hand_over = None
+        if not self.get("server"):
+            self._log("Open PopTracker: no server set - its Archipelago autotracker will "
+                      "have to be connected by hand (click the grey \"AP\").")
+        elif poptracker_supports_ap_args(path):
+            args += [part for flag, value in room if value for part in (flag, value)]
+        else:
+            # Older build: hand the details over instead of pretending to connect. See
+            # poptracker_room_hint for why there is no config file to write instead.
+            hand_over, note = poptracker_room_hint(
+                self.get("server"), self.get("slot"), self.get("password"))
+            self._log("Open PopTracker: this copy is %s, older than %s - the room can't be "
+                      "passed on the command line, so %s is on the clipboard for its AP "
+                      "dialog instead."
+                      % (poptracker_version(path) or "of an unknown version",
+                         POPTRACKER_AP_ARGS_MIN_VERSION, hand_over))
+            self.clipboard_clear()
+            self.clipboard_append(hand_over)
+        try:
+            # cwd is PopTracker's own folder, like _run_archipelago_exe: CWD\packs is one
+            # of its pack search paths, so launching from the launcher's own folder could
+            # have it looking for packs somewhere else entirely.
+            subprocess.Popen([exe] + args, cwd=path)
+        except OSError as exc:
+            messagebox.showerror("ARKIpelago Launcher",
+                                 "Could not start PopTracker:\n%s\n\n%s" % (exe, exc))
+            self._log("! PopTracker failed to start: %s" % exc)
+            return
+        self._log("Started PopTracker%s" % (" (pack + room pre-filled)" if args else ""))
+        # Shown AFTER the launch (PopTracker takes a couple of seconds to appear, so the
+        # instructions are on screen while the user waits) and only once per app session:
+        # the details are on the clipboard and in the log every time, but a modal box on
+        # every click of a button people press repeatedly is a nag, not help.
+        if hand_over and not self._poptracker_room_hint_shown:
+            self._poptracker_room_hint_shown = True
+            messagebox.showinfo("Open PopTracker", note)
+
+    # ------------------------------------------- Archipelago tab: gating ---- #
+    def _archipelago_dir(self):
+        """The configured Archipelago directory, normalised, or "" when unset. get()
+        returns "" while the greyed placeholder is showing, so an unconfigured field
+        can never be mistaken for a real install at C:\\ProgramData\\Archipelago."""
+        value = self.get(ARCHIPELAGO_DIR_KEY)
+        return os.path.normpath(value) if value else ""
+
+    def _refresh_archipelago_buttons(self, _event=None):
+        """Enable/disable every button on the tab to match the current directory.
+
+        Each launch button is gated on its OWN exe existing, not just on the folder
+        being set, so a partially-broken install disables only the buttons that can't
+        work. The reason is put on the button's tooltip so a disabled button always
+        explains itself (a disabled ttk button swallows clicks, so a messagebox on
+        press would never be seen)."""
+        # The directory field is rendered before the buttons exist, and set() fires the
+        # trace that calls this - so a partially built tab has to be a no-op, not a crash.
+        if not (hasattr(self, "_archipelago_buttons")
+                and hasattr(self, "_archipelago_folder_buttons")):
+            return
+        path = self._archipelago_dir()
+        for btn, exe, base_tip in self._archipelago_buttons:
+            if not path:
+                ok, why = False, "Set the Archipelago directory above first (or click " \
+                                 "\"Scan for Archipelago\")."
+            elif not os.path.isdir(path):
+                ok, why = False, "The Archipelago directory doesn't exist:\n%s" % path
+            elif not os.path.isfile(os.path.join(path, exe)):
+                ok, why = False, "%s isn't in the Archipelago directory:\n%s" % (exe, path)
+            else:
+                ok, why = True, ""
+            try:
+                btn.configure(state=("normal" if ok else "disabled"))
+            except tk.TclError:
+                pass
+            tip = getattr(btn, "_tooltip", None)
+            if tip is not None:
+                tip.text = base_tip if ok else why + "\n\n" + base_tip
+        usable = bool(path) and os.path.isdir(path)
+        for btn in self._archipelago_folder_buttons:
+            try:
+                btn.configure(state=("normal" if usable else "disabled"))
+            except tk.TclError:
+                pass
+        if not hasattr(self, "archipelago_status_label"):
+            return
+        if not path:
+            msg = "No Archipelago directory set."
+        elif is_archipelago_dir(path):
+            msg = "Archipelago found."
+        elif os.path.isdir(path):
+            missing = [e for e in ARCHIPELAGO_REQUIRED_EXES
+                       if not os.path.isfile(os.path.join(path, e))]
+            msg = "Folder found, but missing: %s" % ", ".join(missing)
+        else:
+            msg = "That folder doesn't exist."
+        self.archipelago_status_label.configure(text=msg)
+
+    # ------------------------------------------- directory-field scans ----- #
+    #
+    # "Scan for Archipelago" and "Scan for PopTracker" are the same scan pointed at two
+    # different markers, so they share one implementation: common locations first
+    # (synchronous - a handful of os.path.isfile calls), and only if none of them match,
+    # ONE budgeted drive walk on a thread. The walker is bounded_drive_scan, the same one
+    # the SERVER_ROOT auto-detect uses, with a per-field matcher and a skip-list that
+    # doesn't exclude ProgramData/Program Files. Per-field data lives in DIR_SCAN_TARGETS;
+    # the widgets come from self._dir_scan_widgets, filled in when each row was built.
+    def _on_scan_archipelago(self):
+        self._start_dir_scan(ARCHIPELAGO_DIR_KEY)
+
+    def _on_scan_poptracker(self):
+        self._start_dir_scan(POPTRACKER_DIR_KEY)
+
+    def _dir_scan_status(self, key, text):
+        widgets = self._dir_scan_widgets.get(key)
+        if widgets:
+            try:
+                widgets[2].configure(text=text)
+            except tk.TclError:
+                pass
+
+    def _start_dir_scan(self, key):
+        spec = DIR_SCAN_TARGETS[key]
+        label = "Scan for %s" % spec["what"]
+        # One scan at a time across BOTH fields: a drive walk is the expensive part, and
+        # two of them racing would only make each slower.
+        if getattr(self, "_dir_scan_thread", None) is not None \
+                and self._dir_scan_thread.is_alive():
+            self._log("%s: a scan is already running." % label)
+            return
+        for cand in spec["candidates"]():
+            if spec["matches"](cand):
+                self.set(key, os.path.normpath(cand))
+                self._log("%s: found %s" % (label, os.path.normpath(cand)))
+                return
+        self._log("%s: not in the common locations - scanning drives (this can take up "
+                  "to ~20s)..." % label)
+        self._dir_scan_status(key, "Scanning drives - this can take up to ~20s...")
+        self._set_dir_scan_busy(key, True)
+        self._dir_scan_queue = queue.Queue()
+        self._dir_scan_thread = threading.Thread(
+            target=self._dir_scan_worker, args=(key,), daemon=True)
+        self._dir_scan_thread.start()
+        self.after(150, self._poll_dir_scan_queue, key)
+
+    def _dir_scan_worker(self, key):
+        q = self._dir_scan_queue
+        try:
+            found = bounded_drive_scan(
+                lambda line: q.put(("line", line)),
+                lambda: False,
+                matches=DIR_SCAN_TARGETS[key]["matches"],
+                skip_names=SKIP_ARCHIPELAGO_SCAN_DIR_NAMES)
+        except Exception as exc:  # a scan must never take the app down with it
+            q.put(("error", str(exc)))
+            return
+        q.put(("result", found))
+
+    def _poll_dir_scan_queue(self, key):
+        spec = DIR_SCAN_TARGETS[key]
+        label = "Scan for %s" % spec["what"]
+        try:
+            while True:
+                kind, payload = self._dir_scan_queue.get_nowait()
+                if kind == "line":
+                    self._log(payload)
+                elif kind == "error":
+                    self._set_dir_scan_busy(key, False)
+                    self._dir_scan_thread = None
+                    self._log("! %s failed: %s" % (label, payload))
+                    self._dir_scan_status(key, "Scan failed - see the log.")
+                    return
+                elif kind == "result":
+                    self._set_dir_scan_busy(key, False)
+                    self._dir_scan_thread = None
+                    if payload:
+                        # set() fires the field's trace, which re-runs that tab's own
+                        # button gating and rewrites the status label - no per-field
+                        # refresh call needed here.
+                        self.set(key, os.path.normpath(payload))
+                        self._log("%s: found %s" % (label, os.path.normpath(payload)))
+                    else:
+                        self._log("%s: nothing found - %s" % (label, spec["missing"]))
+                        self._dir_scan_status(key, "Not found - set the folder manually.")
+                    return
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_dir_scan_queue, key)
+
+    def _set_dir_scan_busy(self, key, busy):
+        widgets = self._dir_scan_widgets.get(key)
+        if not widgets:
+            return
+        btn, progress, _label = widgets
+        try:
+            btn.configure(state=("disabled" if busy else "normal"))
+            if busy:
+                progress.pack(side="left", padx=(6, 0))
+                progress.start(60)
+            else:
+                progress.stop()
+                progress.pack_forget()
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------- Archipelago tab: launch --- #
+    def _run_archipelago_exe(self, exe, args=(), label=None, new_console=False):
+        """Start one of Archipelago's executables, with its own folder as the working
+        directory - Archipelago resolves Players/, output/, custom_worlds/ and host.yaml
+        relative to cwd, so launching from the launcher's cwd would point it at the
+        wrong data. Popen, not run(): these are long-lived GUI apps and must not block
+        this app.
+
+        new_console gives the child its own console window instead of inheriting this
+        app's (which, as a windowed build, hasn't got one). Only the server needs it:
+        it's the one child here that is an interactive console process rather than a
+        fire-and-forget GUI - the user has to read its output and type commands like
+        /send into it, so it must own a window they can actually reach."""
+        label = label or exe
+        path = os.path.join(self._archipelago_dir(), exe)
+        if not os.path.isfile(path):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "%s was not found in the Archipelago directory:\n%s\n\nSet the "
+                "Archipelago directory on the Archipelago Setup tab (or use \"Scan for "
+                "Archipelago\")." % (exe, path))
+            self._refresh_archipelago_buttons()
+            return False
+        try:
+            subprocess.Popen(
+                [path] + list(args), cwd=self._archipelago_dir(),
+                creationflags=(getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                               if new_console else 0))
+        except OSError as exc:
+            messagebox.showerror("ARKIpelago Launcher",
+                                 "Could not start %s:\n%s\n\n%s" % (label, path, exc))
+            self._log("! %s failed to start: %s" % (label, exc))
+            return False
+        self._log("Started %s%s" % (label, " (pre-connected)" if args else ""))
+        return True
+
+    def _open_text_client(self):
+        """Launch the Text Client pre-connected from the server/slot fields.
+
+        Uses --connect/--name/--password (verified present in Archipelago 0.6.7's
+        CommonClient base parser) rather than the archipelago://name:pass@host:port
+        positional url, because a slot name or password containing ':', '@' or '/'
+        would silently corrupt the url form. Blank fields are simply omitted, which
+        opens the client unconnected - the client asks for whatever it still needs."""
+        args = []
+        server = self.get("server")
+        slot = self.get("slot")
+        password = self.get("password")
+        if server:
+            args += ["--connect", server]
+        if slot:
+            args += ["--name", slot]
+        if password:
+            args += ["--password", password]
+        if not server:
+            self._log("Text Client: no server set - opening it unconnected.")
+        self._run_archipelago_exe(ARCHIPELAGO_TEXT_CLIENT_EXE, args, "Text Client")
+
+    def _open_options_creator(self):
+        """Launch the Options Creator. No arguments: it has no command-line interface
+        at all (see the block comment above _build_archipelago_tab), so it can't be
+        opened directly onto ARK's options page - the user picks the game in its UI."""
+        if self._run_archipelago_exe("ArchipelagoOptionsCreator.exe", (), "Options Creator"):
+            self._log("  Options Creator can't be opened onto a specific game - pick "
+                      "\"ARK: Survival Evolved\" from its game list.")
+
+    def _open_generate(self):
+        if self._run_archipelago_exe("ArchipelagoGenerate.exe", (), "Archipelago Generate"):
+            self._log("  Generating from the .yaml files in Archipelago's Players "
+                      "folder; the finished seed lands in its output folder.")
+
+    def _open_archipelago_launcher(self):
+        self._run_archipelago_exe("ArchipelagoLauncher.exe", (), "Archipelago Launcher")
+
+    def _host_local_server(self):
+        """Host a room on this machine with ArchipelagoServer.exe.
+
+        What the exe actually accepts was checked against Archipelago 0.6.7 rather than
+        assumed (`ArchipelagoServer.exe --help`, plus real launches):
+
+          * It takes the seed as a POSITIONAL argument (`multidata`) - so the room can
+            be opened straight onto a generated seed with no "browse for a file" step
+            inside the server. Both the .zip that Generate writes and a bare extracted
+            .archipelago boot correctly.
+          * `--password` sets the room password players connect with; `--server_password`
+            is the separate remote-admin password, deliberately not exposed here (it
+            isn't needed to play, and it's a footgun to set without meaning to).
+          * `--port`/`--host` exist but are NOT passed - see archipelago_host_port().
+            host.yaml is the user's own place to change the port, and a CLI --port would
+            silently beat it.
+
+        Everything else the parser exposes (--savefile/--disable_save, the SSL --cert
+        pair, --release_mode/--collect_mode/--countdown_mode/--remaining_mode,
+        --hint_cost, --location_check_points, --disable_item_cheat, --compatibility,
+        --loglevel/--logtime/--log_network, --auto_shutdown) is a per-room rules
+        preference with a working host.yaml default. Those belong in host.yaml, where
+        they persist across every launch, rather than in a wall of widgets on this tab
+        that would have to be re-set every time."""
+        root = self._archipelago_dir()
+        if not root:
+            messagebox.showwarning("ARKIpelago Launcher",
+                                   "The Archipelago directory is not set.")
+            return
+
+        seeds = archipelago_seed_files(root)
+        if not seeds:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "No generated seed was found in:\n%s\n\nClick \"Generate seed\" first - "
+                "hosting needs a finished seed to open the room onto."
+                % os.path.join(root, "output"))
+            self._log("Host local server: nothing in the output folder to host.")
+            return
+
+        # Newest first, so the common "generate, then host it" path is one click. Cancel
+        # aborts entirely; No opens the output folder in a file picker, which doubles as
+        # the "list of what's there" for anyone hosting an older seed.
+        newest = seeds[0]
+        choice = messagebox.askyesnocancel(
+            "ARKIpelago Launcher",
+            "Host this seed?\n\n%s\n(generated %s)\n\n"
+            "Yes - host this one.\nNo - pick a different seed.\nCancel - don't host."
+            % (os.path.basename(newest),
+               time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(newest)))))
+        if choice is None:
+            return
+        if choice:
+            seed = newest
+        else:
+            seed = filedialog.askopenfilename(
+                title="Pick a generated seed to host",
+                initialdir=os.path.join(root, "output"),
+                filetypes=[("Archipelago seed", "*.zip *.archipelago"),
+                           ("All files", "*.*")])
+            if not seed:
+                return
+
+        args = [seed]
+        # The room password and the password the connector will use are the same value,
+        # so hosting from this field is what keeps "Copy ARK connection command" correct.
+        # Omitted when blank so host.yaml's own password setting still applies.
+        password = self.get("password")
+        if password:
+            args += ["--password", password]
+
+        if not self._run_archipelago_exe(ARCHIPELAGO_SERVER_EXE, args,
+                                         "Archipelago Server", new_console=True):
+            return
+
+        port = archipelago_host_port(root)
+        self._log("Hosting %s in its own console window (port %d)."
+                  % (os.path.basename(seed), port))
+        self._log("  Other players connect to YOUR IP, not localhost - the server "
+                  "window prints the address it's hosting on.")
+        self._offer_local_server_address(port)
+
+    def _offer_local_server_address(self, port):
+        """Point the Connector `server` field at the room just started locally.
+
+        Without this the tab still says archipelago.gg, so "Copy ARK connection command"
+        and "Open Text Client" - both of which read this field - would quietly aim at
+        the wrong room. localhost is correct for the HOST's own machine, which is who
+        is pressing this button.
+
+        An existing value is never replaced silently: it's usually a real room address
+        someone typed, and clobbering it on a button press that didn't advertise itself
+        as editing the field would be the kind of thing you only notice much later."""
+        local = "localhost:%d" % port
+        current = self.get("server")
+        if current == local:
+            return
+        if current:
+            if not messagebox.askyesno(
+                    "ARKIpelago Launcher",
+                    "Point the Connector at your local server?\n\n"
+                    "server is currently:\n    %s\n\nReplace it with:\n    %s\n\n"
+                    "This is what \"Copy ARK connection command\" and \"Open Text "
+                    "Client\" use. Your old value isn't saved anywhere - note it down "
+                    "first if you still need it." % (current, local)):
+                self._log("  Left server as %s - the local room is at %s."
+                          % (current, local))
+                return
+        self.set("server", local)
+        self._log("  server set to %s. Click Save to keep it." % local)
+
+    def _open_archipelago_subfolder(self, subdir, label):
+        """Open the Archipelago folder, or one of its subfolders, in Explorer.
+
+        Creates a missing subfolder rather than erroring: Players/output/custom_worlds
+        are Archipelago's own well-known folders, and the whole point of the button is
+        that the user is about to put a file there - failing because it doesn't exist
+        yet would be the least useful possible outcome."""
+        root = self._archipelago_dir()
+        if not root:
+            messagebox.showwarning("ARKIpelago Launcher",
+                                   "The Archipelago directory is not set.")
+            return
+        path = os.path.join(root, subdir) if subdir else root
+        if subdir and not os.path.isdir(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+                self._log("Created %s" % path)
+            except OSError as exc:
+                messagebox.showerror("ARKIpelago Launcher",
+                                     "Could not create:\n%s\n\n%s" % (path, exc))
+                return
+        self._open_folder(path, label)
+
+    def _render_field_groups(self, parent, groups):
+        """Render (group title, [(key, label, kind), ...]) groups as LabelFrames of
+        labelled fields into `parent`.
+
+        Shared by the Configuration tab (GROUPS) and the Archipelago Setup tab
+        (ARCHIPELAGO_GROUPS) so a field looks and behaves identically wherever it is
+        rendered. Every field still registers itself in self.vars/self._entries under
+        its own key, which is what lets the rest of the app (connector.ini writing,
+        profiles, diagnostics, Setup Status) stay completely unaware of which tab a
+        field is drawn on. The per-group/per-key special cases below key off the
+        title/field name, never off the parent, for the same reason."""
+        for title, fields in groups:
+            lf = ttk.LabelFrame(parent, text=title, padding=(10, 6))
             lf.pack(fill="x", expand=True, pady=6)
             lf.columnconfigure(0, weight=1)
 
@@ -3471,6 +6582,18 @@ class ArkAPLauncher(tk.Tk):
                               ).grid(row=2, column=0, columnspan=2, sticky="w",
                                      pady=(2, 0))
 
+                # Sits inside the "Archipelago installation" group, directly under the
+                # directory field and its Browse button, so setting the folder and
+                # searching for it read as one thing rather than two unrelated controls.
+                if key == ARCHIPELAGO_DIR_KEY:
+                    self._build_archipelago_scan_row(lf)
+
+                # Same idea, one group down: the PopTracker scan row and the three
+                # PopTracker buttons all live in the same LabelFrame as the directory they
+                # act on, so the whole feature reads as one thing.
+                if key == POPTRACKER_DIR_KEY:
+                    self._build_poptracker_controls(lf)
+
                 if key == "password":
                     crow = ttk.Frame(lf)
                     crow.pack(fill="x", pady=(0, 6))
@@ -3486,114 +6609,6 @@ class ArkAPLauncher(tk.Tk):
                             "(the digits after the colon) - handy for the connector and "
                             "for firewall/port-forward entries.")
 
-        self._build_config_upload_section(inner)
-
-        # Bottom action bar (fixed) --------------------------------------------
-        bottom = ttk.Frame(tab_config, padding=(10, 8))
-        bottom.pack(fill="x")
-
-        q = ttk.LabelFrame(bottom, text="Quick launch", padding=(8, 6))
-        q.pack(fill="x")
-        qrow = ttk.Frame(q)
-        qrow.pack(fill="x")
-        for text, cmd in [
-            ("Open ipc folder",        self.open_ipc),
-            ("Open Plugins folder",    self.open_plugins),
-            ("Open Game.ini folder",   self.open_gameini_folder),
-            ("Open SERVER_ROOT",       self.open_server_root),
-            ("Open ClusterDir folder", self.open_cluster_dir),
-        ]:
-            btn = ttk.Button(qrow, text=text, command=cmd)
-            btn.pack(side="left", padx=3, pady=2)
-            if text == "Open ClusterDir folder":
-                Tooltip(btn, "Opens the cluster data folder (ClusterDir) in Explorer.")
-
-        rrow = ttk.Frame(q)
-        rrow.pack(fill="x")
-        for text, batname in RUN_BATS:
-            ttk.Button(rrow, text=text,
-                       command=lambda b=batname: self.run_bat(b)
-                       ).pack(side="left", padx=3, pady=2)
-
-        # Sits where "Run reset_ark_test" / "Run apply_server_config" used to, on the same
-        # row as the other Run buttons.
-        patch_gi_btn = ttk.Button(rrow, text="Patch Game.ini for randomized creatures",
-                                  command=self.patch_game_ini_for_randomized_dinos)
-        patch_gi_btn.pack(side="left", padx=3, pady=2)
-        Tooltip(patch_gi_btn,
-                "Applies the plugin's ipc\\%s into your Game.ini (backed up first) so "
-                "randomized creatures take effect - the automated version of copying that "
-                "block in by hand. Stop the ARK server first." % GAME_INI_FRAGMENT_NAME,
-                wraplength=520)
-
-        # New-seed reset controls. These replace the old "Delete session.json" button,
-        # which only cleared the AP->game direction (session.json) and left the outgoing
-        # checks (checks_out.jsonl etc.) behind - so a fresh room got flooded with the
-        # previous seed's checks on the connector's first read. Both buttons clear ALL
-        # generated plugin/connector tracking; the second also backs up + wipes the world
-        # save (an in-app equivalent of reset_ark_test.bat that doesn't rely on .bat paths).
-        reset_row = ttk.Frame(q)
-        reset_row.pack(fill="x", pady=(2, 0))
-        reset_ap_btn = ttk.Button(reset_row, text="Reset AP data (keep world save)",
-                                   command=self.reset_ap_data)
-        reset_ap_btn.pack(side="left", padx=3, pady=2)
-        Tooltip(reset_ap_btn,
-                "Clears all Archipelago tracking the plugin and connector generate. "
-                "Note: if your character/world isn't also reset, level and inventory "
-                "checks will immediately re-send. Use 'Full reset for new seed' instead "
-                "when starting a new seed.")
-        full_reset_btn = ttk.Button(reset_row, text="Full reset for new seed",
-                                     command=self.full_reset_new_seed)
-        full_reset_btn.pack(side="left", padx=3, pady=2)
-        Tooltip(full_reset_btn,
-                "Complete reset before joining a new Archipelago seed: clears all "
-                "plugin/connector tracking AND backs up + wipes the world save. The ARK "
-                "server must be stopped first.")
-
-        act = ttk.Frame(bottom)
-        act.pack(fill="x", pady=(8, 0))
-        ttk.Checkbutton(act, text="Back up each file (.bak) before writing",
-                        variable=self.backup_var).pack(side="left")
-        # Save sits in a thin warn_bg/warn_border frame - the same pale yellow as the
-        # header's "make sure to save!" hint and the install reminder banner, so the
-        # reminder and the button it points at read as one thing. A frame rather than a
-        # styled button because ttk's "vista" engine ignores background on TButton.
-        self.save_btn_halo = tk.Frame(act, background=self.theme["warn_bg"],
-                                      highlightbackground=self.theme["warn_border"],
-                                      highlightthickness=1)
-        self.save_btn_halo.pack(side="right", padx=3)
-        ttk.Button(self.save_btn_halo, text="Save", command=self.on_save
-                   ).pack(padx=2, pady=2)
-        ttk.Button(act, text="Reload from files",
-                   command=lambda: self.load_from_files()).pack(side="right", padx=3)
-        export_btn = ttk.Button(act, text="Export diagnostics",
-                                command=self.export_diagnostics)
-        export_btn.pack(side="right", padx=3)
-        Tooltip(export_btn,
-                "Bundle ArkAP_debug.log, a Setup Status summary, a password-redacted copy "
-                "of your config, and the crash log (if any) into one zip on your Desktop - "
-                "drag it into Discord or a GitHub issue when asking for help.")
-
-        # Status / report log ---------------------------------------------------
-        self.log = tk.Text(bottom, height=7, wrap="word", state="disabled",
-                           font=("Consolas", 9),
-                           background=self.theme["text_bg"], foreground=self.theme["text_fg"],
-                           insertbackground=self.theme["text_fg"])
-        self.log.pack(fill="x", pady=(8, 0))
-
-        self._build_install_tab(tab_install)
-        self._build_mods_tab(tab_mods)
-        self._build_setup_status_tab(tab_status)
-        self._build_debug_log_tab(tab_debug)
-        self._build_profiles_tab(tab_profiles)
-        self._build_instructions_tab(tab_instructions)
-
-        # Live "does this still match the loaded profile?" indicator - wired up last
-        # so profile_status_var (built by _build_profiles_tab above) already exists.
-        for var in self.vars.values():
-            var.trace_add("write", lambda *_a: self._update_profile_status())
-
-    # ------------------------------------- Game.ini / GameUserSettings upload - #
     def _build_config_upload_section(self, parent):
         """Copy the user's own Game.ini / GameUserSettings.ini over the server's.
 
@@ -3937,7 +6952,7 @@ class ArkAPLauncher(tk.Tk):
                  text="Set SERVER_ROOT and install the ARK server first - mods install "
                       "into SERVER_ROOT's Content\\Mods folder."
                  ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
-        ttk.Button(self.mods_gate_banner, text="Go to Server Install",
+        ttk.Button(self.mods_gate_banner, text="Go to Install Server/Api/Plugin",
                    command=self._goto_install_tab).pack(side="right", padx=6, pady=4)
 
         top = ttk.Frame(wrap)
@@ -3966,7 +6981,7 @@ class ArkAPLauncher(tk.Tk):
         self._mods_action_buttons.append(self.mods_uncheck_all_btn)
 
         # Top-left: scrollable, ordered mod list - same Canvas + Scrollbar pattern as
-        # the Configuration/Server Install/Setup Status tabs.
+        # the Configuration, Install Server/Api/Plugin and Setup Status tabs.
         list_outer = ttk.Frame(top)
         list_outer.pack(side="left", fill="both", expand=True)
         canvas = tk.Canvas(list_outer, borderwidth=0, highlightthickness=0,
@@ -4005,8 +7020,8 @@ class ArkAPLauncher(tk.Tk):
         # all/Uncheck all - see _on_mod_toggle/on_mods_check_all/on_mods_uncheck_all)
         # only ever edits in-memory intent - Save (or Download checked) is what
         # actually writes ActiveMods.
-        self.mods_save_btn_halo = tk.Frame(btns, background=self.theme["warn_bg"],
-                                           highlightbackground=self.theme["warn_border"],
+        self.mods_save_btn_halo = tk.Frame(btns, background=self.theme["bg"],
+                                           highlightbackground=self.theme["bg"],
                                            highlightthickness=1)
         self.mods_save_btn_halo.pack(fill="x", pady=2)
         self.mods_save_btn = ttk.Button(self.mods_save_btn_halo, text="Save",
@@ -4028,6 +7043,15 @@ class ArkAPLauncher(tk.Tk):
         self.mods_add_btn = _add_btn(
             "Add mod...", self.on_mods_add,
             "Add a raw Workshop mod ID not in the supported list above.", gated=False)
+        # Not gated - a rename is pure display state in the config, so it works with no
+        # server set. Enabled/disabled by selection in _update_mods_button_states.
+        self.mods_rename_btn = _add_btn(
+            "Rename mod...", self.on_mods_rename,
+            "Give the selected user-added mod a readable name instead of its raw "
+            "Workshop ID. Cosmetic only - the ID, install state, load order and "
+            "activation are unchanged, and the mod is still left out of the YAML copy "
+            "if it's unsupported. Supported mods keep their apworld names and can't be "
+            "renamed.", gated=False)
         self.mods_uninstall_btn = _add_btn(
             "Uninstall unchecked", self.on_mods_uninstall_unchecked,
             "Deletes the installed files for every mod that's currently unchecked, "
@@ -4043,10 +7067,14 @@ class ArkAPLauncher(tk.Tk):
         # Copy the checked IDs for pasting into the plugin's YAML. Not gated - it only
         # reads the checkbox state, and prepping a YAML doesn't require a server yet.
         self.mods_copy_ids_btn = _add_btn(
-            "Copy active IDs", self.on_mods_copy_active_ids,
+            "Copy IDs for YAML", self.on_mods_copy_active_ids,
             "Copy the IDs of every checked mod (in this list's top-to-bottom order) to "
             "the clipboard as a comma-separated list, ready to paste into the plugin's "
-            "YAML mod configuration. Includes unsupported/added mods if they're checked.",
+            "YAML mod configuration.\n"
+            "Only mods tagged \"apworld ✓\" are copied: the apworld rejects any ID it "
+            "doesn't ship engram data for, so a user-added ID in mod_ids fails generation "
+            "outright. Anything left out is named when you copy - those mods still "
+            "install and load on the server as normal.",
             gated=False)
         # Manual refresh - re-reads real install + active state from disk. Not gated: it
         # must work even with no server set (to show the all-red/unchecked truth).
@@ -4078,6 +7106,7 @@ class ArkAPLauncher(tk.Tk):
         self.mods_log.insert("end", line.rstrip("\n") + "\n")
         self.mods_log.see("end")
         self.mods_log.configure(state="disabled")
+        launcher_log(line, "Mods")  # downloads, installs, ActiveMods writes
 
     def _mods_gate_state(self):
         """(ok, server_root) - ok only if SERVER_ROOT is set AND the ARK server is
@@ -4150,12 +7179,21 @@ class ArkAPLauncher(tk.Tk):
         tk.Label(row, text=icon, background=row_bg, foreground=color, width=2
                  ).pack(side="left", padx=(0, 6))
 
-        name_text = mod["name"]
-        if not mod.get("supported", True):
-            name_text += "  [unsupported]"
-        name_fg = self.theme["fg"] if mod.get("supported", True) else self.theme["status_info"]
-        name_lbl = tk.Label(row, text=name_text, background=row_bg, foreground=name_fg,
-                             anchor="w")
+        # Apworld support, stated for BOTH states rather than tagging only the odd one out:
+        # an absent tag reads as "nothing special here", which is the wrong impression for
+        # exactly the mods "Copy IDs for YAML" leaves out of mod_ids. Sits next to the
+        # install icon so a glance down the list separates the two questions - is it on
+        # disk, and can it go in the YAML.
+        supported = mod.get("supported", True)
+        tag = "apworld %s" % self.STATUS_ICONS["ok" if supported else "fail"]
+        tk.Label(row, text=tag, background=row_bg,
+                 foreground=self.theme["status_ok"] if supported
+                 else self.theme["status_info"],
+                 width=10, anchor="w").pack(side="left", padx=(0, 6))
+
+        name_lbl = tk.Label(row, text=mod["name"], background=row_bg, anchor="w",
+                             foreground=self.theme["fg"] if supported
+                             else self.theme["status_info"])
         name_lbl.pack(side="left", fill="x", expand=True)
 
         id_lbl = tk.Label(row, text=mod["id"], background=row_bg,
@@ -4177,8 +7215,34 @@ class ArkAPLauncher(tk.Tk):
             b.configure(state="normal" if enabled else "disabled")
         self.mods_workshop_btn.configure(
             state="normal" if (has_selection and not busy) else "disabled")
+        # Same selection-only rule: left clickable for a supported mod so the handler can
+        # explain why that one can't be renamed, rather than greying out silently.
+        self.mods_rename_btn.configure(
+            state="normal" if (has_selection and not busy) else "disabled")
         self.mods_verify_btn.configure(
             state="normal" if (enabled and has_selection) else "disabled")
+        # Same rule as the other two Save buttons - lit only while there's something
+        # unapplied. This runs from _rebuild_mods_rows, i.e. after every toggle, Check
+        # all/Uncheck all, reorder, add, Refresh and Save. Cached in _mods_dirty_flag so
+        # the header hint can reuse the verdict instead of re-reading the .ini.
+        self._mods_dirty_flag = self._mods_dirty()
+        self._set_halo(self.mods_save_btn_halo, self._mods_dirty_flag)
+        self._update_save_hint()
+
+    def _mods_dirty(self):
+        """True when the checkboxes, as Save would apply them (checked AND installed, in
+        list order), don't match GameUserSettings.ini's ActiveMods.
+
+        Compared against disk rather than a remembered snapshot because that's the same
+        pair on_mods_save writes, so a toggle, a reorder, a Refresh, an external edit and
+        a Save all resolve correctly with no extra bookkeeping. Never dirty while gated -
+        Save is disabled then, and there is nothing to write."""
+        gate_ok, server_root = self._mods_gate_state()
+        if not gate_ok:
+            return False
+        want = [m["id"] for m in self._mods
+                if m.get("enabled") and check_mod_installed(server_root, m["id"])[0]]
+        return want != read_active_mods(server_root)
 
     def _move_mod(self, idx, direction):
         new_idx = idx + direction
@@ -4195,6 +7259,9 @@ class ArkAPLauncher(tk.Tk):
         mod["enabled"] = bool(var.get())
         self._mods_log_line("%s: %s (pending - click Save to apply)"
                             % (mod["name"], "checked" if mod["enabled"] else "unchecked"))
+        # The one mutation that doesn't redraw the rows (the checkbox already shows the new
+        # state), so it has to re-run the dirty check itself or the Save halo never lights.
+        self._update_mods_button_states()
 
     def on_mods_add(self):
         win = tk.Toplevel(self)
@@ -4364,6 +7431,50 @@ class ArkAPLauncher(tk.Tk):
         set_active_mods(server_root, active)
         self._refresh_mods_list()
 
+    def on_mods_rename(self):
+        mod = next((m for m in self._mods if m["id"] == self._mods_selected_id), None)
+        if not mod:
+            messagebox.showinfo("Rename mod", "Select a mod in the list first.")
+            return
+        if mod.get("supported", True):
+            messagebox.showinfo(
+                "Rename mod",
+                "\"%s\" is one of the mods the apworld knows by name, so its name stays "
+                "as-is. Only mods you added yourself (\"apworld ✗\") can be renamed."
+                % mod["name"])
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Rename mod")
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Display name for mod %s:" % mod["id"]).pack(anchor="w")
+        name_var = tk.StringVar(value=mod["name"])
+        entry = ttk.Entry(frm, textvariable=name_var, width=36)
+        entry.pack(anchor="w", pady=(2, 8))
+        entry.focus_set()
+        entry.select_range(0, "end")
+        ttk.Label(frm, foreground=self.theme["subtle_fg"], wraplength=320, justify="left",
+                  text="Display only - the mod's ID, install state, load order and "
+                       "activation don't change, and an unsupported mod is still left "
+                       "out of the YAML copy. Clear the box to show the raw ID."
+                  ).pack(anchor="w", pady=(0, 8))
+
+        def _submit():
+            rename_mod(mod, name_var.get())
+            self._save_mods_config()
+            self._mods_log_line("Renamed mod %s to \"%s\"." % (mod["id"], mod["name"]))
+            win.destroy()
+            self._refresh_mods_list()
+
+        btnrow = ttk.Frame(frm)
+        btnrow.pack(fill="x")
+        ttk.Button(btnrow, text="Rename", command=_submit).pack(side="right", padx=(4, 0))
+        ttk.Button(btnrow, text="Cancel", command=win.destroy).pack(side="right")
+        entry.bind("<Return>", lambda _e: _submit())
+
     def on_mods_open_workshop_page(self):
         mod = next((m for m in self._mods if m["id"] == self._mods_selected_id), None)
         if not mod:
@@ -4373,20 +7484,57 @@ class ArkAPLauncher(tk.Tk):
             "https://steamcommunity.com/sharedfiles/filedetails/?id=%s" % mod["id"])
 
     def on_mods_copy_active_ids(self):
-        # Every CHECKED mod's id, in the list's current top-to-bottom order (= load
-        # order), comma-separated - for pasting into the plugin's YAML. Install status
-        # is irrelevant here; this is "the IDs I currently have active", supported or not.
-        ids = [m["id"] for m in self._mods if m.get("enabled")]
-        if not ids:
-            messagebox.showinfo("Copy active IDs",
+        # Every CHECKED and SUPPORTED mod's id, in the list's current top-to-bottom order
+        # (= load order), comma-separated - for pasting into the yaml's mod_ids. Install
+        # status is irrelevant here; supported status is NOT (see split_copyable_mod_ids).
+        if not any(m.get("enabled") for m in self._mods):
+            messagebox.showinfo("Copy IDs for YAML",
                                 "No mods are checked - tick the mods you want in your YAML "
                                 "first, then copy.")
-            self._mods_log_line("Copy active IDs: nothing to copy (no mods checked).")
+            self._mods_log_line("Copy IDs for YAML: nothing to copy (no mods checked).")
             return
+        ids, excluded, conflicts = split_copyable_mod_ids(self._mods)
+        listed = "\n".join("  %s  (%s)" % (m["id"], m.get("name", "?")) for m in excluded)
+        if not ids:
+            # Copying "" would look like the button did nothing; say what happened instead.
+            messagebox.showwarning(
+                "Copy IDs for YAML",
+                "Nothing was copied: all %d checked mod(s) are user-added, and the "
+                "apworld only accepts mod IDs it ships engram data for.\n\n%s\n\nThey "
+                "still install and load on your server as normal ARK mods - they just "
+                "can't go in your YAML's mod_ids, which would fail generation with "
+                "\"mod_ids lists <id>, which this apworld doesn't know\"."
+                % (len(excluded), listed))
+            self._mods_log_line("Copy IDs for YAML: nothing copied - all %d checked mod(s) "
+                                "are unsupported by the apworld." % len(excluded))
+            return
+
         text = ", ".join(ids)
         self.clipboard_clear()
         self.clipboard_append(text)
         self._mods_log_line("Copied %d mod ID(s) for YAML: %s" % (len(ids), text))
+
+        notes = []
+        if excluded:
+            notes.append(
+                "%d unsupported mod ID(s) were left out - the apworld only accepts IDs it "
+                "ships engram data for, and including one fails generation with \"mod_ids "
+                "lists <id>, which this apworld doesn't know\":\n\n%s\n\nThey still "
+                "install and load on your server as normal ARK mods; mod_ids is the only "
+                "place they can't appear." % (len(excluded), listed))
+        for pair in conflicts:
+            notes.append(
+                "Heads up: %s are the same mod (Structures Plus and its fork Super "
+                "Structures). Both were copied, but the apworld rejects the pair - a "
+                "server can only load one. Delete whichever you don't have installed from "
+                "the pasted line." % " and ".join(pair))
+        if notes:
+            messagebox.showinfo("Copy IDs for YAML",
+                                "Copied %d mod ID(s):\n\n%s\n\n%s"
+                                % (len(ids), text, "\n\n".join(notes)))
+            self._mods_log_line("Copy IDs for YAML: excluded %d unsupported ID(s)%s."
+                                % (len(excluded),
+                                   "; alias conflict: %s" % conflicts if conflicts else ""))
 
     # ---- mod download/install worker (SteamCMD, streamed to the Mods log) ---------- #
     def _start_mods_worker(self, server_root, to_download, activate, force, title):
@@ -4485,7 +7633,7 @@ class ArkAPLauncher(tk.Tk):
         ttk.Label(wrap, foreground=self.theme["subtle_fg"], wraplength=640, justify="left",
                   text="Read-only check of common setup steps, based on the current "
                        "Configuration tab paths and the files on disk. Nothing here is "
-                       "changed automatically - use Configuration / Server Install to fix "
+                       "changed automatically - use Configuration / Install Server/Api/Plugin to fix "
                        "a ✗."
                   ).pack(anchor="w", pady=(4, 8))
 
@@ -4528,7 +7676,7 @@ class ArkAPLauncher(tk.Tk):
             "label": "ARK dedicated server installed",
             "state": "ok" if ok else "fail",
             "detail": detail,
-            "hint": "Set SERVER_ROOT on the Configuration tab, then Server Install -> "
+            "hint": "Set SERVER_ROOT on the Configuration tab, then Install Server/Api/Plugin -> "
                     "Install ARK Server.",
         })
 
@@ -4537,7 +7685,7 @@ class ArkAPLauncher(tk.Tk):
             "label": "ArkApi installed",
             "state": "ok" if ok else "fail",
             "detail": detail,
-            "hint": "Server Install -> Install ArkServerApi (needs the ARK server "
+            "hint": "Install Server/Api/Plugin -> Install ArkServerApi (needs the ARK server "
                     "installed first).",
         })
 
@@ -4579,7 +7727,7 @@ class ArkAPLauncher(tk.Tk):
             "label": "ArkAP plugin installed",
             "state": "ok" if ok else "fail",
             "detail": detail,
-            "hint": "Server Install -> Install Plugin.",
+            "hint": "Install Server/Api/Plugin -> Install Plugin.",
         })
 
         ok, detail = check_plugin_mode(plugin_dir)
@@ -4589,6 +7737,42 @@ class ArkAPLauncher(tk.Tk):
             "detail": detail,
             "hint": "Set \"mode\": \"ap\" in ArkAP.config.json for real multiworld play "
                     "(\"offline\" self-randomizes locally for solo hook testing).",
+        })
+
+        # Its own row rather than folding into the per-mod icons: a corrupt <id>.mod is
+        # not "mod missing", it's "the server will crash on startup", and it can be left
+        # by a mod this launcher doesn't even have in its list.
+        broken = find_broken_mod_files(self.get("SERVER_ROOT"))
+        items.append({
+            "label": "No corrupt .mod files in Content\\Mods",
+            "state": "fail" if broken else "ok",
+            "detail": ("; ".join("%s - %s" % (os.path.basename(p), why) for p, why in broken)
+                       if broken else "Every <id>.mod file present is intact."),
+            "hint": "A corrupt .mod file crashes the ARK server on startup (\"Invalid "
+                    "BufferCount=0\") instead of just skipping the mod. The launcher "
+                    "deletes these automatically at startup - hit Re-check, then "
+                    "re-download the mod from the Mods tab. If it stays listed, the file "
+                    "is locked (is the server running?) - delete it by hand.",
+        })
+
+        # The Mods tab shows intent; GameUserSettings.ini is what the server reads. Nothing
+        # else in the app notices when the two drift apart (see check_active_mods_match).
+        ok, detail = check_active_mods_match(self.get("SERVER_ROOT"), self._mods)
+        items.append({
+            "label": "Mods tab matches ActiveMods on disk",
+            "state": "ok" if ok else "fail",
+            "detail": detail,
+            "hint": "The server reads its mod list from GameUserSettings.ini's ActiveMods, "
+                    "and Save is what writes the ticks there. Ticked but not in ActiveMods "
+                    "means it was never saved, so it never loads, and a yaml whose mod_ids "
+                    "name it then expects engrams that aren't in the world. In ActiveMods "
+                    "but not ticked means the server is already loading it while the tab "
+                    "(and \"Copy IDs for YAML\") pretends it's off. Either way the tab is "
+                    "what wins: tick the mods you actually want - Refresh re-reads disk if "
+                    "it's the ticks that are wrong - then Mods tab -> Save writes that list "
+                    "over ActiveMods (its Save button is highlighted whenever there's "
+                    "something to write); \"Download checked\" installs anything missing "
+                    "and saves in one go. Restart the ARK server afterwards.",
         })
 
         ok, detail = check_scripts_sourced(self._scripts_dir)
@@ -4603,6 +7787,31 @@ class ArkAPLauncher(tk.Tk):
                     "folder and reopen - the current version is unpacked from the exe.",
         })
 
+        # The SAME comparison Quick Launch makes before running the .bat (_preflight_bat),
+        # surfaced up front instead of only on the click that gets refused: the fields are
+        # compared against what is actually written in the file, so a value typed but never
+        # Saved reads as unsaved even though the field on screen looks right.
+        missing, unsaved, absent = self._preflight_bat("start_ase_server.bat")
+        parts = []
+        if missing:
+            parts.append("not set: %s" % ", ".join(missing))
+        if unsaved:
+            parts.append("typed but not saved (the file still holds the old value): %s"
+                         % ", ".join("%s in %s" % (key, fname) for key, fname in unsaved))
+        if absent:
+            parts.append("missing from the scripts folder: %s" % ", ".join(absent))
+        items.append({
+            "label": "Configuration is saved into the server scripts",
+            "state": "fail" if parts else "ok",
+            "detail": ("; ".join(parts) if parts else
+                       "paths.cmd and start_ase_server.bat hold the current field values."),
+            "hint": "start_ase_server.bat reads its settings from paths.cmd, and Save is "
+                    "what writes them there. Anything typed but not yet saved is missing "
+                    "from the file, so Quick Launch refuses to start the server rather "
+                    "than running against stale paths. Fix: Configuration tab -> Save (its "
+                    "Save button is highlighted whenever there's something to write).",
+        })
+
         # Reads the FILE, not the Connector fields. The in-game integrated connector is
         # the primary way to connect - connector.ini only matters for the optional
         # standalone Python connector fallback, so a missing/incomplete file is an
@@ -4610,19 +7819,19 @@ class ArkAPLauncher(tk.Tk):
         # fail state (see aggregate_status_state).
         ini_path = self.get("connector_ini")
         ok, detail = check_connector_filled(ini_path)
+        if not ini_path:
+            state, detail = "ok", "Not configured - using the in-game integrated connector."
+        else:
+            state = "ok" if ok else "info"
         items.append({
             "label": "connector.ini filled in (optional standalone connector fallback only)",
-            "state": "ok" if ok else "info",
+            "state": state,
             "detail": detail,
-            "hint": ("Only needed if you use the standalone Python connector instead of "
-                     "the in-game integrated connector. Point \"connector.ini file\" in "
-                     "the Configuration tab's Locations group at your ArkConnector's "
-                     "connector.ini, then fill in server/slot/ipc_dir in the Connector "
-                     "group and Save."
-                     if not (ini_path and os.path.isfile(ini_path)) else
-                     "Fill in server / slot / ipc_dir in the Connector group on the "
-                     "Configuration tab, then Save - only needed for the standalone "
-                     "connector fallback."),
+            "hint": "" if state == "ok" else
+                    ("Point \"connector.ini file\" in the Configuration tab's Locations group "
+                     "at your ArkConnector's connector.ini, then fill in server/slot on the "
+                     "Archipelago Setup tab and ipc_dir in the Configuration tab's "
+                     "\"Plugin files & DeathLink\" group, and Save."),
         })
 
         # Component/launcher version rows (yellow "i" when newer, green check for the
@@ -4726,6 +7935,8 @@ class ArkAPLauncher(tk.Tk):
         self._start_component_version_check()
 
     def _on_tab_changed(self, _event=None):
+        # Leaving the tab the easter-egg track started on kills it, permanently.
+        self._stop_egg_music()
         try:
             current = self.notebook.select()
         except tk.TclError:
@@ -4736,6 +7947,14 @@ class ArkAPLauncher(tk.Tk):
             self._update_profile_status()
         elif current == str(self.tab_mods):
             self._refresh_mods_tab()
+        elif current == str(self.tab_debug):
+            # Logs grow while the app and the server run - re-read on entry so the tab
+            # isn't showing whatever was on disk at startup.
+            self._refresh_debug_log()
+        elif current == str(self.tab_archipelago):
+            # Re-stat on entry: Archipelago may have been installed, moved or
+            # uninstalled since the tab was last looked at.
+            self._refresh_archipelago_buttons()
 
     # ----------------------------------------------------- Diagnostics export #
     def _redacted_config_json(self):
@@ -4748,11 +7967,102 @@ class ArkAPLauncher(tk.Tk):
             return "(could not read %s: %s)" % (self.config_path, exc)
         return json.dumps(redact_config(data), indent=2)
 
+    def _mods_diagnostics(self):
+        """(summary_text, session_log_text) for the diagnostics zip. Install state is
+        re-read from disk here rather than trusting the row icons, so the export is
+        accurate even if the Mods tab was never opened this session."""
+        server_root = self.get("SERVER_ROOT")
+        installed = {str(m.get("id")) for m in self._mods
+                     if is_mod_installed(server_root, m.get("id"))}
+        summary = format_mods_summary(self._mods, installed, server_root)
+        try:
+            log_text = self.mods_log.get("1.0", "end").strip()
+        except (AttributeError, tk.TclError):
+            log_text = ""
+        return summary, log_text or "(the Mods tab logged nothing this session)"
+
+    def _diagnostics_entries(self):
+        """[(name_in_zip, text)] for the whole export.
+
+        Every entry is TEXT, which is what lets one redaction pass cover the entire
+        bundle (see export_diagnostics). Files are read rather than zf.write()n for the
+        same reason - and so the big logs can be truncated on the way through."""
+        cfg = self._read_config_dict()
+        server_root = self.get("SERVER_ROOT")
+        config_dir = self._server_config_dir()
+        plugin_dir = self._arkap_plugin_dir()
+        arch_dir = self.get(ARCHIPELAGO_DIR_KEY)
+        mods_summary, mods_log = self._mods_diagnostics()
+        yamls, yaml_note = find_player_yamls(arch_dir, self.get("slot"))
+
+        entries = [
+            ("setup_status.txt", format_setup_status_summary(self._gather_setup_status())),
+            ("versions.txt", format_version_block(cfg)),
+            ("arkap_launcher_config.redacted.json", self._redacted_config_json()),
+            ("mods_status.txt", mods_summary),
+            ("mods_output_log.txt", mods_log),
+            ("archipelago_yaml_search.txt", yaml_note),
+            ("listing_ipc.txt", format_dir_listing(self._ipc_dir(), "ipc folder")),
+            ("listing_content_mods.txt", format_dir_listing(
+                os.path.join(os.path.normpath(server_root), "ShooterGame", "Content", "Mods")
+                if server_root else "", "ARK ShooterGame\\Content\\Mods folder")),
+        ]
+
+        # Config/log files, each as (name in the zip, where it lives). A blank path means
+        # "we can't work out where it would be" - read_for_diagnostics says so in the file
+        # rather than leaving a silent hole.
+        srv = os.path.normpath(server_root) if server_root else ""
+        for name, path in [
+                ("ArkAP_debug.log", self._arkap_debug_log_path()),
+                # The launcher's own activity log - what this app actually did, in order,
+                # with timestamps. Usually the first file worth reading.
+                (LAUNCHER_LOG_FILENAME, launcher_log_path()),
+                (CRASH_LOG_FILENAME, crash_log_path()),
+                ("paths.cmd", os.path.join(self._scripts_dir, "paths.cmd")
+                 if self._scripts_dir else ""),
+                ("Game.ini", os.path.join(config_dir, "Game.ini") if config_dir else ""),
+                ("GameUserSettings.ini",
+                 os.path.join(config_dir, "GameUserSettings.ini") if config_dir else ""),
+                ("ArkAP.config.json",
+                 os.path.join(plugin_dir, "ArkAP.config.json") if plugin_dir else ""),
+                ("ShooterGame.log",
+                 os.path.join(srv, "ShooterGame", "Saved", "Logs", "ShooterGame.log")
+                 if srv else ""),
+                # host.yaml decides the port a locally hosted room actually listens on
+                # (see archipelago_host_port) - the other half of every "I can't connect".
+                ("host.yaml", os.path.join(os.path.normpath(arch_dir), "host.yaml")
+                 if arch_dir else "")]:
+            entries.append((name, read_for_diagnostics(path)))
+
+        # SteamCMD's own logs. What it prints to stdout (already in the install log, and so
+        # in the launcher log) is a fraction of what these record - the rest is what
+        # explains a mod download that reported success and wrote nothing. Grouped under
+        # steamcmd/ like ipc/, and absent on a --onefile build that hasn't downloaded
+        # anything this run: the bundle folder is re-extracted per run (see resource_dir).
+        for name in ("console_log.txt", "workshop_log.txt", "content_log.txt"):
+            entries.append(("steamcmd/" + name,
+                            read_for_diagnostics(os.path.join(steamcmd_dir(), "logs", name))))
+
+        for path in yamls:
+            entries.append(("players_yaml/" + os.path.basename(path),
+                            read_for_diagnostics(path)))
+        # The ipc files themselves, on top of the listing above - see collect_ipc_entries.
+        entries.extend(collect_ipc_entries(self._ipc_dir()))
+        return entries
+
     def export_diagnostics(self):
-        """Bundle the debug log, a Setup Status summary, a redacted config copy, and the
-        crash log (if any) into one zip the user can drag straight into Discord. Secrets
-        (ADMINPASS / SERVERPASS / connector password) are replaced with [REDACTED] - the
-        rest of the config is kept so it's still useful for troubleshooting."""
+        """Bundle everything a helper would otherwise have to ask for - Setup Status,
+        component versions, the redacted config, Mods state + log, the user's Archipelago
+        yaml, paths.cmd, Game.ini / GameUserSettings.ini, ArkAP.config.json, the debug,
+        launcher, crash, ShooterGame and SteamCMD logs - every log the Debug Log tab can
+        show - the contents of ipc\\ (including the per-player mailbox
+        subfolders), and listings of ipc\\ and Content\\Mods - into one zip the user can drag
+        straight into Discord.
+
+        Redaction is ONE pass over the finished bundle rather than a redactor per file:
+        paths.cmd holds ADMINPASS/SERVERPASS since the single-source-of-truth refactor,
+        GameUserSettings.ini holds ServerAdminPassword/ServerPassword, and a yaml can
+        hold a room password - a per-file approach silently misses each new one."""
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         initial_dir = desktop if os.path.isdir(desktop) else base_dir()
         default_name = "arkap_diagnostics_%s.zip" % time.strftime("%Y%m%d_%H%M%S")
@@ -4763,37 +8073,28 @@ class ArkAPLauncher(tk.Tk):
         if not dest:
             return
 
-        # Gather text pieces first so a read error surfaces before we open the zip.
-        summary = format_setup_status_summary(self._gather_setup_status())
-        redacted = self._redacted_config_json()
-        debug_path = self._arkap_debug_log_path()
-        crash_path = crash_log_path()
-        included = []
+        # Gather everything first so a read error surfaces before we open the zip.
+        entries = self._diagnostics_entries()
         try:
             with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("setup_status.txt", summary)
-                zf.writestr("arkap_launcher_config.redacted.json", redacted)
-                if debug_path and os.path.isfile(debug_path):
-                    zf.write(debug_path, "ArkAP_debug.log")
-                    included.append("ArkAP_debug.log")
-                else:
-                    zf.writestr("ArkAP_debug.log.txt",
-                                "(no ArkAP_debug.log found - expected at %s)"
-                                % (debug_path or "unknown; set SERVER_ROOT/PLUGINS_DIR"))
-                if os.path.isfile(crash_path):
-                    zf.write(crash_path, CRASH_LOG_FILENAME)
-                    included.append(CRASH_LOG_FILENAME)
+                for name, text in entries:
+                    zf.writestr(name, redact_text(text))
         except OSError as exc:
             messagebox.showerror("Export diagnostics",
                                  "Could not write the diagnostics zip:\n\n%s" % exc)
             return
 
-        extra = (" It also includes: %s." % ", ".join(included)) if included else ""
+        size_kb = max(1, os.path.getsize(dest) // 1024)
         messagebox.showinfo(
             "Export diagnostics",
-            "Diagnostics saved to:\n\n%s\n\nIt contains a Setup Status summary and a "
-            "redacted copy of your config (passwords removed).%s\n\nDrag this file into "
-            "Discord or attach it to a GitHub issue when asking for help." % (dest, extra))
+            "Diagnostics saved to:\n\n%s\n\n%d files, %d KB. It contains your Setup "
+            "Status, component versions, config, Archipelago yaml, server config files, "
+            "logs, the contents of the ipc folder and folder listings. Every password in "
+            "every file is replaced with %s; long logs are cut to their last %d lines and "
+            "the ipc files to their last %d.\n\nDrag this file into "
+            "Discord or attach it to a GitHub issue when asking for help."
+            % (dest, len(entries), size_kb, REDACT_MARKER, DIAG_MAX_LINES,
+               DIAG_IPC_MAX_LINES))
         try:
             os.startfile(os.path.dirname(dest))  # noqa: S606 - open the folder in Explorer
         except OSError:
@@ -4801,16 +8102,36 @@ class ArkAPLauncher(tk.Tk):
 
     # ------------------------------------------------------------ Debug Log #
     def _build_debug_log_tab(self, parent):
-        """ArkAP debug log viewer - relocated here from the bottom of the
-        Configuration tab (was under the Quick launch buttons). Same widgets,
-        same handlers (_refresh_debug_log / _jump_debug_log_latest /
-        _highlight_debug_log_search), just given a whole tab instead of a
-        cramped LabelFrame."""
+        """Log viewer - one text pane showing whichever log the dropdown selects.
+
+        A dropdown rather than a second row of sub-tabs: the tab already has a
+        control row (Search / Jump to latest / Refresh) with room in it, a nested
+        ttk.Notebook inside the main one reads as two tab bars stacked, and the
+        Profiles tab already picks from a list this exact way. The search box,
+        "Jump to latest" and "Refresh" all act on the selected log - there is only
+        ever one text widget (self.debug_log_text), so the in-app search and the
+        theme switcher keep working unchanged."""
         wrap = ttk.Frame(parent, padding=(10, 8))
         wrap.pack(fill="both", expand=True)
 
-        dbg = ttk.LabelFrame(wrap, text="ArkAP Debug Log", padding=(8, 6))
+        dbg = ttk.LabelFrame(wrap, text="Logs", padding=(8, 6))
         dbg.pack(fill="both", expand=True)
+
+        selrow = ttk.Frame(dbg)
+        selrow.pack(fill="x", pady=(0, 6))
+        ttk.Label(selrow, text="Log:").pack(side="left")
+        self.debug_log_source_var = tk.StringVar(value=LOG_SOURCES[0][0])
+        source_combo = ttk.Combobox(selrow, textvariable=self.debug_log_source_var,
+                                     state="readonly", width=42,
+                                     values=[label for label, _key in LOG_SOURCES])
+        source_combo.pack(side="left", padx=(6, 8))
+        source_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_debug_log())
+        Tooltip(source_combo,
+                "Which log to show below. The plugin log is ArkAP's own; the launcher "
+                "log is what this app did (installs, scans, saves, resets, mod "
+                "downloads); the crash log holds launcher tracebacks; ShooterGame.log is "
+                "ARK's, where LowLevelFatalError crashes land; the SteamCMD logs cover "
+                "downloads. Very large logs load only their newest part.")
         dbgtop = ttk.Frame(dbg)
         dbgtop.pack(fill="x")
         ttk.Label(dbgtop, text="Search:").pack(side="left")
@@ -4825,8 +8146,8 @@ class ArkAPLauncher(tk.Tk):
         Tooltip(jump_btn, "Scroll to the bottom of the log (the most recent lines).")
         refresh_btn = ttk.Button(dbgtop, text="Refresh", command=self._refresh_debug_log)
         refresh_btn.pack(side="left")
-        Tooltip(refresh_btn, "Re-read ArkAP_debug.log from disk - it changes while the "
-                             "server runs, so this isn't automatic.")
+        Tooltip(refresh_btn, "Re-read the selected log from disk - logs change while the "
+                             "server and the launcher run, so this isn't automatic.")
 
         dbgbody = ttk.Frame(dbg)
         dbgbody.pack(fill="both", expand=True, pady=(4, 0))
@@ -4938,60 +8259,65 @@ class ArkAPLauncher(tk.Tk):
                 "new profile\" or \"Update selected profile\".")
 
     def _build_instructions_tab(self, parent):
+        """One tab, two guides. Quick Guide (default) and Full Guide are each built as
+        their own Text widget by _build_instruction_text, then stacked in `body` with
+        only one packed at a time - _toggle_instructions_mode swaps which one is packed
+        rather than rebuilding either, so collapse/expand state in the hidden guide
+        survives a switch."""
         wrap = ttk.Frame(parent, padding=(10, 8))
         wrap.pack(fill="both", expand=True)
 
         toolbar = ttk.Frame(wrap)
         toolbar.pack(fill="x", pady=(0, 4))
         # One pair, both levels: "Collapse all" folds every section heading AND every step
-        # (flattening the tab to just headings); "Expand all" opens both back up fully.
+        # (flattening the guide to just headings); "Expand all" opens both back up fully.
+        # Acts on whichever guide is currently showing.
         ttk.Button(toolbar, text="Expand all",
-                   command=lambda: self._set_all_instructions(False)).pack(side="left")
+                   command=lambda: self._set_all_instructions(
+                       False, self._active_instructions_text())).pack(side="left")
         ttk.Button(toolbar, text="Collapse all",
-                   command=lambda: self._set_all_instructions(True)
+                   command=lambda: self._set_all_instructions(
+                       True, self._active_instructions_text())
                    ).pack(side="left", padx=(6, 0))
+        # Labeled with the guide a click switches TO, never the one currently showing.
+        self.instructions_mode_btn = ttk.Button(toolbar, text="Full Guide",
+                                                 command=self._toggle_instructions_mode)
+        self.instructions_mode_btn.pack(side="right")
+        Tooltip(self.instructions_mode_btn,
+                "Quick Guide is the short version. Full Guide has every detail and "
+                "caveat. Switching keeps each guide's own collapsed/expanded sections.")
 
-        txt = tk.Text(wrap, wrap="word", font=("Segoe UI", 9), borderwidth=0,
-                       highlightthickness=0, padx=10, pady=8, cursor="arrow",
-                       background=self.theme["text_bg"], foreground=self.theme["text_fg"],
-                       insertbackground=self.theme["text_fg"])
-        vsb = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
-
-        txt.tag_configure("h1", font=("Segoe UI", 12, "bold"), spacing1=10, spacing3=4)
-        txt.tag_configure("body", font=("Segoe UI", 9), spacing3=2, lmargin1=2, lmargin2=2)
-        txt.tag_configure("bullet", font=("Segoe UI", 9), spacing1=1, lmargin1=18, lmargin2=32)
-        # Blank line between numbered steps - a small font keeps it a gap rather
-        # than a full empty body line.
-        txt.tag_configure("step_gap", font=("Segoe UI", 4))
+        body = ttk.Frame(wrap)
+        body.pack(fill="both", expand=True)
 
         # (tag, text) pairs - kept short and skimmable, referencing this app's actual
         # tab/button/group names rather than a generic reprint of the GitHub README.
-        content = [
+        full_content = [
 
-            ("bullet", "Pro tip: most options have tooltips if you hover over them!"),
+            ("bullet", "Pro tip: most options have tooltips, just hover over one."),
             ("bullet", "Pro tip: the Search bar (top left) searches field labels, tooltips, "
                        "and text across every tab - press Enter, then use Find Next / Find "
                        "Prev to jump between matches."),
             ("bullet", "THIS LAUNCHER WILL NEVER TOUCH YOUR ACTUAL ARK DOWNLOAD LOCATION PLEASE DONT SET ANY PATH TO IT, i beg you"),
 
-            ("bullet", "Pro tip: everything in this tab collapses and expands. Try it out by "
-                       "clicking the box beside each header, or just use the collapse and expand all buttons"),
+            ("bullet", "Pro tip: everything here collapses and expands. Click the box "
+                       "beside a header, or use the Expand all / Collapse all buttons."),
 
             ("h1", "Start here - install in this order"),
             ("bullet", "The three installs below must happen in order: the ARK server "
                        "first, then ArkServerApi into it, then the ArkAP plugin into "
                        "ArkApi. Each one needs the previous one to already exist. All "
-                       "three live on the Server Install tab."),
+                       "three live on the Install Server/Api/Plugin tab."),
 
-            ("bullet", "1. Server Install tab -> set SERVER_ROOT (the folder the server "
+            ("bullet", "1. Install Server/Api/Plugin tab -> set SERVER_ROOT (the folder the server "
                        "gets installed into), then click \"Install ARK Server\". This "
                        "downloads ~18gb via SteamCMD - progress shows in the console box "
                        "below the buttons, and \"Cancel\" stops it if you need to. Note: "
                        "make sure your ARK: Survival Evolved game is on the preaquatica "
                        "branch, or you won't be able to join."),
+            ("bullet", "   You can install the server anywhere you like - it doesn't have "
+                       "to be a special location. A short path near the top of a drive, "
+                       "like C:\\ark\\, keeps things simple and avoids very long paths."),
             ("bullet", "   If it fails with exit code 8, just click Install again - it "
                        "usually works on the second try."),
             ("bullet", "   When it finishes, the cluster folders (CLUSTERDIR / SAVESROOT / "
@@ -5007,12 +8333,17 @@ class ArkAPLauncher(tk.Tk):
                        "Folders that already exist are left untouched, and a path you "
                        "set yourself is created where you put it rather than moved."),
 
-            ("bullet", "2. Server install tab -> click \"Install ArkServerApi\". This downloads the "
+            ("bullet", "2. Install Server/Api/Plugin tab -> click \"Install ArkServerApi\". This downloads the "
                        "latest ArkApi release and extracts it into "
                        "ShooterGame\\Binaries\\Win64 for you - no manual unzipping. When "
                        "it's done, Win64 contains version.dll and an ArkApi\\ folder. "
                        "Note: BattlEye must be OFF for ArkApi to work, but "
                        "start_ase_server already disables it for you - We gotchu fam."),
+            ("bullet", "   Your own ARK: Survival Evolved game also needs BattlEye off to "
+                       "connect - that's separate from the server side above, which "
+                       "start_ase_server already handles for you. In Steam, right-click "
+                       "ARK: Survival Evolved -> Properties -> Launch Options, and add "
+                       "-NoBattlEye."),
 
             ("bullet", "3. Same tab -> in the \"Install/update ArkAP Plugin\" box, click \"Install "
                        "Plugin\". It downloads the latest ArkAP_Plugin.zip straight from "
@@ -5023,7 +8354,7 @@ class ArkAPLauncher(tk.Tk):
                        "\"Manual downloads\" at the bottom of the tab instead.)"),
 
             ("bullet", "4. Configuration tab -> in the Paths group, click \"Scan for "
-                       "paths\", or Browse to set paths by hand. "                      
+                       "paths\", or Browse to set paths by hand. "
                        "if SERVER_ROOT isn't set yet, or "
                        "doesn't look right, it finds it for you first (Steam libraries, "
                        "common drive roots), then automatically scans around it for "
@@ -5037,6 +8368,14 @@ class ArkAPLauncher(tk.Tk):
                        "scan on its own, filling in PLUGINS_DIR / ipc_dir / game_ini and "
                        "possibly suggesting CLUSTERDIR / SAVESROOT / BACKUPROOT. These are "
                        "typically correct - it's recommended to accept them."),
+            ("bullet", "   Scan for paths shows its suggestions in a popup - nothing is "
+                       "filled in until you click the suggested option there. If a "
+                       "suggestion looks clearly wrong, close the popup and use Browse to "
+                       "set that path by hand instead."),
+            ("bullet", "   A scan that turns up a lot of candidate folders gives you a "
+                       "scrollable popup rather than a list running off the bottom of the "
+                       "screen, so use the scrollbar or your mouse wheel to reach the "
+                       "suggestions further down."),
             ("bullet", "   If something wasn't found, pick a higher \"Scan intensity\" "
                        "in the dropdown to the left of the button (it's chosen before you "
                        "scan) and click \"Scan for paths\" again. Quick only checks the "
@@ -5053,43 +8392,123 @@ class ArkAPLauncher(tk.Tk):
                        "connector fallback, ignore it unless you're using that instead of "
                        "the in-game integrated connector). Anything showing an X has a hint "
                        "telling you what to fix. This is the fastest way to catch a missed "
-                       "step before you start troubleshooting in-game."),
+                       "step before you start troubleshooting in-game. A yellow \"i\" "
+                       "anywhere in the app is advisory only, and is typically nothing to "
+                       "worry about."),
+            ("bullet", "   Two of the rows there catch mistakes that only show up much "
+                       "later, so come back to this tab after any change: "
+                       "\"Configuration is saved into the server scripts\" (a field you "
+                       "typed but never Saved isn't in paths.cmd, so Quick Launch will "
+                       "refuse to start the server) and \"Mods tab matches ActiveMods on "
+                       "disk\" (a mod ticked but never Saved never loads on the server). "
+                       "Both are red X rows with the button that fixes them named in the "
+                       "hint."),
 
             ("bullet", "6. Generate the Archipelago room. This guide won't explain how "
                        "YAMLs and Archipelago work - this isn't a beginner-friendly "
                        "Archipelago setup. Just remember to set up your yaml, remember your "
                        "yaml name, and drop the .apworld into Archipelago's custom worlds. "),
+            ("bullet", "   The Archipelago Setup tab does all of this without leaving the "
+                       "launcher: set (or \"Scan for Archipelago\") your Archipelago "
+                       "directory, then \"Update .apworld\" to fetch the latest %s "
+                       "straight into custom_worlds (no manual download - your old copy "
+                       "is backed up, not overwritten), and \"Open Options Creator (YAML)\" "
+                       "to build your yaml - inside it, click \"Export Options\" in the "
+                       "top right and save it into the Players folder inside your "
+                       "Archipelago directory (\"Open Players folder\" opens that folder "
+                       "for you). Then \"Generate seed\" builds the multiworld; once it "
+                       "finishes, \"Open output folder\" is where the generated seed .zip "
+                       "lands." % APWORLD_ASSET_NAME),
 
-            ("bullet", "7. Configuration tab -> fill in the Connector settings (server, "
-                       "slot, password) with your Archipelago room info. Your slot must "
-                       "match the name in your yaml exactly, including capitalisation. "
-                       "Copy the connection command - this is what you'll paste in-game."),
+            ("bullet", "   Now you need a room to actually host that seed. There are two "
+                       "ways, and they are alternatives - pick ONE, don't do both:"),
+            ("bullet", "   (a) archipelago.gg - upload the generated .zip to the website "
+                       "and it hosts the room for you. Nothing to keep running on your PC, "
+                       "no router setup, and it gives you the server address to put in "
+                       "step 7. This is the easier path and what most people do."),
+            ("bullet", "   (b) Host it yourself - \"Host local Archipelago server\" in the "
+                       "Launch section runs Archipelago's own server on this PC. It asks "
+                       "which generated seed to open (offering the newest one from your "
+                       "output folder), then opens it in its own console window. That "
+                       "window IS the room: its output appears there, it's where you type "
+                       "commands like /send, and closing it ends the room. It also offers "
+                       "to fill the server field in step 7 with your local address, so "
+                       "there's nothing to copy by hand."),
+            ("bullet", "   Optional, and only if you want a live map of your checks: the "
+                       "\"PopTracker (tracker)\" group on the same tab sets up PopTracker "
+                       "and the %s in one click (\"Download PopTracker\" if you haven't got "
+                       "it, otherwise point the directory field at your copy and click "
+                       "\"Install/update %s\"). It changes nothing about the server or the "
+                       "seed - see the Archipelago Setup entry under \"What each tab "
+                       "does\" below." % (TRACKER_PACK_LABEL, TRACKER_PACK_LABEL)),
+
+            ("bullet", "   The catch with (b) is reachability. You connect to your own "
+                       "room at localhost, but everybody else connects to YOUR public IP "
+                       "address - and for anyone outside your home network that only works "
+                       "if you forward the Archipelago port (default %d, TCP) to this PC "
+                       "in your router's settings. Other players in your own house need "
+                       "no forwarding. If port forwarding isn't something you want to deal "
+                       "with, use archipelago.gg." % ARCHIPELAGO_DEFAULT_PORT),
+            ("bullet", "   Hosting locally uses the port from Archipelago's own host.yaml "
+                       "(and the password from the field in step 7, if you set one). "
+                       "Change the port there, not on the command line, if you need a "
+                       "different one."),
+
+            ("bullet", "7. Archipelago Setup tab -> in the \"Archipelago room (Connector "
+                       "settings)\" group, fill in server, slot and password with your "
+                       "Archipelago room info. (These used to be on the Configuration tab - "
+                       "they moved here, next to the Archipelago tooling that uses them.) "
+                       "Your slot must match the name in your yaml exactly, including "
+                       "capitalisation. Then click \"Copy ARK connection command\" - that's "
+                       "what you'll paste in-game."),
+            ("bullet", "   If you hosted locally in step 6, server is already filled in for "
+                       "you (it asks first if you'd already typed something there). You "
+                       "still set slot yourself - the launcher can't know which yaml in "
+                       "the seed is yours."),
+            ("bullet", "   The command is built in the form: /connect server slotname "
+                       "password - server FIRST, then your slot name, then the password. "
+                       "If your room has no password the command simply ends after the "
+                       "slot name. (The in-game command order changed - if you have an old "
+                       "one written down that starts with your slot name, it won't work.)"),
+            ("bullet", "   You don't have to paste anything into the Archipelago Text "
+                       "Client, though: \"Open Text Client\" on this same tab opens it "
+                       "already connected using these fields."),
 
             ("bullet", "8. Quick Launch -> \"Run start_ase_server\" to launch the server. "
                        "It can take a few minutes depending on your SSD/HDD speed. Confirm "
                        "in the console that the plugin has loaded (or check the Debug Log "
                        "tab for the LOAD line)."),
+            ("bullet", "   Wait for the console window to finish printing its startup "
+                       "messages - the scrolling settles down - before assuming something's "
+                       "wrong. Don't click inside the console window while it's starting."),
+            ("bullet", "   If the console window's title bar starts with the word "
+                       "\"Select\", the console has frozen - a normal Windows quirk from "
+                       "clicking or dragging inside it. Press Enter to unfreeze it."),
 
             ("bullet", "9. In ARK: Survival Evolved, go to LAN and look for your session "
                        "name (default: ArchipelagoSolo). Join, spawn your character, open "
                        "in-game chat, and paste the connection command from step 7."),
 
-            ("bullet", "10. You should be good to go! (if randomize dino spawns enabled see bottom of instuctions)Quick test: level up and see if a "
+            ("bullet", "10. You should be good to go! (If you enabled randomized dino "
+                       "spawns, see the bottom of these instructions.) "
+                       "Quick test: level up and see if a "
                        "check goes out. To test check-in: in the host's server console (the "
                        "ArchipelagoServer window, or the web room's command box) run "
-                       "/send ARCHIPELAGONAME Engram: Canteen - within a few seconds it "
+                       "/send ARCHIPELAGONAME Engram: Compass - within a few seconds it "
                        "should unlock in your engrams. If not, uh oh "),
 
             ("bullet", "Any issues: check the Debug Log tab first, then the Discord or "
                        "GitHub to search for or report them."),
 
             ("h1", "What each tab does"),
-            ("bullet", "Configuration - every Locations / Paths / Network / Connector / "
-                       "Cluster field, the Quick Launch buttons, and Save / Reload from "
-                       "files. The Paths group also holds \"Scan intensity\" + \"Scan for "
-                       "paths\" (all path detection in one button) and \"Create "
-                       "ServerCluster folders\"."),
-            ("bullet", "Server Install - the three installers, in order: \"Install ARK "
+            ("bullet", "Listed in tab order, left to right."),
+            ("bullet", "Configuration - every Locations / Paths / Network / Plugin files & "
+                       "DeathLink / Cluster field, the Quick Launch buttons, and Save / "
+                       "Reload from files. The Paths group also holds \"Scan intensity\" + "
+                       "\"Scan for paths\" (all path detection in one button) and \"Create "
+                       "ServerCluster folders\". Note: server / slot / password are no "
+                       "longer here - they're on the Archipelago Setup tab."),
+            ("bullet", "Install Server/Api/Plugin - the three installers, in order: \"Install ARK "
                        "Server\" (SteamCMD, ~18gb), \"Install ArkServerApi\" (downloads + "
                        "extracts the latest ArkApi into Win64), and \"Install Plugin\" "
                        "(downloads the latest ArkAP_Plugin.zip from GitHub and installs it "
@@ -5097,30 +8516,137 @@ class ArkAPLauncher(tk.Tk):
                        "fallback if an automated download fails (or you want a specific "
                        "older plugin version), plus the ArkConnector, which still needs "
                        "downloading by hand."),
-            ("bullet", "Setup Status - a read-only checklist (server installed / ArkApi "
-                       "installed / plugin installed / plugin mode) with hints for "
-                       "anything showing an X. Click Re-check after fixing something. It "
+            ("bullet", "Archipelago Setup - a built-in quick launcher for your own "
+                       "Archipelago installation (the separate app that hosts the room and "
+                       "builds the yaml), plus the Connector settings that used to live on "
+                       "the Configuration tab."),
+            ("bullet", "   \"Archipelago installation\" group - the Archipelago directory "
+                       "field with Browse, and the \"Scan for Archipelago\" button "
+                       "directly under it (they're grouped together so setting the folder "
+                       "and finding it are one thing). Default install location is %s. "
+                       "The scan checks the common locations first and only falls back to "
+                       "a wider drive scan if none match, so the usual case is instant. A "
+                       "folder is only accepted if it contains all of %s - a half-copied "
+                       "or unrelated folder is never taken."
+                       % (ARCHIPELAGO_DEFAULT_DIR, ", ".join(ARCHIPELAGO_REQUIRED_EXES))),
+            ("bullet", "   \"Archipelago room (Connector settings)\" group - server, slot "
+                       "and password, moved here from the Configuration tab because they "
+                       "describe your Archipelago room rather than your ARK server, along "
+                       "with the \"Copy ARK connection command\" and \"Copy port\" buttons "
+                       "that use them. They're still saved, still written to connector.ini, "
+                       "and still included in Profiles exactly as before - only their "
+                       "location in the app changed."),
+            ("bullet", "   The whole tab persists between sessions: the Archipelago "
+                       "directory, server, slot and password are all saved with your "
+                       "config and travel with your profiles, so the tab comes back "
+                       "exactly as you left it. It has its own Save button, which lights "
+                       "up only when one of those four fields has been changed."),
+            ("bullet", "   \"Launch\" group - \"Open Text Client\", \"Open Options Creator "
+                       "(YAML)\", \"Generate seed\" and \"Open Archipelago Launcher\" (a "
+                       "general entry point to everything else Archipelago ships). A note "
+                       "at the top of the group points out that Open Text Client fills in "
+                       "your room details automatically, and that these apps can take a "
+                       "couple of seconds to appear - that's normal, not a hang. Each "
+                       "button greys out if the Archipelago directory isn't set or that "
+                       "particular .exe is missing, and its tooltip says which."),
+            ("bullet", "   \"Folders\" group - shortcuts to custom_worlds (where the "
+                       ".apworld goes), Players (where your yaml goes), output (where a "
+                       "generated seed lands), and the Archipelago folder itself. A "
+                       "missing folder is created rather than reported as an error."),
+            ("bullet", "   \"ARK world (.apworld)\" group at the bottom - \"Update "
+                       ".apworld\" downloads the latest %s from this project's GitHub "
+                       "releases straight into custom_worlds, so you never have to "
+                       "download and drag it in by hand. If a copy is already there it's "
+                       "renamed to a timestamped .bak first rather than deleted, so "
+                       "rolling back is just a rename. Restart Archipelago afterwards for "
+                       "it to be picked up." % APWORLD_ASSET_NAME),
+            ("bullet", "   \"PopTracker (tracker)\" group - optional, and entirely "
+                       "separate from playing: PopTracker is a third-party app that shows "
+                       "your checks and items on a map as you play, following the "
+                       "multiworld automatically. It lives on this tab because it's "
+                       "Archipelago tooling, not ARK server tooling."),
+            ("bullet", "   There are two ways in, and you only need one. If you already "
+                       "have PopTracker, point the \"PopTracker directory\" field at it "
+                       "(Browse, or \"Scan for PopTracker\") - that's the folder holding "
+                       "%s. If you don't, click \"Download PopTracker\": you pick where it "
+                       "should go, and the launcher downloads the latest stable Windows "
+                       "build, extracts it there, fills the field in for you, and installs "
+                       "the ARK tracker pack into it in the same click. PopTracker is "
+                       "~17 MB on its own, which is why it isn't bundled with the launcher."
+                       % POPTRACKER_EXE),
+            ("bullet", "   \"Install/update %s\" downloads the pack from its own GitHub "
+                       "repository (%s) and puts it in PopTracker's \"%s\" folder. Any copy "
+                       "already there is MOVED into a timestamped folder under "
+                       "\"%s\" next to it, not deleted and not left inside %s - PopTracker "
+                       "treats every folder in there as a pack, so a backup sitting beside "
+                       "the new one would show up in its Load list as a second, older copy "
+                       "of the same tracker."
+                       % (TRACKER_PACK_LABEL, TRACKER_PACK_RELEASES_PAGE,
+                          POPTRACKER_PACKS_DIRNAME, TRACKER_PACK_BACKUP_DIRNAME,
+                          POPTRACKER_PACKS_DIRNAME)),
+            ("bullet", "   \"Open PopTracker\" launches it already loaded onto the ARK "
+                       "pack - no picking a pack inside it."),
+            ("bullet", "   Connecting it to your room is automatic only on PopTracker %s or "
+                       "newer, which is where its command-line room arguments were added. "
+                       "An older build - including the current stable one, and therefore "
+                       "the one \"Download PopTracker\" fetches - refuses to START when "
+                       "given them, so the launcher doesn't pretend: it copies your room "
+                       "address to the clipboard and tells you once where to paste it. In "
+                       "PopTracker, click the grey \"AP\" in the top row, paste the host "
+                       "and port, then enter your slot and password. It remembers the host "
+                       "and slot for next time; the password it never stores."
+                       % POPTRACKER_AP_ARGS_MIN_VERSION),
+            ("bullet", "   That is a genuine limit of PopTracker, not something missing "
+                       "here - the same situation as Archipelago's Options Creator further "
+                       "up. There is no settings file to fill in either: PopTracker does "
+                       "remember a host and slot, but only as the defaults for that dialog "
+                       "(nothing connects from them), and the password isn't stored "
+                       "anywhere at all. Loading the pack, which is the part that can be "
+                       "automated, is automated."),
+            ("bullet", "   All three buttons grey out with the reason on their tooltip when "
+                       "the PopTracker directory isn't set (\"Download PopTracker\" "
+                       "deliberately doesn't - it's the one you press when nothing is set "
+                       "yet), and the line beside the scan button always says where you "
+                       "stand: no directory, folder found but no %s, or PopTracker found "
+                       "with the tracker pack version that's installed. The directory is "
+                       "saved with your config and travels with your profiles like every "
+                       "other field on this tab - click Save after setting it."
+                       % POPTRACKER_EXE),
+            ("bullet", "   One limitation worth knowing: the Options Creator cannot be "
+                       "opened straight onto ARK: Survival Evolved. It takes no "
+                       "command-line arguments at all, so the button just opens it and you "
+                       "pick ARK from its own game list. That's a limit of Archipelago, not "
+                       "something this launcher is missing."),
+            ("bullet", "Mods - download and activate Steam Workshop mods for the server "
+                       "(see the \"Mods (Steam Workshop)\" section below)."),
+            ("bullet", "Setup Status - a read-only checklist with hints for anything "
+                       "showing an X. It covers the three installs and the plugin mode, "
+                       "the cluster folders, the .mod files in Content\\Mods, and the two "
+                       "things that go quietly out of step as you work: whether your "
+                       "Configuration fields have actually been written out to the server "
+                       "scripts, and whether the Mods tab agrees with the ActiveMods line "
+                       "the server really reads. Click Re-check after fixing something. It "
                        "also shows advisory rows (a yellow \"i\", not a red X) for things "
                        "that are worth knowing but aren't broken - the BattlEye note, "
                        "connector.ini status (only relevant if you use the optional "
                        "standalone connector instead of the in-game integrated one), and "
                        "\"update available\" when a newer ArkServerApi or ArkAP plugin "
                        "release exists than the one you installed (with a link to the "
-                       "release). None of these are failures, so they never show an X."),
+                       "release). None of these are failures, so they never show an X. "
+                       "These advisory rows are typically nothing to worry about."),
             ("bullet", "   The Setup Status tab has a small coloured symbol next to its "
                        "name in the tab bar, so you can see your overall status from any "
                        "tab without opening it: a green check = everything passes, a "
                        "yellow \"i\" = no failures but at least one advisory (BattlEye, or "
                        "a newer component version), a red X = at least one hard failure. "
-                       "It updates whenever the checks re-run."),
-            ("bullet", "Debug Log - live view of ArkAP_debug.log with a search box, "
-                       "\"Jump to latest\", and \"Refresh\". Check here first when checks "
-                       "or items aren't coming through."),
+                       "It updates whenever the checks re-run. A yellow \"i\" is advisory "
+                       "only, and is typically nothing to worry about."),
             ("bullet", "Profiles - save/load named snapshots of every Configuration field "
-                       "(e.g. \"Solo Test\" vs \"Friend Group Run\") plus a free-text notes "
-                       "box, stored separately from your live config. Loading a profile "
-                       "only fills in the Configuration fields - it never saves/applies by "
-                       "itself, so press Save on the Configuration tab afterward."),
+                       "plus the Archipelago Setup room fields (e.g. \"Solo Test\" vs "
+                       "\"Friend Group Run\") plus a free-text notes box, stored separately "
+                       "from your live config. Loading a profile only fills the fields in - "
+                       "it never saves/applies by itself, so press Save on the "
+                       "Configuration tab afterward."),
             ("bullet", "   On first run a profile named \"%s\" is created from your "
                        "starting Configuration values and loaded straight away, so your "
                        "settings are backed by a real profile from the very beginning "
@@ -5131,9 +8657,93 @@ class ArkAPLauncher(tk.Tk):
                        "always holds only the newest snapshot, never touches the "
                        "profiles you save yourself, and can't be renamed or updated by "
                        "hand - load it if you ever need to get recent settings back."),
-            ("bullet", "Instructions - this tab."),
-            ("bullet", "Mods - download and activate Steam Workshop mods for the server "
-                       "(see the \"Mods (Steam Workshop)\" section below)."),
+            ("bullet", "Debug Log - a viewer for every log that matters, with a search "
+                       "box, \"Jump to latest\", and \"Refresh\". Pick which log with the "
+                       "\"Log:\" dropdown at the top; the search box and both buttons act "
+                       "on whichever one is showing. Check here first when checks or "
+                       "items aren't coming through."),
+            ("bullet", "   ArkAP plugin log (ArkAP_debug.log) - the plugin's own log, "
+                       "written inside your ArkApi\\Plugins\\ArkAP folder while the server "
+                       "runs. This is the one to read when checks or items aren't moving "
+                       "between ARK and Archipelago."),
+            ("bullet", "   Launcher log (%s) - what this app itself did, timestamped and "
+                       "kept across restarts: server / ArkApi / plugin / .apworld / "
+                       "tracker installs and updates, path scans and what they found, "
+                       "saves and what changed, ServerCluster folder creation, resets and "
+                       "their verification, mod downloads and ActiveMods writes, Game.ini "
+                       "patches and uploads, and every error the app showed you. It sits "
+                       "next to arkap_launcher_config.json, is appended to rather than "
+                       "overwritten, and is capped in size so it can't grow forever."
+                       % LAUNCHER_LOG_FILENAME),
+            ("bullet", "   Launcher crash log (%s) - the full traceback from any "
+                       "unexpected launcher error. Missing until something goes wrong, "
+                       "which is exactly as it should be." % CRASH_LOG_FILENAME),
+            ("bullet", "   ARK server log (ShooterGame.log) - ARK's own log, from "
+                       "<SERVER_ROOT>\\ShooterGame\\Saved\\Logs. This is where a "
+                       "LowLevelFatalError server crash lands; search for that word."),
+            ("bullet", "   SteamCMD console / workshop / content logs - what SteamCMD "
+                       "itself recorded while downloading the server or a mod. Worth a "
+                       "look when a mod download fails or finishes suspiciously fast."),
+            ("bullet", "   A log that doesn't exist yet (no crashes, the server never "
+                       "installed) says so and explains why, rather than showing an empty "
+                       "box. Very large logs - ShooterGame.log usually is - load only "
+                       "their newest part, with a line at the top saying so, so switching "
+                       "to one doesn't hang the app."),
+            ("bullet", "Instructions - this tab, with a Quick Guide and this Full Guide. "
+                       "Switch between them with the button in the top right."),
+
+            ("h1", "Saving, and what a highlighted Save button means"),
+            ("bullet", "Save buttons light up in a yellow halo only while something on "
+                       "screen differs from what is already written to disk. A highlighted "
+                       "Save button is a reliable signal that you have unsaved changes; a "
+                       "plain one means the fields and the files already agree, and "
+                       "pressing it would change nothing."),
+            ("bullet", "There are three of them, and each lights up only for its own "
+                       "fields: Configuration (every path, port and cluster field), "
+                       "Archipelago Setup (the directory plus server / slot / password), "
+                       "and Mods (which mods are ticked, and their order). Editing a path "
+                       "therefore never lights up a tab you haven't touched. A short "
+                       "reminder also appears above the tab strip while anything anywhere "
+                       "is unsaved."),
+            ("bullet", "Saving matters more than it looks, because nothing else in the app "
+                       "reads your typed values. The .bat scripts read paths.cmd, the "
+                       "server reads GameUserSettings.ini, and Save is what puts your "
+                       "values into those files. Until then the old values are still in "
+                       "there, doing exactly what they did before."),
+            ("bullet", "Two safety nets catch it if you forget. Run start_ase_server "
+                       "compares every field against what is really in paths.cmd and "
+                       "refuses to launch rather than starting the server on stale paths. "
+                       "And the Setup Status tab shows both cases as red X rows up front: "
+                       "\"Configuration is saved into the server scripts\" and \"Mods tab "
+                       "matches ActiveMods on disk\"."),
+
+            ("h1", "Check for Updates (top of the window)"),
+            ("bullet", "The button tracks four components: the launcher itself, the ArkAP "
+                       "plugin, the .apworld, and the %s. All four are compared against "
+                       "their latest GitHub releases (the tracker pack's own repo is a "
+                       "different one from the plugin's, and is only compared once you've "
+                       "set a PopTracker directory for it to look in)." % TRACKER_PACK_LABEL),
+            ("bullet", "The check also runs by itself every time the launcher starts, "
+                       "quietly in the background. Anything it can't reach is left out "
+                       "silently rather than shown as an error, so a machine with no "
+                       "internet never gets nagged."),
+            ("bullet", "When something newer exists the button gets a small marker and is "
+                       "highlighted, using the same halo as the Save buttons. The "
+                       "highlight clears once you have clicked through and seen that "
+                       "particular release. Each component is tracked separately, so "
+                       "clicking through a plugin update never dismisses an .apworld "
+                       "update you haven't seen yet."),
+            ("bullet", "The dialog lists each component with the version you have and the "
+                       "version available. The launcher can update itself in place; the "
+                       "other three each name the button that installs them "
+                       "(\"Install Plugin\" on the Install Server/Api/Plugin tab, and "
+                       "\"Update .apworld\" / \"Install/update %s\" on the Archipelago "
+                       "Setup tab). A version that "
+                       "couldn't be worked out is spelled out as such, so a blank line "
+                       "never gets mistaken for \"up to date\"." % TRACKER_PACK_LABEL),
+            ("bullet", "The same lookups feed the \"update available\" advisory rows on "
+                       "Setup Status, so the button and that tab can never disagree about "
+                       "what the latest release is."),
 
             ("h1", "Mods (Steam Workshop)"),
             ("bullet", "The Mods tab downloads Steam Workshop mods with the bundled "
@@ -5156,6 +8766,14 @@ class ArkAPLauncher(tk.Tk):
                        "that checked/unchecked mixture into GameUserSettings.ini's "
                        "ActiveMods. A checked mod that isn't installed yet is left inactive "
                        "and flagged in the log - Download checked installs it first."),
+            ("bullet", "   Setup Status carries a \"Mods tab matches ActiveMods on disk\" "
+                       "row for exactly this: it reads the ActiveMods line back off disk "
+                       "and compares it against your ticks, order included (order is load "
+                       "priority, so a reordered list is a different setup), and shows a "
+                       "red X naming the mods that differ - by name and ID, and which way "
+                       "round: ticked but unsaved (the server never loads it), active but "
+                       "not ticked (the server loads it anyway), or ticked but never "
+                       "downloaded."),
             ("bullet", "Download checked - downloads every checked-but-not-installed mod, "
                        "then activates the checked set (applies right away, same as Save). "
                        "Check all / Uncheck all (above the list) - tick or untick every "
@@ -5165,14 +8783,29 @@ class ArkAPLauncher(tk.Tk):
                        "space. Verify/Redownload - re-fetches a selected mod if it looks "
                        "corrupt. Restart the ARK server after any of these for it to take "
                        "effect."),
-            ("bullet", "Copy active IDs - copies every checked mod's ID to the clipboard as "
+            ("bullet", "Every row is tagged \"apworld ✓\" or \"apworld ✗\" next to "
+                       "its install icon. Two different questions: the icon is whether the "
+                       "mod is on disk, the tag is whether the .apworld knows it. Only "
+                       "\"apworld ✓\" mods can appear in your YAML's mod_ids."),
+            ("bullet", "Rename mod... - a mod you added yourself shows up as its raw "
+                       "Workshop ID; select it and rename it to something you'll "
+                       "recognise. Display only, and it sticks across restarts and "
+                       "profile loads. \"apworld ✓\" mods keep their real names."),
+            ("bullet", "Copy IDs for YAML - copies your checked mods' IDs to the clipboard as "
                        "a comma-separated list, in the list's top-to-bottom order, ready to "
-                       "paste into the plugin's YAML mod configuration. It copies whatever "
-                       "you have checked (supported or not), so what you see in the list is "
-                       "exactly what gets pasted."),
+                       "paste into the plugin's YAML mod configuration. Only the "
+                       "\"apworld ✓\" ones are copied: the apworld only accepts IDs it "
+                       "ships engram data for, and one it doesn't know fails generation "
+                       "outright (\"mod_ids lists <id>, which this apworld doesn't know\"). "
+                       "Anything left out is listed for you when you copy, and if nothing "
+                       "is copyable the launcher says so rather than copying an empty "
+                       "line."),
+            ("bullet", "Leaving an ID out of mod_ids doesn't disable the mod - it still "
+                       "downloads, still goes into ActiveMods, still loads on the server. "
+                       "It just gets no Archipelago engrams or checks."),
             ("bullet", "Add mod - adds a raw Workshop ID that isn't in the supported list. "
                        "Only the pre-populated (supported) mods are known to integrate with "
-                       "the plugin's checks/items; an added mod is tagged \"unsupported\" "
+                       "the plugin's checks/items; an added mod is tagged \"apworld ✗\" "
                        "and may just run as a normal ARK mod with no Archipelago "
                        "integration."),
 
@@ -5183,12 +8816,14 @@ class ArkAPLauncher(tk.Tk):
                        "automatically and centering the match on screen."),
 
             ("h1", "Quick launch (bottom of the Configuration tab)"),
-            ("bullet", "Open ipc folder / Open Plugins folder / Open Game.ini folder / "
-                       "Open SERVER_ROOT / Open ClusterDir folder - open the matching "
-                       "folder in Explorer."),
+            ("bullet", "The buttons are ordered by how often they get used - the top row is "
+                       "the everyday four, the rest follow below."),
             ("bullet", "Run start_ase_server - launches the main ARK server."),
-            ("bullet", "Run switch_map - swaps the active map (optionally backing up "
-                       "first)."),
+            ("bullet", "Open SERVER_ROOT / Open Game.ini folder / Open ipc folder / Open "
+                       "Plugins folder / Open ClusterDir folder - open the matching folder "
+                       "in Explorer."),
+            ("bullet", "Run switch_map - currently unsupported, so don't rely on it "
+                       "working yet."),
             ("bullet", "Patch Game.ini for randomized creatures - applies the plugin's "
                        "ipc\\game_ini_fragment.txt into your Game.ini (backed up first) so "
                        "randomized creatures take effect. Stop the ARK server first."),
@@ -5237,23 +8872,77 @@ class ArkAPLauncher(tk.Tk):
                        "MAP / SESSION / MAXPLAYERS / ports / TRIBUTEEXP write only into "
                        "start_ase_server.bat, since those are per-script settings."),
             ("bullet", "Connector fields also write into connector.ini, for the optional "
-                       "standalone connector fallback - server/slot/password additionally "
-                       "feed the in-game \"Copy ARK connection command\" button, which is "
-                       "what the normal in-game integrated connector flow uses."),
+                       "standalone connector fallback. That's still all seven of them - "
+                       "server / slot / password (now on the Archipelago Setup tab) and "
+                       "death_link / ipc_dir / data_dir / game_ini (Configuration tab, "
+                       "\"Plugin files & DeathLink\" group). Splitting them across two tabs "
+                       "changed nothing about what gets written or where."),
+            ("bullet", "server / slot / password additionally feed the \"Copy ARK "
+                       "connection command\" button (/connect server slotname password) "
+                       "and the \"Open Text Client\" button, which passes them straight to "
+                       "Archipelago's text client so it opens already connected."),
+            ("bullet", "The Archipelago directory field is the one path here that feeds "
+                       "nothing on disk - no .bat, no .ini. It only tells the launcher "
+                       "where your Archipelago install is so the Archipelago Setup tab's "
+                       "buttons know what to open, and where custom_worlds is for "
+                       "\"Update .apworld\". It is saved with your config and profiles "
+                       "like everything else."),
+            ("bullet", "The PopTracker directory is the same kind of field: nothing on "
+                       "disk reads it, it just tells the launcher which PopTracker to open "
+                       "and which \"%s\" folder the %s belongs in. Also saved with your "
+                       "config and profiles."
+                       % (POPTRACKER_PACKS_DIRNAME, TRACKER_PACK_LABEL)),
             ("bullet", "Save only rewrites the one matching line for each field in each "
                        "file - everything else in the script is left untouched."),
 
             ("h1", "Reporting a problem (diagnostics & crash log)"),
             ("bullet", "Export diagnostics - a button next to Save / Reload on the "
-                       "Configuration tab. It bundles ArkAP_debug.log, a text summary of "
-                       "the Setup Status checks, a copy of your config with the passwords "
-                       "removed (ADMINPASS, SERVERPASS and the connector password show as "
-                       "[REDACTED] - everything else is kept so it's still useful), and "
-                       "the crash log if there is one, into a single .zip. It saves to "
-                       "your Desktop by default (you pick where) and opens the folder when "
-                       "it's done. Drag that zip straight into Discord or attach it to a "
-                       "GitHub issue when asking for help - it's the fastest way to get "
-                       "diagnosed."),
+                       "Configuration tab. It bundles everything someone helping you "
+                       "would otherwise have to ask for, one question at a time, into a "
+                       "single .zip. It saves to your Desktop by default (you pick where) "
+                       "and opens the folder when it's done. Drag that zip straight into "
+                       "Discord or attach it to a GitHub issue - it's the fastest way to "
+                       "get diagnosed."),
+            ("bullet", "What's in the zip: a text summary of the Setup Status checks; a "
+                       "versions file (launcher, ArkAP plugin, .apworld, the %s and "
+                       "ArkServerApi in one place); your config; your Archipelago .yaml, "
+                       "found by "
+                       "reading Archipelago's Players folder and matching the name inside "
+                       "each file against your slot (so the filename doesn't matter); "
+                       "Archipelago's host.yaml; paths.cmd; Game.ini and "
+                       "GameUserSettings.ini from your server's "
+                       "WindowsServer config folder; the plugin's ArkAP.config.json; "
+                       "ArkAP_debug.log; the launcher's own activity log "
+                       "(arkipelago_launcher.log - usually the most useful single file, since "
+                       "it's a timestamped record of everything the app did); ARK's own "
+                       "ShooterGame.log; the crash log if "
+                       "there is one; SteamCMD's own console / workshop / content logs "
+                       "under steamcmd\\ (what it recorded while downloading, which is "
+                       "more than it printed on screen); your Mods tab state and output "
+                       "log; the contents of "
+                       "the whole ipc folder (session.json, state.json, the jsonl "
+                       "exchanges, flags.json, game_ini_fragment.txt and the per-player "
+                       "ipc\\<CharacterName> mailboxes a multiplayer server creates), kept "
+                       "under an ipc\\ folder in the zip so it's obvious where each file "
+                       "came from; and a listing "
+                       "of the ipc folder and ShooterGame\\Content\\Mods showing each "
+                       "file's size and date (a 0-byte .mod file crashes the server and "
+                       "there is no other way to spot it - which is why the listing stays "
+                       "even though the files themselves are now included)."
+                       % TRACKER_PACK_LABEL),
+            ("bullet", "Passwords are removed from every file in the zip, not just the "
+                       "config - ADMINPASS and SERVERPASS in paths.cmd, "
+                       "ServerAdminPassword / ServerPassword / SpectatorPassword in "
+                       "GameUserSettings.ini, and any room password in your yaml all show "
+                       "as [REDACTED]. The setting name stays visible so the file still "
+                       "reads normally; everything that isn't a password is kept as-is."),
+            ("bullet", "If a log is huge (ShooterGame.log usually is), only its last "
+                       "5000 lines go in, with a line at the top saying it was cut - the "
+                       "error is nearly always at the end, and this keeps the zip small "
+                       "enough to upload. The ipc files are cut the same way at 500 lines, "
+                       "since they grow for as long as you play. If a file can't be found, "
+                       "the zip says where it was looked for instead of leaving it out "
+                       "silently."),
             ("bullet", "Crash log - if the launcher ever hits an unexpected error it shows "
                        "a \"Something went wrong\" message and writes the full details to "
                        "arkap_launcher_crash.log, saved next to the launcher's .exe (the "
@@ -5262,7 +8951,8 @@ class ArkAPLauncher(tk.Tk):
                        "grow forever), so it survives even if the app crashes again before "
                        "you get to report the first one. When reporting a crash, attach "
                        "that file - or just use \"Export diagnostics\", which already "
-                       "includes it."),
+                       "includes it. You can also read it without leaving the app: Debug "
+                       "Log tab, \"Log:\" dropdown, \"Launcher crash log\"."),
 
             ("h1", "Other Information"),
             ("bullet", "If you want to restart your world for a new Archipelago seed, "
@@ -5276,9 +8966,326 @@ class ArkAPLauncher(tk.Tk):
                        "duplicating it) - no more copy-pasting it by hand. Restart the "
                        "server afterwards. (The fragment only exists once you've connected "
                        "to the server at least once on a randomized seed.)"),
-        
-         
+
         ]
+
+        quick_content = [
+            ("bullet", "This is a simplified version of the Instructions. It is being "
+                       "tested to see if it's easier to follow. The full version is "
+                       "available by pressing Full Guide in the top right."),
+            ("bullet", "Most options have tooltips, just hover over one."),
+            ("bullet", "Use the Search bar at the top left to find anything in the app."),
+            ("bullet", "THIS LAUNCHER WILL NEVER TOUCH YOUR ACTUAL ARK DOWNLOAD LOCATION "
+                       "PLEASE DONT SET ANY PATH TO YOUR ARK GAME INSTALL, i beg you"),
+            ("bullet", "Click the box beside a header to collapse or expand it. The Expand "
+                       "all and Collapse all buttons do the whole guide."),
+
+            ("h1", "Start here - install in this order"),
+            ("bullet", "Do these steps in order. Each step needs the one before it."),
+
+            ("bullet", "1. Open the Install Server/Api/Plugin tab. Set SERVER_ROOT. Click "
+                       "\"Install ARK Server\"."),
+            ("bullet", "   You can install it anywhere. A short path near the top of a "
+                       "drive, like C:\\ark\\, keeps things simple."),
+            ("bullet", "   The download is about 18gb. Progress shows in the console box. "
+                       "Wait for it to finish."),
+            ("bullet", "   Set your ARK: Survival Evolved game to the preaquatica branch. "
+                       "You cannot join the server otherwise."),
+            ("bullet", "   The cluster folders are created and filled in for you when it "
+                       "finishes. Go to the Configuration tab and click Save."),
+
+            ("bullet", "2. Stay on the Install Server/Api/Plugin tab. Click \"Install "
+                       "ArkServerApi\". Wait for it to finish."),
+            ("bullet", "   Your ARK game also needs BattlEye off. In Steam, right-click "
+                       "ARK: Survival Evolved, open Properties, then Launch Options, and "
+                       "add -NoBattlEye."),
+
+            ("bullet", "3. Stay on the same tab. Find the \"Install/update ArkAP Plugin\" "
+                       "box. Click \"Install Plugin\". Wait for it to finish."),
+
+            ("bullet", "4. Open the Configuration tab. In the Paths group, click \"Scan for "
+                       "paths\". Accept the paths it fills in. Click Save."),
+            ("bullet", "   SERVER_ROOT is the folder that contains ShooterGame."),
+            ("bullet", "   The scan shows its suggestions in a popup. Click a suggestion to "
+                       "accept it. If one looks wrong, close the popup and use Browse to "
+                       "set that path yourself."),
+            ("bullet", "   The popup scrolls if the scan found a lot of folders. Use the "
+                       "scrollbar or your mouse wheel."),
+
+            ("bullet", "5. Open the Setup Status tab. Click Re-check."),
+            ("bullet", "   Every row should show a green checkmark before you carry on."),
+            ("bullet", "   A yellow \"i\" is advisory only and is typically nothing to "
+                       "worry about. A red X tells you what to fix."),
+            ("bullet", "   Come back here after any change. It also checks that your "
+                       "settings were saved into the server scripts, and that your ticked "
+                       "mods match what the server will really load."),
+
+            ("bullet", "6. Set up your Archipelago room. This guide assumes you already know "
+                       "how Archipelago and YAMLs work."),
+            ("bullet", "   Open the Archipelago Setup tab. Set your Archipelago directory, "
+                       "or click \"Scan for Archipelago\"."),
+            ("bullet", "   Click \"Update .apworld\" to install %s." % APWORLD_ASSET_NAME),
+            ("bullet", "   Click \"Open Options Creator (YAML)\" to build your yaml. Pick "
+                       "ARK from its game list."),
+            ("bullet", "   Click \"Export Options\" in the top right of the Options "
+                       "Creator to save your yaml."),
+            ("bullet", "   Write down your slot name. You need it in step 7."),
+            ("bullet", "   Click \"Open Players folder\" and put your yaml in there."),
+            ("bullet", "   Click \"Generate seed\"."),
+            ("bullet", "   Click \"Open output folder\" to find your generated seed."),
+
+            ("bullet", "   Now host that seed. Two options - pick one, not both."),
+            ("bullet", "   Option A: upload the .zip to archipelago.gg and let the website "
+                       "host it. Easiest. It gives you the server address for step 7."),
+            ("bullet", "   Option B: click \"Host local Archipelago server\" to host it on "
+                       "this PC. Pick the seed when it asks. It opens in its own console "
+                       "window - leave that window open, closing it ends the room."),
+            ("bullet", "   Option B fills in the server field for you, so step 7 is just "
+                       "your slot name. It asks first if you had already typed something "
+                       "there."),
+            ("bullet", "   Option B uses your room password from step 7, and the port from "
+                       "Archipelago's own host.yaml. Change the port there if you need a "
+                       "different one."),
+            ("bullet", "   Option B warning: other players connect to your IP, not "
+                       "localhost. Anyone outside your home network needs you to forward "
+                       "port %d (TCP) to this PC on your router. Use archipelago.gg if "
+                       "that sounds like a hassle." % ARCHIPELAGO_DEFAULT_PORT),
+
+            ("bullet", "   Optional: a live tracker map. In the \"PopTracker (tracker)\" "
+                       "group on the same tab, click \"Download PopTracker\" and pick a "
+                       "folder. It downloads PopTracker, installs the %s into it, and "
+                       "fills in the directory for you. Click Save."
+                       % TRACKER_PACK_LABEL),
+            ("bullet", "   Already have PopTracker? Set the \"PopTracker directory\" (or "
+                       "click \"Scan for PopTracker\") and click \"Install/update %s\" "
+                       "instead. Your old copy of the pack is moved aside."
+                       % TRACKER_PACK_LABEL),
+            ("bullet", "   Click \"Open PopTracker\" to open it on the ARK map."),
+            ("bullet", "   PopTracker can't be opened already connected (that needs "
+                       "PopTracker %s, which isn't out yet). Your room address is copied to "
+                       "your clipboard instead."
+                       % POPTRACKER_AP_ARGS_MIN_VERSION),
+            ("bullet", "   In PopTracker, click the grey \"AP\", paste the address with "
+                       "Ctrl+V, then type your slot and password. It remembers them for "
+                       "next time, apart from the password."),
+
+            ("bullet", "7. Stay on the Archipelago Setup tab. Find the \"Archipelago room "
+                       "(Connector settings)\" group. Fill in server, slot and password."),
+            ("bullet", "   Type your slot name exactly as it appears in your yaml. Capital "
+                       "letters matter."),
+            ("bullet", "   Click \"Copy ARK connection command\". You paste this in-game "
+                       "later."),
+            ("bullet", "   Click \"Open Text Client\" to open the Archipelago text client "
+                       "already connected."),
+
+            ("bullet", "8. Open the Configuration tab. Under Quick Launch, click \"Run "
+                       "start_ase_server\"."),
+            ("bullet", "   Wait for the console to finish printing its startup messages "
+                       "before assuming something's wrong. Don't click inside the console "
+                       "window while it's starting."),
+            ("bullet", "   If the console's title bar starts with \"Select\", it has "
+                       "frozen. Press Enter to unfreeze it."),
+
+            ("bullet", "9. Start ARK: Survival Evolved. Open the LAN server list. Join your "
+                       "session. The default name is ArchipelagoSolo."),
+            ("bullet", "   Spawn your character. Open in-game chat. Paste the command from "
+                       "step 7."),
+
+            ("bullet", "10. You are done. Level up once to send your first check."),
+            ("bullet", "   To test items, run /send ARCHIPELAGONAME Engram: Compass in your "
+                       "Archipelago server console. The engram should unlock within a few "
+                       "seconds."),
+            ("bullet", "   Randomized dinos need one extra step. See \"Other information\" "
+                       "below."),
+
+            ("h1", "What each tab does"),
+            ("bullet", "Configuration - all your settings, the Quick Launch buttons, and "
+                       "Save."),
+            ("bullet", "Install Server/Api/Plugin - the three installers, in order."),
+            ("bullet", "Archipelago Setup - your Archipelago folder, your room details, and "
+                       "buttons that open Archipelago's own tools."),
+            ("bullet", "   It remembers every field between sessions, and they travel "
+                       "with your profiles. The tab has its own Save button."),
+            ("bullet", "   The \"PopTracker (tracker)\" group at the bottom is optional: it "
+                       "sets up the PopTracker app and the ARK tracker pack, and opens the "
+                       "tracker on the ARK map."),
+            ("bullet", "Mods - download and turn on Steam Workshop mods."),
+            ("bullet", "Setup Status - a checklist of your setup. Click Re-check after you "
+                       "fix something."),
+            ("bullet", "Profiles - save and load named copies of your settings. Click Save "
+                       "on the Configuration tab after you load one."),
+            ("bullet", "Debug Log - a viewer for your logs. The \"Log:\" dropdown at the "
+                       "top picks which one: the ArkAP plugin's log, the launcher's own "
+                       "log of what it did, the launcher crash log, ARK's ShooterGame.log "
+                       "(where server crashes land), or SteamCMD's download logs. Search, "
+                       "\"Jump to latest\" and \"Refresh\" work on whichever is showing, "
+                       "and a log that doesn't exist yet says so."),
+            ("bullet", "Instructions - this tab. Use the button in the top right to switch "
+                       "to the Full Guide."),
+
+            ("h1", "Saving your changes"),
+            ("bullet", "A Save button glows yellow while something on screen is unsaved."),
+            ("bullet", "A plain Save button means everything already matches what is "
+                       "saved."),
+            ("bullet", "There are three, and each one glows only for its own fields: "
+                       "Configuration, Archipelago Setup, and Mods."),
+            ("bullet", "Save matters. The server and the .bat scripts read your settings "
+                       "from files, and Save is what writes them there."),
+            ("bullet", "Forget to save and Run start_ase_server refuses to start, and "
+                       "Setup Status shows a red X. Click Save and try again."),
+
+            ("h1", "Check for Updates (top of the window)"),
+            ("bullet", "It checks the launcher, the ArkAP plugin, the .apworld and the %s."
+                       % TRACKER_PACK_LABEL),
+            ("bullet", "It runs by itself every time you start the launcher."),
+            ("bullet", "A marker and a highlight on the button mean something newer "
+                       "exists. Click it to see what."),
+            ("bullet", "The launcher updates itself. For the other three the dialog names "
+                       "the button that installs them."),
+
+            ("h1", "Mods (Steam Workshop)"),
+            ("bullet", "The Mods tab installs Steam Workshop mods for you."),
+            ("bullet", "Install the ARK server and set SERVER_ROOT first."),
+            ("bullet", "Tick a mod to mark it active."),
+            ("bullet", "Click \"Download checked\" to install and activate every ticked "
+                       "mod."),
+            ("bullet", "Mods load from top to bottom. Use the arrows to change the order."),
+            ("bullet", "Click Save to write your ticked list to the server."),
+            ("bullet", "Setup Status tells you if your ticks and the server's real mod "
+                       "list have drifted apart."),
+            ("bullet", "Restart the ARK server after any mod change."),
+            ("bullet", "Click \"Copy IDs for YAML\" to copy your mod list for the plugin's "
+                       "yaml. Only mods tagged \"apworld ✓\" are copied - the others "
+                       "would stop your game generating. They still work on the server."),
+            ("bullet", "Click \"Rename mod\" to give a mod you added yourself a name you "
+                       "will recognise instead of a bare ID."),
+
+            ("h1", "Search (top left of the window)"),
+            ("bullet", "Type a word and press Enter."),
+            ("bullet", "Click Find Next or Find Prev to step through the matches."),
+
+            ("h1", "Quick launch (bottom of the Configuration tab)"),
+            ("bullet", "Run start_ase_server - starts the server."),
+            ("bullet", "The Open buttons open that folder in Explorer."),
+            ("bullet", "Run switch_map - not supported right now."),
+            ("bullet", "Patch Game.ini for randomized creatures - turns on randomized "
+                       "dinos. Stop the server first."),
+            ("bullet", "Reset AP data (keep world save) - clears your Archipelago progress "
+                       "and keeps your world."),
+            ("bullet", "Full reset for new seed - clears your Archipelago progress and "
+                       "wipes your world save. Use it when you join a new seed. Stop the "
+                       "server first. Your old save is backed up."),
+
+            ("h1", "Uploading your own Game.ini / GameUserSettings.ini"),
+            ("bullet", "Stop the ARK server first."),
+            ("bullet", "Open the Configuration tab. Find \"Upload server config files\"."),
+            ("bullet", "Pick your file. Click \"Upload to server\"."),
+            ("bullet", "The file it replaces is backed up first."),
+            ("bullet", "Restart the server."),
+
+            ("h1", "What the path fields feed"),
+            ("bullet", "The path fields write into the launcher's .bat and .ini files for "
+                       "you."),
+            ("bullet", "Click Save after you change any field."),
+            ("bullet", "The Archipelago directory field only tells the launcher where "
+                       "Archipelago is installed."),
+            ("bullet", "The PopTracker directory field is the same - it only says where "
+                       "PopTracker is, so the tracker pack goes in the right place."),
+
+            ("h1", "Reporting a problem"),
+            ("bullet", "Click \"Export diagnostics\" next to Save on the Configuration "
+                       "tab."),
+            ("bullet", "It saves one .zip and opens the folder. Post that zip on Discord "
+                       "or attach it to a GitHub issue."),
+            ("bullet", "Your yaml is found by reading the name inside each file in your "
+                       "Players folder and matching it to your slot, so what the file is "
+                       "called does not matter."),
+            ("bullet", "The zip holds your Setup Status, your version numbers, your "
+                       "config, your Archipelago .yaml, paths.cmd, Game.ini and "
+                       "GameUserSettings.ini, the plugin's ArkAP.config.json, the debug, "
+                       "crash and ShooterGame logs, everything in your ipc folder "
+                       "(including each player's mailbox folder), and a list of your ipc "
+                       "and Mods folders. That is everything anyone would ask you for."),
+            ("bullet", "Every password in every one of those files is replaced with "
+                       "[REDACTED] before it goes in. Very long logs are cut down to "
+                       "their last 5000 lines, and the ipc files to their last 500, so "
+                       "the zip stays small."),
+
+            ("h1", "Other information"),
+            ("bullet", "To start a new seed, click \"Full reset for new seed\" under Quick "
+                       "Launch. Stop the server and the connector first."),
+            ("bullet", "If you randomized dinos, stop the server. Click \"Patch Game.ini "
+                       "for randomized creatures\" under Quick Launch. Restart the server."),
+            ("bullet", "That button only works after you have connected to the server once "
+                       "on a randomized seed."),
+
+            ("h1", "If something goes wrong"),
+            ("bullet", "The server install stopped with exit code 8. Click \"Install ARK "
+                       "Server\" again."),
+            ("bullet", "\"Scan for paths\" missed a path. Pick a higher \"Scan intensity\" "
+                       "next to the button and scan again."),
+            ("bullet", "Your cluster folders are missing. Click \"Create ServerCluster "
+                       "folders\" in the Paths group on the Configuration tab."),
+            ("bullet", "The connection command fails in-game. The order is /connect server "
+                       "slot password. Copy it again from the Archipelago Setup tab."),
+            ("bullet", "Checks or items are not coming through. Open the Debug Log tab "
+                       "(it opens on the ArkAP plugin log)."),
+            ("bullet", "The server closed by itself. Debug Log tab, switch the \"Log:\" "
+                       "dropdown to \"ARK server log\" and search for LowLevelFatalError."),
+            ("bullet", "Something the launcher did went wrong. Debug Log tab, \"Log:\" "
+                       "dropdown, \"Launcher log\" - it lists what the app did, with times."),
+            ("bullet", "The server will not start and it says something is unsaved. Open "
+                       "the Configuration tab and click Save."),
+            ("bullet", "A mod you ticked is not loading in game. Open the Mods tab, click "
+                       "Save, and restart the server."),
+            ("bullet", "Setup Status shows a red X. Read the hint on that row and fix that "
+                       "one thing."),
+            ("bullet", "Still stuck. Click \"Export diagnostics\" and post the zip on "
+                       "Discord or GitHub."),
+        ]
+
+        self.instructions_text_quick = self._build_instruction_text(body, quick_content)
+        self.instructions_text_full = self._build_instruction_text(body, full_content)
+        self._instructions_mode = "quick"
+        self.instructions_text_quick._container.pack(fill="both", expand=True)
+
+    def _active_instructions_text(self):
+        return (self.instructions_text_quick if self._instructions_mode == "quick"
+                else self.instructions_text_full)
+
+    def _toggle_instructions_mode(self):
+        old = self._active_instructions_text()
+        self._instructions_mode = "full" if self._instructions_mode == "quick" else "quick"
+        new = self._active_instructions_text()
+        old._container.pack_forget()
+        new._container.pack(fill="both", expand=True)
+        self.instructions_mode_btn.configure(
+            text="Quick Guide" if self._instructions_mode == "full" else "Full Guide")
+
+    def _build_instruction_text(self, parent, content):
+        """Shared renderer for both guides. Returns the Text widget, with its own
+        container frame (Text + Scrollbar) stashed as `_container` so the caller can
+        pack/pack_forget the pair as a unit, and its three collapse-state maps stashed
+        as `_instr_vars` so each guide keeps independent state (tags are per-widget, so
+        the names can repeat between the two guides)."""
+        container = ttk.Frame(parent)
+
+        txt = tk.Text(container, wrap="word", font=("Segoe UI", 9), borderwidth=0,
+                       highlightthickness=0, padx=10, pady=8, cursor="arrow",
+                       background=self.theme["text_bg"], foreground=self.theme["text_fg"],
+                       insertbackground=self.theme["text_fg"])
+        vsb = ttk.Scrollbar(container, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt._container = container
+
+        txt.tag_configure("h1", font=("Segoe UI", 12, "bold"), spacing1=10, spacing3=4)
+        txt.tag_configure("body", font=("Segoe UI", 9), spacing3=2, lmargin1=2, lmargin2=2)
+        txt.tag_configure("bullet", font=("Segoe UI", 9), spacing1=1, lmargin1=18, lmargin2=32)
+        # Blank line between numbered steps - a small font keeps it a gap rather
+        # than a full empty body line.
+        txt.tag_configure("step_gap", font=("Segoe UI", 4))
 
         # Two independent collapse levels (see the module-level rationale in the pro-tip
         # text). SECTIONS: everything after each h1 heading, until the next h1, folds under
@@ -5303,16 +9310,16 @@ class ArkAPLauncher(tk.Tk):
         for tag, line in intro:
             txt.insert("end", line + "\n", tag)
 
-        self._instruction_step_vars = {}        # body_tag  -> step var  (search + set-all)
-        self._instruction_step_label_vars = {}  # label_tag -> step var  (search)
-        self._instr_section_vars = {}           # mark_tag  -> section var (search + set-all)
+        step_vars = {}         # body_tag  -> step var  (search + set-all)
+        step_label_vars = {}   # label_tag -> step var  (search)
+        section_vars = {}      # mark_tag  -> section var (search + set-all)
         step_counter = 0
 
         for s, (h1_text, items) in enumerate(sections):
             section_var = tk.BooleanVar(value=False)   # False = expanded
             mark_tag = "instr_sect_%d" % s             # marker only (no elide)
             body_tag_sect = "instr_sectbody_%d" % s    # elide = section collapsed
-            self._instr_section_vars[mark_tag] = section_var
+            section_vars[mark_tag] = section_var
 
             hcb = ttk.Checkbutton(txt, variable=section_var)
             Tooltip(hcb, "Collapse this whole section down to its heading, or expand it.")
@@ -5334,14 +9341,21 @@ class ArkAPLauncher(tk.Tk):
                     label_tag = "instr_step_label_%d" % step_counter
                     step_counter += 1
                     step_var = tk.BooleanVar(value=False)
-                    self._instruction_step_vars[body_tag] = step_var
-                    self._instruction_step_label_vars[label_tag] = step_var
+                    step_vars[body_tag] = step_var
+                    step_label_vars[label_tag] = step_var
 
                     cb = ttk.Checkbutton(txt, variable=step_var)
                     Tooltip(cb, "Collapse this step down to its number, or expand it again.")
                     txt.window_create("end", window=cb, padx=4)
                     # Tag the just-created checkbox char so it hides when the section folds.
-                    win_idx = txt.index("end-1c")
+                    # The index MUST come from the widget itself: "end-1c" is the trailing
+                    # newline Tk keeps after the window, one char PAST the checkbox. Tagging
+                    # that instead left the step checkbox un-elided when its section folded,
+                    # and an un-elided window char merging into the next display line zeroes
+                    # out the layout of the following embedded window - which is why, after
+                    # "Collapse all", the "What each tab does" heading checkbox (the one
+                    # right after the only section with steps) drew but could not be clicked.
+                    win_idx = txt.index(cb)
                     txt.tag_add(mark_tag, win_idx, "%s+1c" % win_idx)
                     txt.tag_add(body_tag_sect, win_idx, "%s+1c" % win_idx)
 
@@ -5384,17 +9398,18 @@ class ArkAPLauncher(tk.Tk):
 
             _apply_section()  # set the initial (fully-expanded) elide state
 
-        self.instructions_text = txt
-        self._tag_instruction_examples()
+        txt._instr_vars = (section_vars, step_vars, step_label_vars)
         txt.configure(state="disabled")
+        return txt
 
-    def _set_all_instructions(self, collapsed):
+    def _set_all_instructions(self, collapsed, txt):
         """Back the toolbar's "Collapse all" / "Expand all" buttons - both levels at once:
         every section heading and every step. Sections are set first so their per-step
         recompute runs, then the step vars settle each step to `collapsed`."""
-        for var in self._instr_section_vars.values():
+        section_vars, step_vars, _labels = txt._instr_vars
+        for var in section_vars.values():
             var.set(collapsed)
-        for var in self._instruction_step_vars.values():
+        for var in step_vars.values():
             var.set(collapsed)
 
     def _tag_instruction_examples(self):
@@ -5402,20 +9417,23 @@ class ArkAPLauncher(tk.Tk):
         examples, not as paths this install actually uses - same colour as an
         empty field's placeholder. Re-run on theme toggle (see _retheme_widgets)
         because a Text tag's colour is fixed at configure time."""
-        txt = self.instructions_text
-        txt.tag_configure("example", foreground=self.theme["entry_placeholder_fg"])
-        txt.tag_remove("example", "1.0", "end")
-        # Longest snippet first: "C:\ARKServer" is a prefix of the nested-install
-        # example, and tagging the short one first would leave the rest undimmed.
-        for snippet in sorted(INSTRUCTION_EXAMPLE_SNIPPETS, key=len, reverse=True):
-            idx = "1.0"
-            while True:
-                pos = txt.search(snippet, idx, stopindex="end", exact=True, elide=True)
-                if not pos:
-                    break
-                end = "%s+%dc" % (pos, len(snippet))
-                txt.tag_add("example", pos, end)
-                idx = end
+        for txt in (getattr(self, "instructions_text_quick", None),
+                    getattr(self, "instructions_text_full", None)):
+            if txt is None:
+                continue
+            txt.tag_configure("example", foreground=self.theme["entry_placeholder_fg"])
+            txt.tag_remove("example", "1.0", "end")
+            # Longest snippet first: "C:\ARKServer" is a prefix of the nested-install
+            # example, and tagging the short one first would leave the rest undimmed.
+            for snippet in sorted(INSTRUCTION_EXAMPLE_SNIPPETS, key=len, reverse=True):
+                idx = "1.0"
+                while True:
+                    pos = txt.search(snippet, idx, stopindex="end", exact=True, elide=True)
+                    if not pos:
+                        break
+                    end = "%s+%dc" % (pos, len(snippet))
+                    txt.tag_add("example", pos, end)
+                    idx = end
 
     # -------------------------------------------------------- reminder ----- #
     def _read_hide_reminder_flag(self):
@@ -5583,7 +9601,8 @@ class ArkAPLauncher(tk.Tk):
         reading self.theme directly, so there's nothing stale to fix up."""
         t = self.theme
         for widget in (self.log, self.install_log, self.debug_log_text,
-                       self.instructions_text, self.profile_notes_text):
+                       self.instructions_text_quick, self.instructions_text_full,
+                       self.profile_notes_text):
             try:
                 widget.configure(background=t["text_bg"], foreground=t["text_fg"],
                                   insertbackground=t["text_fg"])
@@ -5607,15 +9626,11 @@ class ArkAPLauncher(tk.Tk):
         except tk.TclError:
             pass
 
+        # Repainted to whichever state each Save halo currently holds (lit warn colours /
+        # blended-in bg) rather than unconditionally lit - _set_halo reads self.theme.
         try:
-            self.save_btn_halo.configure(background=t["warn_bg"],
-                                         highlightbackground=t["warn_border"])
-        except tk.TclError:
-            pass
-
-        try:
-            self.mods_save_btn_halo.configure(background=t["warn_bg"],
-                                              highlightbackground=t["warn_border"])
+            self._update_save_highlights()
+            self._set_halo(self.mods_save_btn_halo, self._mods_dirty_flag)
         except tk.TclError:
             pass
 
@@ -5676,6 +9691,12 @@ class ArkAPLauncher(tk.Tk):
         self.vars[key].set(value)
         if not value and key in self._placeholder_text:
             self._show_placeholder(key)
+        # Any CLUSTERDIR change (Browse, a scan result, an accepted suggestion, Create
+        # ServerCluster folders) offers its sibling Saves/Backups folders - typing is
+        # covered by the field's FocusOut binding. after_idle so a caller setting all
+        # three cluster fields in a row is finished before we look at them.
+        if key == "CLUSTERDIR" and value and self._cluster_autoscan:
+            self.after_idle(self._on_cluster_dir_focus_out)
 
     def _set_from_file(self, key, value):
         """set(), for values arriving from a .bat / .ini / the config JSON rather than
@@ -5697,8 +9718,8 @@ class ArkAPLauncher(tk.Tk):
     # data becomes real data (or real data silently vanishes):
     #   1. EVERY Entry bound to the field must clear the example on focus - hence
     #      _placeholder_entries being a list, not a single widget. SERVER_ROOT appears
-    #      on both the Configuration and Server Install tabs, and before this was a
-    #      list, typing into the Server Install one left _placeholder_active set, so
+    #      on both the Configuration and Install Server/Api/Plugin tabs, and before this was a
+    #      list, typing into the Install Server/Api/Plugin one left _placeholder_active set, so
     #      get() reported "" and the user's typed path was silently discarded.
     #   2. Placeholder state and appearance must always agree: showing = greyed +
     #      italic, real = default colour + normal. _style_field_as_* are the only two
@@ -5767,6 +9788,10 @@ class ArkAPLauncher(tk.Tk):
         self.log.insert("end", msg + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+        # Same line to the persistent log. Every scan, save, reset, cluster-folder
+        # creation, Game.ini patch and error already routes through here, so mirroring at
+        # this one point covers the lot - and covers whatever gets added next.
+        launcher_log(msg, "Console")
 
     def _clear_log(self):
         self.log.configure(state="normal")
@@ -5815,6 +9840,141 @@ class ArkAPLauncher(tk.Tk):
             self.logo_label.configure(image=self._logo_img)
         except tk.TclError:
             pass
+
+    # ------------------------------------------------------ logo easter egg --- #
+    def _on_logo_click(self, _event=None):
+        """Count clicks on the header logo and play out LOGO_EGG_LINES.
+
+        Nothing else in the app touches _logo_clicks, so switching tabs, running a
+        scan, or clicking anywhere else in between two logo clicks leaves the sequence
+        exactly where it was. After the finale the logo goes permanently inert for the
+        rest of the session; a restart makes it discoverable again (chosen over
+        persisting it, so the whole thing stays a per-session gag rather than a
+        one-shot-per-install one, and so testing it doesn't require editing a file)."""
+        if self._logo_egg_done:
+            return
+        self._logo_clicks += 1
+        line = LOGO_EGG_LINES.get(self._logo_clicks)
+        if line:
+            self._show_logo_bubble(line)
+        if self._logo_clicks == LOGO_EGG_CREDITS_AT:
+            # Let the "here we go" bubble land first, then the payoff.
+            self.after(900, self._show_credits)
+        elif self._logo_clicks == LOGO_EGG_FINALE_AT:
+            self._play_egg_music()
+            self._logo_egg_done = True
+
+    def _show_logo_bubble(self, text):
+        """A small borderless speech bubble under the logo. Non-blocking, click it (or
+        wait) to dismiss; only ever one at a time."""
+        self._close_logo_bubble()
+        t = self.theme
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)   # no title bar - it's a speech bubble, not a dialog
+        win.attributes("-topmost", True)
+        frame = tk.Frame(win, background=t["warn_bg"],
+                         highlightbackground=t["warn_border"], highlightthickness=1)
+        frame.pack(fill="both", expand=True)
+        label = tk.Label(frame, text=text, background=t["warn_bg"], foreground=t["warn_fg"],
+                         justify="left", wraplength=260, padx=10, pady=8,
+                         font=("Segoe UI", 9))
+        label.pack()
+        for w in (win, frame, label):
+            w.bind("<Button-1>", lambda _e: self._close_logo_bubble())
+        # Anchor under the logo, nudged left so a long line stays on screen.
+        win.update_idletasks()
+        try:
+            x = self.logo_label.winfo_rootx() - max(0, win.winfo_width() - 90)
+            y = self.logo_label.winfo_rooty() + self.logo_label.winfo_height() + 6
+        except tk.TclError:
+            x, y = self.winfo_rootx() + 40, self.winfo_rooty() + 90
+        win.geometry("+%d+%d" % (max(0, x), y))
+        self._logo_bubble = win
+        self.after(LOGO_EGG_BUBBLE_MS, lambda w=win: self._close_logo_bubble(w))
+
+    def _close_logo_bubble(self, only=None):
+        """Close the current bubble. `only` guards the auto-close timer from killing a
+        newer bubble that replaced the one it was scheduled for."""
+        win = self._logo_bubble
+        if win is None or (only is not None and only is not win):
+            return
+        self._logo_bubble = None
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+
+    def _show_credits(self):
+        """The payoff: a proper window with the big ARK:ipelago logo and the credits.
+        Themed from self.theme like every other panel, so it reads correctly in both
+        light and dark mode."""
+        t = self.theme
+        win = tk.Toplevel(self)
+        win.title("ARKipelago - Credits")
+        win.transient(self)
+        win.configure(background=t["bg"])
+        win.resizable(False, False)
+        win.minsize(440, 0)   # the logo alone is narrower than this reads well at
+
+        body = tk.Frame(win, background=t["bg"], padx=36, pady=20)
+        body.pack(fill="both", expand=True)
+
+        path = os.path.join(self._assets_dir(), CREDITS_LOGO_FILENAME)
+        if os.path.isfile(path):
+            try:
+                img = tk.PhotoImage(file=path)
+                if img.height() > 220:
+                    img = img.subsample(max(1, round(img.height() / 220)))
+                self._credits_img = img  # keep a reference or Tk drops the image
+                tk.Label(body, image=self._credits_img, background=t["bg"]
+                         ).pack(pady=(0, 10))
+            except tk.TclError:
+                pass  # no logo is survivable; the credits are the point
+
+        tk.Label(body, text="Thank You", background=t["bg"], foreground=t["fg"],
+                 font=(self._header_font_family or "Segoe UI", 22, "bold")
+                 ).pack()
+        tk.Label(body, text="ARKipelago exists because of these people.",
+                 background=t["bg"], foreground=t["subtle_fg"],
+                 font=("Segoe UI", 9, "italic")).pack(pady=(2, 16))
+
+        for name, role in CREDITS:
+            entry = tk.Frame(body, background=t["bg"])
+            entry.pack(fill="x", pady=5)
+            tk.Label(entry, text=name, background=t["bg"], foreground=t["fg"],
+                     font=("Segoe UI", 12, "bold")).pack()
+            tk.Label(entry, text=role, background=t["bg"], foreground=t["subtle_fg"],
+                     font=("Segoe UI", 9), wraplength=380).pack()
+
+        ttk.Button(body, text="Close", command=win.destroy).pack(pady=(20, 0))
+        win.update_idletasks()
+        # Centre on the launcher window rather than the screen - dual-monitor safe.
+        win.geometry("+%d+%d" % (
+            self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_width()) // 2),
+            max(0, self.winfo_rooty() + 20)))
+
+    # ------------------------------------------------------------- egg audio --- #
+    def _play_egg_music(self):
+        """Start the easter-egg track. Background playback via MCI (see mci_play_once) -
+        the Tk thread is never blocked and the app stays fully responsive while it
+        plays. Failure is silent apart from a log line; it's a joke, not a feature."""
+        path = os.path.join(self._assets_dir(), EGG_MUSIC_FILENAME)
+        ok, err = mci_play_once(path)
+        self._egg_music_on = ok
+        if not ok:
+            self._log("(easter egg) could not play %s: %s" % (EGG_MUSIC_FILENAME, err))
+
+    def _stop_egg_music(self):
+        """Stop playback for good - switching back to the tab never resumes it, since
+        nothing but _play_egg_music (one click count, already spent) ever starts it."""
+        if not self._egg_music_on:
+            return
+        self._egg_music_on = False
+        mci_stop()
+
+    def _on_app_close(self):
+        self._stop_egg_music()
+        self.destroy()
 
     def _load_window_icon(self):
         """Set the window/taskbar icon from assets/icon.ico (preferred, Windows
@@ -6033,6 +10193,67 @@ class ArkAPLauncher(tk.Tk):
         except OSError as exc:
             return False, str(exc)
 
+    # -------------------------------------------- Save-button highlights --- #
+    #
+    # The pale-yellow halo around each Save button used to be permanent decoration, so
+    # it said nothing: a freshly launched, fully-saved app looked exactly like one with
+    # an hour of unsaved edits in it. It now means one thing only - "this section has
+    # changes that aren't on disk yet" - measured against _saved_values.
+    def _set_halo(self, halo, on):
+        """Light up (or blend away) one Save halo. Recoloured to the surrounding bg
+        rather than unpacked, the same trick _set_update_highlight uses, so turning it
+        off never shifts the layout around the button."""
+        t = self.theme
+        try:
+            halo.configure(background=t["warn_bg"] if on else t["bg"],
+                            highlightbackground=t["warn_border"] if on else t["bg"])
+        except tk.TclError:
+            pass
+
+    def _mark_saved_baseline(self):
+        """Declare the current field values to BE what's on disk. Called once startup
+        has finished loading and after every successful Save - the two moments the two
+        are genuinely in sync."""
+        self._saved_values = self._current_profile_snapshot()
+        self._update_save_highlights()
+
+    def _update_save_highlights(self):
+        """Light each tab's Save only while one of ITS OWN fields differs from the last
+        saved values. Either button writes everything (there's a single config JSON),
+        but the highlights are scoped per tab so editing a Configuration path doesn't
+        light up a tab the user hasn't touched."""
+        if self._saved_values is None:
+            return          # still loading - nothing has been "changed" yet
+        changed = {key for key, value in self._current_profile_snapshot().items()
+                   if self._saved_values.get(key) != value}
+        arch_dirty = bool(changed & ARCHIPELAGO_KEYS)
+        config_dirty = bool(changed - ARCHIPELAGO_KEYS)
+        self._set_halo(self.archipelago_save_btn_halo, arch_dirty)
+        self._set_halo(self.save_btn_halo, config_dirty)
+        self._fields_dirty = arch_dirty or config_dirty
+        self._update_save_hint()
+
+    def _update_save_hint(self):
+        """The header's "make sure to save!" chip sits above the tab strip, so unlike the
+        halos it answers for every section at once: shown while anything anywhere is
+        unsaved, hidden when nothing is.
+
+        Packed/unpacked rather than recoloured - it's a sentence, and a greyed-out one
+        still reads as a nag. Nothing sits to its right in title_row (the header buttons
+        are packed side="right" on the row above), so it can't shift anything."""
+        want = self._fields_dirty or self._mods_dirty_flag
+        if want == self._save_hint_shown:
+            return
+        if want:
+            self.save_hint_label.pack(side="left", padx=12)
+        else:
+            self.save_hint_label.pack_forget()
+        self._save_hint_shown = want
+
+    def _on_field_changed(self):
+        self._update_profile_status()
+        self._update_save_highlights()
+
     def on_save(self):
         self._clear_log()
         values = self.collect_values()
@@ -6073,6 +10294,12 @@ class ArkAPLauncher(tk.Tk):
 
         # 3) connector.ini
         self._apply_ini(values)
+
+        # The fields now match what's persisted, so both Save halos go dark until the
+        # next edit. Only on a successful JSON write - if that failed, the values really
+        # aren't saved and the highlight must keep saying so.
+        if ok:
+            self._mark_saved_baseline()
 
         self._log("Done.")
         messagebox.showinfo("ARKIpelago Launcher", "Save complete. See the log for details.")
@@ -6120,9 +10347,10 @@ class ArkAPLauncher(tk.Tk):
     def _apply_ini(self, values):
         path = self.get("connector_ini")
         if not path or not os.path.isfile(path):
-            # Loud, not "skipped": everything the user typed into the Connector group
-            # goes nowhere in this case, and the old one-liner read like a harmless
-            # note about an optional file.
+            # Loud, not "skipped": everything the user typed into the Archipelago Setup
+            # tab's room fields and the Configuration tab's plugin-file fields goes
+            # nowhere in this case, and the old one-liner read like a harmless note
+            # about an optional file.
             self._log("! connector.ini: %s - your Connector values (server / slot / "
                       "ipc_dir / ...) were NOT written anywhere the connector reads."
                       % ("no file set" if not path else "not found at %s" % path))
@@ -6365,7 +10593,13 @@ class ArkAPLauncher(tk.Tk):
         profile = self._profiles[name]
         values = profile.get("values", {})
         for key in self.vars:
-            self.set(key, values.get(key, ""))
+            # Only keys the profile actually carries. A profile saved before a field
+            # existed (ARCHIPELAGO_DIR is the one that bit us) has no entry for it, and
+            # blanking on a missing key made the startup restore wipe whatever
+            # _load_json had just put in that field - so it looked like the new field
+            # never persisted at all. Applies to every field added from here on.
+            if key in values:
+                self.set(key, values[key])
         notes = profile.get("notes", "")
         self.profile_notes_text.delete("1.0", "end")
         self.profile_notes_text.insert("1.0", notes)
@@ -6551,7 +10785,12 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showwarning("ARKIpelago Launcher",
                                     "Set slot and server first.")
             return
-        cmd = "/connect %s %s" % (slot, server)
+        # Order is "/connect <server> <slot> [password]" - server FIRST. The in-game
+        # command changed from the old slot-first form, so this must not be "fixed"
+        # back to reading more naturally. Password is appended only when set: a
+        # trailing empty argument would be parsed as a blank password rather than as
+        # "no password", which fails against a room that has none.
+        cmd = "/connect %s %s" % (server, slot)
         if password:
             cmd += " %s" % password
         self.clipboard_clear()
@@ -6589,7 +10828,7 @@ class ArkAPLauncher(tk.Tk):
         q = self._detect_queue
         found = None
         for cand in direct_candidate_server_roots():
-            if os.path.isfile(os.path.join(cand, ARK_EXE_RELPATH)):
+            if is_ark_server_root(cand):
                 found = cand
                 break
         if not found:
@@ -6815,7 +11054,7 @@ class ArkAPLauncher(tk.Tk):
                       % (result.get("PLUGINS_DIR") or "?"))
         if not result.get("ipc_dir"):
             self._log("Scan for paths: the ArkAP plugin isn't installed yet, so ipc_dir "
-                      "was left alone (Server Install -> Install Plugin).")
+                      "was left alone (Install Server/Api/Plugin -> Install Plugin).")
         if not result.get("game_ini"):
             self._log("Scan for paths: Game.ini not found yet - start the server once to "
                       "generate it.")
@@ -6852,10 +11091,7 @@ class ArkAPLauncher(tk.Tk):
                       % (level, result.get("visited", 0)))
 
     def _on_cluster_dir_focus_out(self, _event=None):
-        cluster_dir = self.get("CLUSTERDIR")
-        if not cluster_dir or cluster_dir == self._last_cluster_dir_scan:
-            return
-        self._scan_for_saves_and_backup_root(cluster_dir)
+        self._scan_for_saves_and_backup_root(self.get("CLUSTERDIR"))
 
     def _scan_for_saves_and_backup_root(self, cluster_dir):
         """Given a found/confirmed CLUSTERDIR, look in its parent folder (the same
@@ -6868,8 +11104,16 @@ class ArkAPLauncher(tk.Tk):
         BACKUPROOT especially may not exist yet (some setups only create it on the
         first backup), so when no matching sibling is found we still offer the
         expected sibling path as an unconfirmed placeholder rather than treating that
-        as an error."""
+        as an error - and when NEITHER exists, the popup says so and points at the
+        "Create ServerCluster folders" button, which is the actual fix on a fresh
+        install.
+
+        Called on every CLUSTERDIR change, not just the field's FocusOut (see set()),
+        so the same folder is only ever looked at once (_last_cluster_dir_scan) - typing
+        a path and then tabbing out must not stack two identical popups."""
         if not cluster_dir or not os.path.isdir(cluster_dir):
+            return
+        if os.path.normpath(cluster_dir) == self._last_cluster_dir_scan:
             return
         if is_backup_snapshot_path(cluster_dir):
             # A CLUSTERDIR inside a snapshot makes every sibling here a snapshot folder
@@ -6896,6 +11140,7 @@ class ArkAPLauncher(tk.Tk):
             return
 
         suggestions = {}
+        found_any = False
         for key, pattern, default_name in (
             ("SAVESROOT", "saves", "Saves"),
             ("BACKUPROOT", "backups", "Backups"),
@@ -6908,10 +11153,21 @@ class ArkAPLauncher(tk.Tk):
             matches = [p for p in siblings
                        if pattern in os.path.basename(p).lower()
                        and classify_cluster_folder(os.path.basename(p)) == key]
+            found_any = found_any or bool(matches)
             suggestions[key] = matches if matches else [os.path.join(parent, default_name)]
 
-        if suggestions:
-            self._suggest_paths(suggestions)
+        # Neither sibling exists: every "suggestion" below is a not-yet-created example,
+        # which on its own reads as a dead end. Say what to do instead.
+        note = None
+        if not found_any:
+            note = ("No Saves or Backups folder was found next to this CLUSTERDIR. The "
+                    "paths below are only where they would go - use \"Create %s "
+                    "folders\" on this tab to create them (and fill in all three "
+                    "fields) if this is a fresh install." % CLUSTER_ROOT_DIRNAME)
+            self._log("CLUSTERDIR: no Saves/Backups sibling folders next to %s - use "
+                      "\"Create %s folders\" to create them."
+                      % (cluster_dir, CLUSTER_ROOT_DIRNAME))
+        self._suggest_paths(suggestions, note=note)
 
     # Every field the scan can suggest a folder for. Fixed order so the popup is
     # consistent regardless of which caller (SERVER_ROOT scan vs. CLUSTERDIR focus-out)
@@ -6919,7 +11175,7 @@ class ArkAPLauncher(tk.Tk):
     _SUGGESTABLE_KEYS = ("PLUGINS_DIR", "ipc_dir", "game_ini",
                          "CLUSTERDIR", "SAVESROOT", "BACKUPROOT")
 
-    def _suggest_paths(self, suggestions):
+    def _suggest_paths(self, suggestions, note=None):
         """One dialog offering every name-matched folder the scan turned up, grouped by
         the field it would fill. Suggestions are never applied without a click, since
         folder-name matching is a guess. A path that doesn't exist yet is offered as a
@@ -6943,12 +11199,46 @@ class ArkAPLauncher(tk.Tk):
                   text="The scan found folder(s) that look like they could go in these "
                        "fields. Pick one to use it, or close this to leave a field as it "
                        "is - your current value (if any) is shown marked \"(set)\".").pack()
+        if note:
+            # Same pale-yellow banner as the install reminder - this is advice, not a
+            # suggestion the user can click.
+            banner = tk.Frame(win, background=self.theme["warn_bg"],
+                              highlightbackground=self.theme["warn_border"],
+                              highlightthickness=1)
+            banner.pack(fill="x", padx=10, pady=(0, 6))
+            tk.Label(banner, background=self.theme["warn_bg"],
+                     foreground=self.theme["warn_fg"], justify="left", wraplength=500,
+                     text=note).pack(padx=8, pady=6)
+        # Close stays pinned at the bottom while the list above scrolls.
+        ttk.Button(win, text="Close", command=win.destroy).pack(side="bottom", pady=(4, 10))
+
+        # Scrollable list - same Canvas + Scrollbar pattern as the Setup Status /
+        # Server Install / Archipelago Setup tabs. An Exhaustive scan (Desktop /
+        # Documents / Downloads sweep) can turn up far more candidates than fit on
+        # screen, across several fields at once, and every one has to stay reachable.
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True)
+        canvas = tk.Canvas(body, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
+        vsb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+        # Bound on the Toplevel rather than bind_all so it dies with the window and
+        # can't leak wheel handling onto the main window after this popup closes.
+        win.bind("<MouseWheel>",
+                 lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
         for key, current, cur_norm, matches in sections:
-            ttk.Label(win, text=key, font=("Segoe UI", 9, "bold")
+            ttk.Label(inner, text=key, font=("Segoe UI", 9, "bold")
                       ).pack(anchor="w", padx=10, pady=(6, 0))
             if current and cur_norm not in (os.path.normcase(os.path.normpath(m))
                                              for m in matches):
-                ttk.Button(win, text="%s   (set)" % current, state="disabled"
+                ttk.Button(inner, text="%s   (set)" % current, state="disabled"
                            ).pack(fill="x", padx=10, pady=2)
             for m in matches:
                 is_current = cur_norm == os.path.normcase(os.path.normpath(m))
@@ -6961,13 +11251,23 @@ class ArkAPLauncher(tk.Tk):
                     label = "%s   (not created yet - suggested path)" % m
                 # A path that exists was really found on disk; one that doesn't is
                 # only an example of where it would go, so it's greyed out.
-                btn = ttk.Button(win, text=label,
+                btn = ttk.Button(inner, text=label,
                                   style="TButton" if exists or is_current else "Placeholder.TButton",
                                   state="disabled" if is_current else "normal")
                 if not is_current:
                     btn.configure(command=lambda p=m, k=key, b=btn: self._pick_suggested_path(k, p, b))
                 btn.pack(fill="x", padx=10, pady=2)
-        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(4, 10))
+
+        # Size the viewport to the content, capped so a scan with dozens of hits
+        # scrolls instead of growing the window past the screen. The scrollbar only
+        # appears once it's actually needed.
+        inner.update_idletasks()
+        max_h = max(200, min(SUGGEST_POPUP_MAX_LIST_H, win.winfo_screenheight() - 300))
+        content_h = inner.winfo_reqheight()
+        canvas.configure(width=inner.winfo_reqwidth(), height=min(content_h, max_h))
+        if content_h > max_h:
+            vsb.pack(side="right", fill="y", before=canvas)
+        return win
 
     def _pick_suggested_path(self, key, path, button):
         self.set(key, path)
@@ -6981,6 +11281,7 @@ class ArkAPLauncher(tk.Tk):
         self.install_log.insert("end", line.rstrip("\n") + "\n")
         self.install_log.see("end")
         self.install_log.configure(state="disabled")
+        launcher_log(line, "Install")  # server / ArkApi / plugin installs + SteamCMD output
 
     def _any_install_running(self):
         """True if the SteamCMD, ArkServerApi, ArkAP plugin, or mod-download flow is active.
@@ -7554,10 +11855,10 @@ class ArkAPLauncher(tk.Tk):
 
     # ------------------------------------------------ Launcher self-update - #
     # Downloading and the confirm-before-updating dialog are entirely opt-in: nothing
-    # downloads unless the user clicks "Update Now" in that dialog. Checking for a new
-    # version does also happen once, silently, on startup (see
-    # _start_background_update_check) - it only lights up the "!" badge / button highlight
-    # (see _apply_update_indicators), never opens the dialog itself. Both checks use this app's OWN release repo
+    # downloads unless the user clicks an action in that dialog. Checking for new versions
+    # does also happen once, silently, on startup (see _start_component_version_check) - it
+    # only lights up the "!" badge / button highlight (see _apply_update_indicators), never
+    # opens the dialog itself. The launcher's own releases live in this app's OWN repo
     # (UPDATE_REPO), separate from RELEASES_URL / ARKSERVERAPI_RELEASES_API above, which
     # point at the plugin/connector/ArkApi bundle.
     @staticmethod
@@ -7573,9 +11874,6 @@ class ArkAPLauncher(tk.Tk):
             data = json.loads(resp.read().decode("utf-8"))
         return data if isinstance(data, list) else []
 
-    def _start_background_update_check(self):
-        threading.Thread(target=self._background_update_check_worker, daemon=True).start()
-
     # ------------------------------------------- Component version advisories #
     def _read_config_dict(self):
         try:
@@ -7586,105 +11884,252 @@ class ArkAPLauncher(tk.Tk):
             return {}
 
     def _start_component_version_check(self):
-        """Kick a background check of the installed ArkApi / plugin versions against their
-        latest GitHub releases. Silent and non-blocking, same as the launcher self-check."""
+        """ONE background pass over every tracked component (launcher, ArkAP plugin,
+        .apworld, plus the advisory-only ArkApi). It drives BOTH the "!" badge / button
+        highlight and the Setup Status advisory rows from the same fetches, so the two
+        surfaces can never disagree and startup doesn't hit the same releases list twice.
+        Silent and non-blocking; anything unreachable is simply left out."""
         threading.Thread(target=self._component_version_check_worker, daemon=True).start()
 
-    def _component_version_check_worker(self):
-        """Build the advisory rows off the main thread. Only compares components whose
-        installed version the launcher actually recorded at install time - with no baseline
-        there's nothing to compare against, so it stays silent rather than guessing."""
+    def _write_config_key_async(self, key, value, label):
+        """_write_config_key from a worker thread. The config file is otherwise only ever
+        written from the main thread, and two writers doing read-modify-write would lose
+        one of the keys."""
+        try:
+            self.after(0, self._write_config_key, key, value, label)
+        except (tk.TclError, RuntimeError):
+            pass  # window closed mid-check - see _component_version_check_worker
+
+    def _detect_component_versions(self, cfg, releases):
+        """{component: (installed_version, present_on_disk)} for the plugin and .apworld,
+        read off the FILES first and falling back to the version we recorded at install
+        time. Worker thread only.
+
+        The recorded value used to be the only source, which is why a launcher that shipped
+        with both components already in place showed neither: it installed neither, so it
+        recorded neither. Whatever is detected is written back into the same recorded keys,
+        so the diagnostics version block and the Setup Status advisories pick it up without
+        knowing detection happened.
+
+        Paths come from the config dict rather than the Tk variables - this runs off the
+        main thread, and what's saved is what the connector and the plugin actually use."""
+        out = {}
+
+        plugin_dir = resolve_plugin_dir(cfg.get)
+        dll = os.path.join(plugin_dir, PLUGIN_DLL_NAME) if plugin_dir else ""
+        dll_sha = _file_sha256(dll) if dll else None
+        version = str(cfg.get(PLUGIN_INSTALLED_VERSION_KEY, "") or "").strip()
+        if dll_sha and dll_sha != cfg.get(PLUGIN_PROBED_DLL_SHA_KEY, ""):
+            detected = plugin_version_from_disk(dll_sha, releases)
+            # Recorded even when nothing matched, so an unrecognised build (locally built,
+            # or older than the probe scans) doesn't re-download the zips on every launch.
+            self._write_config_key_async(PLUGIN_PROBED_DLL_SHA_KEY, dll_sha,
+                                         "plugin version probe")
+            if detected:
+                version = detected
+                self._write_config_key_async(PLUGIN_INSTALLED_VERSION_KEY, detected,
+                                             "detected plugin version")
+        # present: True/False/None - see format_installed_version. None means no PLUGINS_DIR
+        # / SERVER_ROOT / ipc_dir is set, which is a different fix from "it isn't installed".
+        out["plugin"] = (version, bool(dll_sha) if plugin_dir else None)
+
+        apworld = resolve_apworld_path(cfg.get)
+        version = str(cfg.get(APWORLD_INSTALLED_VERSION_KEY, "") or "").strip()
+        detected = apworld_version_from_disk(apworld, releases)
+        if detected and detected != version:
+            version = detected
+            self._write_config_key_async(APWORLD_INSTALLED_VERSION_KEY, detected,
+                                         "detected .apworld version")
+        # None when the Archipelago directory isn't set: _archipelago_dir deliberately
+        # refuses to assume C:\ProgramData\Archipelago, so neither does this.
+        out["apworld"] = (version, os.path.isfile(apworld) if apworld else None)
+        return out
+
+    def _collect_update_statuses(self):
+        """({component: status}, [error strings]) for UPDATE_COMPONENTS. Worker thread only.
+
+        A component is omitted only when GitHub couldn't be reached for it - i.e. when there
+        is no "latest" to compare against at all. Not knowing the INSTALLED version is no
+        longer a reason to drop it: the status carries an empty "installed" plus "present"
+        (is the file actually on disk), the dialog spells that out, and the two cues skip it
+        so an unmeasurable install still never nags. Each status carries
+        label / installed / present / latest / release / url / how. Errors are collected
+        rather than raised so one dead endpoint can't hide the others; only the manual
+        "Check for Updates" click surfaces them."""
         cfg = self._read_config_dict()
-        advisories = []
-        checks = [
-            (cfg.get(ARKAPI_INSTALLED_VERSION_KEY, ""), ARKSERVERAPI_RELEASES_API,
-             "ArkServerApi", ARKSERVERAPI_RELEASES_PAGE,
-             "Server Install tab -> \"Install ArkServerApi\" upgrades it in place."),
-            (cfg.get(PLUGIN_INSTALLED_VERSION_KEY, ""), ARKAP_PLUGIN_RELEASES_API,
-             "ArkAP plugin", RELEASES_URL,
-             "Server Install tab -> \"Install Plugin\" downloads and upgrades it in place "
-             "- your ArkAP.config.json is kept."),
+        out, errors = {}, []
+
+        # Launcher: the SAME _fetch_release_list + _pick_best_release the self-update flow
+        # uses, so the cues and the actual download can never disagree about "latest".
+        try:
+            best, version_str = _pick_best_release(self._fetch_release_list(), APP_VERSION)
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+        else:
+            out["launcher"] = {
+                "label": UPDATE_COMPONENT_LABELS["launcher"],
+                "installed": APP_VERSION,
+                "present": True,
+                # None = nothing newer carrying an installable zip. Report the installed
+                # version so this reads as "no update", not "unknown".
+                "latest": version_str or APP_VERSION,
+                "release": best,
+                "url": (best or {}).get("html_url") or UPDATE_RELEASES_PAGE,
+                "how": ("Use \"Check for Updates\" at the top of the window to update "
+                        "in place."),
+            }
+
+        # Plugin and .apworld both ship from the ONE ArkAP releases list (pre-release aware,
+        # see _fetch_arkap_release_list): fetched once, then scanned per asset with the same
+        # _release_for_asset the installers use - "newest release carrying this asset" is
+        # exactly what they'd download, so it's what we have to compare against.
+        wanted = [
+            ("plugin", ARKAP_PLUGIN_ASSET_NAME,
+             "Install Server/Api/Plugin tab -> \"Install Plugin\" downloads and upgrades it "
+             "in place - your ArkAP.config.json is kept."),
+            ("apworld", APWORLD_ASSET_NAME,
+             "Archipelago Setup tab -> \"Update .apworld\" downloads it into custom_worlds "
+             "(your existing copy is backed up first)."),
         ]
-        for installed, api, name, page, how in checks:
-            if not installed:
+        try:
+            releases = _fetch_arkap_release_list()
+        except (OSError, ValueError) as exc:
+            releases = []
+            errors.append(str(exc))
+        # Needs the release list: both detections identify the installed file by matching it
+        # against the published assets (see apworld_version_from_disk).
+        detected = self._detect_component_versions(cfg, releases) if releases else {}
+        for comp, asset_name, how in wanted:
+            rel, _asset = _release_for_asset(releases, asset_name)
+            if rel is None:
                 continue
-            latest = fetch_latest_release_tag(api)
-            if latest and _version_is_newer(latest, installed):
+            installed, present = detected.get(comp, ("", False))
+            out[comp] = {
+                "label": UPDATE_COMPONENT_LABELS[comp],
+                "installed": installed,
+                "present": present,
+                "latest": (rel.get("tag_name") or "").strip() or installed,
+                "release": rel,
+                "url": rel.get("html_url") or RELEASES_URL,
+                "how": how,
+            }
+
+        # The ARK tracker pack ships from its OWN repo, with no release assets at all (the
+        # download is GitHub's source zip), so it gets its own fetch rather than joining the
+        # asset scan above. Its installed version needs no hash matching either: the pack's
+        # manifest.json carries a package_version that tracks the release tag, read straight
+        # off disk by installed_tracker_pack.
+        try:
+            rel = _fetch_newest_release(TRACKER_PACK_RELEASES_API)
+        except (OSError, ValueError) as exc:
+            rel = None
+            errors.append(str(exc))
+        if rel:
+            packs = poptracker_packs_dir(cfg.get(POPTRACKER_DIR_KEY))
+            pack_path, detected_version = installed_tracker_pack(packs) if packs else ("", "")
+            recorded = str(cfg.get(TRACKER_PACK_INSTALLED_VERSION_KEY, "") or "").strip()
+            if detected_version and detected_version != recorded:
+                self._write_config_key_async(TRACKER_PACK_INSTALLED_VERSION_KEY,
+                                             detected_version,
+                                             "detected %s version" % TRACKER_PACK_LABEL)
+            out["trackerpack"] = {
+                "label": UPDATE_COMPONENT_LABELS["trackerpack"],
+                "installed": detected_version or recorded,
+                # None when no PopTracker directory is set - a different fix from "the
+                # pack isn't installed", exactly as for the .apworld.
+                "present": bool(pack_path) if packs else None,
+                "latest": (rel.get("tag_name") or "").strip()
+                          or detected_version or recorded,
+                "release": rel,
+                "url": rel.get("html_url") or TRACKER_PACK_RELEASES_PAGE,
+                "how": ("Archipelago Setup tab -> \"Install/update %s\" downloads it into "
+                        "PopTracker's %s folder (your existing copy is moved aside first)."
+                        % (TRACKER_PACK_LABEL, POPTRACKER_PACKS_DIRNAME)),
+            }
+        return out, errors
+
+    def _component_version_check_worker(self):
+        """Build the cues + advisory rows off the main thread. Only compares components
+        whose installed version could be established - detected from the files on disk, or
+        recorded by our own installer. With no baseline there's nothing to compare against,
+        so it stays silent rather than guessing (see _collect_update_statuses); the update
+        dialog still lists the component either way."""
+        statuses, _errors = self._collect_update_statuses()
+        advisories = []
+
+        # ArkApi is advisory-only: nothing in the "Check for Updates" dialog installs it,
+        # so it gets a Setup Status row but no badge. Still the same silent, best-effort
+        # tag fetch as before.
+        arkapi_installed = self._read_config_dict().get(ARKAPI_INSTALLED_VERSION_KEY, "")
+        if arkapi_installed:
+            latest = fetch_latest_release_tag(ARKSERVERAPI_RELEASES_API)
+            if latest and _version_is_newer(latest, arkapi_installed):
                 advisories.append({
-                    "label": "%s update available (advisory)" % name,
+                    "label": "ArkServerApi update available (advisory)",
+                    "state": "info",
+                    "detail": "Installed %s, latest release is %s. Being on an older "
+                              "version isn't broken - just worth knowing. Install "
+                              "Server/Api/Plugin tab -> \"Install ArkServerApi\" upgrades "
+                              "it in place." % (arkapi_installed, latest),
+                    "hint": "",
+                    "link": ARKSERVERAPI_RELEASES_PAGE,
+                })
+
+        for comp in UPDATE_COMPONENTS:
+            st = statuses.get(comp)
+            if not st:
+                continue
+            if st["installed"] and _version_is_newer(st["latest"], st["installed"]):
+                advisories.append({
+                    "label": "%s update available (advisory)" % st["label"],
                     "state": "info",
                     "detail": "Installed %s, latest release is %s. Being on an older "
                               "version isn't broken - just worth knowing. %s"
-                              % (installed, latest, how),
+                              % (st["installed"], st["latest"], st["how"]),
                     "hint": "",
-                    "link": page,
+                    "link": st["url"],
+                })
+            elif comp == "launcher":
+                # Only the launcher gets a green "you're current" row - it's the one whose
+                # absence from this list would otherwise read as "the check didn't run".
+                advisories.append({
+                    "label": "Launcher up to date",
+                    "state": "ok",
+                    "detail": "Running %s, the latest release." % APP_VERSION,
+                    "hint": "",
                 })
 
-        # The launcher's own version, via the SAME release-picking the self-update flow and
-        # the tab-bar "!" badge use (_fetch_release_list + _pick_best_release) - no duplicated
-        # comparison logic, so this row and the badge can never disagree. Coexists with the
-        # badge: this is just the Setup Status surfacing of the same result. Unlike the
-        # component rows above, the launcher always gets a row (green check when up to date,
-        # yellow "i" when newer) - it's shown only when GitHub was reachable this run.
+        # The window can be gone by the time a slow fetch returns (the check outlives a
+        # quick close, and now runs after every plugin/.apworld install too) - handing work
+        # to a dead Tk interpreter raises on this thread and helps nobody.
         try:
-            best, version_str = _pick_best_release(self._fetch_release_list(), APP_VERSION)
-        except (OSError, ValueError):
-            best = version_str = None
-            reachable = False
-        else:
-            reachable = True
-        if reachable and best is not None:
-            advisories.append({
-                "label": "Launcher update available (advisory)",
-                "state": "info",
-                "detail": "Installed %s, latest release is %s. Being on an older version "
-                          "isn't broken - just worth knowing. Use \"Check for Updates\" at "
-                          "the top of the window to update in place."
-                          % (APP_VERSION, version_str),
-                "hint": "",
-                "link": (best.get("html_url") or UPDATE_RELEASES_PAGE),
-            })
-        elif reachable:
-            advisories.append({
-                "label": "Launcher up to date",
-                "state": "ok",
-                "detail": "Running %s, the latest release." % APP_VERSION,
-                "hint": "",
-            })
+            self.after(0, self._on_component_versions, statuses, advisories)
+        except (tk.TclError, RuntimeError):
+            pass
 
-        self.after(0, self._on_component_versions, advisories)
-
-    def _on_component_versions(self, advisories):
+    def _on_component_versions(self, statuses, advisories):
+        self._update_status = statuses
         self._component_advisories = advisories
+        # Silent check never acknowledges - it only reflects the current state, so anything
+        # newer lights up both cues until the user actually clicks the button.
+        self._apply_update_indicators()
         # Re-render the Setup Status rows and the tab-bar symbol with the new advisories,
         # whether or not that tab is currently open.
         self._refresh_setup_status()
 
-    def _background_update_check_worker(self):
-        try:
-            releases = self._fetch_release_list()
-        except (OSError, ValueError):
-            return
-        _best, version_str = _pick_best_release(releases, APP_VERSION)
-        # Silent check never acknowledges - it only reflects the current state, so a newer
-        # installable release lights up both cues until the user actually clicks the button.
-        self.after(0, self._apply_update_indicators, version_str or "")
-
-    def _read_acknowledged_version(self):
-        """Newest release the user has clicked 'Check for Updates' through to see, from the
-        persistent config file (empty string if never / unreadable)."""
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return ""
-        val = data.get(ACK_VERSION_KEY, "")
+    def _read_acknowledged_version(self, component):
+        """Newest release of `component` the user has clicked 'Check for Updates' through
+        to see, from the persistent config file (empty string if never / unreadable).
+        Per-component key - see _ack_key."""
+        val = self._read_config_dict().get(_ack_key(component), "")
         return val if isinstance(val, str) else ""
 
-    def _acknowledge_version(self, version_str):
-        """Persist `version_str` as the newest release the user has now seen. Written to
-        the config JSON (not profiles) so it survives restarts - see ACK_VERSION_KEY."""
-        self._write_config_key(ACK_VERSION_KEY, version_str, "acknowledged update version")
+    def _acknowledge_version(self, component, version_str):
+        """Persist `version_str` as the newest release of `component` the user has now seen.
+        Written to the config JSON (not profiles) so it survives restarts - see
+        ACK_VERSION_KEY / _ack_key."""
+        self._write_config_key(_ack_key(component), version_str,
+                               "acknowledged %s version" % component)
 
     def _set_update_highlight(self, on):
         """Light up (or clear) the button's Save-style halo. Off = recoloured to the header
@@ -7695,12 +12140,17 @@ class ArkAPLauncher(tk.Tk):
         border = t["warn_border"] if on else t["bg"]
         self.update_btn_halo.configure(background=colour, highlightbackground=border)
 
-    def _apply_update_indicators(self, latest_version):
-        """Set both cues from the live latest-release version: the persistent "!" badge
-        (an update exists at all, vs installed APP_VERSION) and the dismissible button
-        highlight (newer than what the user has acknowledged). See _compute_update_cues."""
-        show_badge, show_highlight = _compute_update_cues(
-            latest_version, APP_VERSION, self._read_acknowledged_version())
+    def _apply_update_indicators(self):
+        """Set both cues from the collected per-component statuses (self._update_status):
+        the persistent "!" badge (ANY tracked component has something newer than what's
+        installed) and the dismissible button highlight (ANY component is newer than what
+        the user acknowledged FOR THAT COMPONENT).
+
+        Per-component acknowledgement is the whole point of the second comparison: with one
+        shared value, clicking through a plugin update would silently dismiss the highlight
+        for an .apworld update the user never saw. See _compute_update_cues / _ack_key."""
+        show_badge, show_highlight = _aggregate_update_cues(
+            self._update_status, self._read_acknowledged_version)
         self.update_badge_label.configure(text="!" if show_badge else "")
         self._set_update_highlight(show_highlight)
 
@@ -7718,35 +12168,39 @@ class ArkAPLauncher(tk.Tk):
         self._update_check_thread.start()
 
     def _update_check_worker(self):
+        statuses, errors = self._collect_update_statuses()
         try:
-            releases = self._fetch_release_list()
-            self.after(0, self._on_update_check_done, True, releases)
-        except (OSError, ValueError) as exc:
-            self.after(0, self._on_update_check_done, False, str(exc))
+            self.after(0, self._on_update_check_done, statuses, errors)
+        except (tk.TclError, RuntimeError):
+            pass  # window closed mid-check - see _component_version_check_worker
 
-    def _on_update_check_done(self, ok, payload):
+    def _on_update_check_done(self, statuses, errors):
         self._update_check_thread = None
         self.update_check_btn.configure(state="normal", text="Check for Updates")
-        if not ok:
+        # Nothing came back at all AND something failed: this is the offline case. The
+        # startup check swallows it silently, but a deliberate click deserves the error
+        # rather than a cheerful "you're up to date" that isn't known to be true.
+        if not statuses and errors:
             messagebox.showerror("ARKIpelago Launcher",
-                                  "Could not check for updates:\n\n%s" % payload)
+                                  "Could not check for updates:\n\n%s" % errors[0])
             return
-        # payload is the releases list; pick the newest installable (folder-zip) release that
-        # is newer than what's installed. None means we're already on (or ahead of) it.
-        data, version_str = _pick_best_release(payload, APP_VERSION)
-        if data is None:
-            messagebox.showinfo(
-                "ARKIpelago Launcher",
-                "You're up to date.\n\nInstalled version: %s" % APP_VERSION)
+        self._update_status = statuses
+        # The user clicked through to see these releases: acknowledge each component's
+        # latest (persisted, per component), then recompute both cues. The highlight clears
+        # (nothing is newer than what's acknowledged now); the "!" badge stays lit for
+        # whatever is still newer than what's actually installed.
+        for comp, st in statuses.items():
+            self._acknowledge_version(comp, st["latest"])
+        self._apply_update_indicators()
+        if not any(st["installed"] and _version_is_newer(st["latest"], st["installed"])
+                   for st in statuses.values()):
+            # Every component gets a line, including the ones whose version couldn't be
+            # worked out - listing only what was measurable is what made this box say
+            # "Launcher: 0.4.7" and nothing else on an install the launcher didn't build.
+            messagebox.showinfo("ARKIpelago Launcher",
+                                "You're up to date.\n\n%s" % format_update_rows(statuses))
             return
-        _v, tag = _extract_release_version(data)
-        html_url = data.get("html_url") or UPDATE_RELEASES_PAGE
-        # The user clicked through to see this release: acknowledge it (persisted), then
-        # recompute both cues. The highlight clears (this release is no longer newer than
-        # what's acknowledged); the "!" badge stays lit while it's newer than APP_VERSION.
-        self._acknowledge_version(version_str)
-        self._apply_update_indicators(version_str)
-        self._show_update_available_dialog(data, tag, html_url)
+        self._show_update_available_dialog(statuses)
 
     def _find_checksum_asset(self, data, asset_name):
         """Best-effort: some releases attach a checksum file alongside the zip. Recognises
@@ -7789,9 +12243,24 @@ class ArkAPLauncher(tk.Tk):
                 h.update(chunk)
         return h.hexdigest()
 
-    def _show_update_available_dialog(self, data, tag, html_url):
-        asset = _launcher_zip_asset(data)
+    def _dialog_component_action(self, win, tab, action):
+        """Close the update dialog, switch to the tab that owns this component's installer,
+        then run it. Jumping to the tab first is what makes the click legible: those flows
+        put their progress bar and log on their own tab, and firing them from a dialog that
+        then vanishes would look like nothing happened."""
+        win.destroy()
+        try:
+            self.notebook.select(tab)
+        except tk.TclError:
+            pass
+        action()
 
+    def _show_update_available_dialog(self, statuses):
+        """One row per tracked component: installed vs latest, and its own action button.
+        Every component in UPDATE_COMPONENTS gets a row even when its version couldn't be
+        determined - "not detected" / "not installed" said out loud beats a component
+        silently missing from the list, since a missing row is indistinguishable from "this
+        launcher has no such feature" and leaves the user nothing to act on."""
         win = tk.Toplevel(self)
         win.title("Update available")
         win.resizable(False, False)
@@ -7801,15 +12270,65 @@ class ArkAPLauncher(tk.Tk):
         frame = ttk.Frame(win, padding=14)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="A newer version of ARKIpelago Launcher is available.",
+        ttk.Label(frame, text="Updates are available.",
                   font=(self._header_font_family or "Segoe UI", 11, "bold")
-                  ).pack(anchor="w")
-        ttk.Label(frame, text="Installed: %s      Latest: %s" % (APP_VERSION, tag)
-                  ).pack(anchor="w", pady=(2, 8))
+                  ).pack(anchor="w", pady=(0, 8))
 
-        body = (data.get("body") or "").strip()
+        launcher = statuses.get("launcher")
+        actions = {
+            "plugin": lambda: self._dialog_component_action(
+                win, self.tab_install, self.on_install_plugin),
+            "apworld": lambda: self._dialog_component_action(
+                win, self.tab_archipelago, self._on_update_apworld),
+            "trackerpack": lambda: self._dialog_component_action(
+                win, self.tab_archipelago, self._on_install_tracker_pack),
+        }
+        btn_text = {"launcher": "Update Now", "plugin": "Install Plugin",
+                    "apworld": "Update .apworld",
+                    "trackerpack": "Update tracker pack"}
+        labels = UPDATE_COMPONENT_LABELS
+
+        grid = ttk.Frame(frame)
+        grid.pack(fill="x", pady=(0, 8))
+        grid.columnconfigure(1, weight=1)
+        for row, comp in enumerate(UPDATE_COMPONENTS):
+            st = statuses.get(comp)
+            ttk.Label(grid, text=labels[comp]).grid(row=row, column=0, sticky="w",
+                                                    padx=(0, 12), pady=2)
+            ttk.Label(grid, text="Installed: %s      Latest: %s"
+                      % (format_installed_version(st),
+                         (st or {}).get("latest") or "unknown")).grid(row=row, column=1,
+                                                                      sticky="w", pady=2)
+            if not st:
+                continue
+            # An unknown installed version falls THROUGH to the action button rather than
+            # claiming "Up to date": we can't say it is, and the button is the only thing
+            # that makes the row worth showing.
+            if st["installed"] and not _version_is_newer(st["latest"], st["installed"]):
+                ttk.Label(grid, text="Up to date", foreground=self.theme["subtle_fg"]
+                          ).grid(row=row, column=2, sticky="e", pady=2)
+                continue
+            if comp == "launcher":
+                # Only the launcher can update itself from here, and only if the release
+                # actually carries a folder-zip - otherwise it's a manual download.
+                asset = _launcher_zip_asset(st["release"] or {})
+                if not asset:
+                    ttk.Label(grid, text="Download manually", foreground=self.theme["subtle_fg"]
+                              ).grid(row=row, column=2, sticky="e", pady=2)
+                    continue
+                cmd = (lambda s=st, a=asset: self._confirm_and_start_update(
+                    win, s["release"], a, s["latest"]))
+            else:
+                cmd = actions[comp]
+            ttk.Button(grid, text=btn_text[comp], command=cmd).grid(row=row, column=2,
+                                                                    sticky="e", pady=2)
+
+        # Release notes are the launcher's only - the plugin/.apworld share the ArkAP
+        # release whose notes cover both, and three notes boxes is a wall of text.
+        body = ((launcher or {}).get("release") or {}).get("body") or ""
+        body = body.strip()
         if body:
-            ttk.Label(frame, text="Release notes:").pack(anchor="w")
+            ttk.Label(frame, text="Launcher release notes:").pack(anchor="w")
             shown = body if len(body) <= 4000 else body[:4000] + "\n..."
             notes = tk.Text(frame, width=64, height=10, wrap="word",
                              background=self.theme["text_bg"], foreground=self.theme["text_fg"])
@@ -7817,22 +12336,19 @@ class ArkAPLauncher(tk.Tk):
             notes.configure(state="disabled")
             notes.pack(fill="both", expand=True, pady=(2, 8))
 
-        link = ttk.Label(frame, text=html_url, foreground=self.theme["status_info"],
-                          cursor="hand2")
-        link.pack(anchor="w", pady=(0, 10))
-        link.bind("<Button-1>", lambda _e: webbrowser.open(html_url))
+        for comp in UPDATE_COMPONENTS:
+            st = statuses.get(comp)
+            if not st or (st["installed"]
+                          and not _version_is_newer(st["latest"], st["installed"])):
+                continue
+            url = st["url"]
+            link = ttk.Label(frame, text="%s: %s" % (labels[comp], url),
+                              foreground=self.theme["status_info"], cursor="hand2")
+            link.pack(anchor="w")
+            link.bind("<Button-1>", lambda _e, u=url: webbrowser.open(u))
 
         btn_row = ttk.Frame(frame)
-        btn_row.pack(fill="x")
-        if asset:
-            ttk.Button(btn_row, text="Update Now",
-                       command=lambda: self._confirm_and_start_update(win, data, asset, tag)
-                       ).pack(side="left")
-        else:
-            ttk.Label(btn_row, text="No downloadable update package (.zip) was found on this "
-                                     "release - update manually from the link above.",
-                      foreground=self.theme["subtle_fg"], wraplength=340, justify="left"
-                      ).pack(side="left")
+        btn_row.pack(fill="x", pady=(10, 0))
         ttk.Button(btn_row, text="Not Now", command=win.destroy).pack(side="right")
 
     def _confirm_and_start_update(self, dialog, data, asset, tag):
@@ -8079,6 +12595,33 @@ class ArkAPLauncher(tk.Tk):
             cwd=exe_dir, creationflags=creationflags, close_fds=True)
         self.destroy()
 
+    def _sweep_broken_mod_files(self):
+        """Startup housekeeping: delete any corrupt <id>.mod under Content\\Mods. Never
+        fatal. Unlike a missing mod, one of these takes the whole server down on its next
+        start, so it is removed rather than merely reported - after which the mod reads as
+        plainly "not installed" and the Mods tab's Download button fixes it. Logged loudly
+        (Configuration log + Mods log) so the deletion is never silent."""
+        results = remove_broken_mod_files(self.get("SERVER_ROOT"))
+        if not results:
+            return
+        for path, reason, removed in results:
+            line = ("Removed corrupt mod file %s (%s)." if removed else
+                    "! Corrupt mod file %s could not be removed (%s).") % (path, reason)
+            self._log(line)
+            self._mods_log_line(line)
+        gone = [os.path.basename(p) for p, _r, ok in results if ok]
+        stuck = [os.path.basename(p) for p, _r, ok in results if not ok]
+        msg = ""
+        if gone:
+            msg += ("These mod files were corrupt and would have crashed the ARK server "
+                    "on startup, so they were deleted:\n\n%s\n\nRe-download those mods "
+                    "from the Mods tab before starting the server.\n\n" % "\n".join(gone))
+        if stuck:
+            msg += ("These mod files are corrupt but could not be deleted (is the server "
+                    "running?). Delete them by hand before starting the server:\n\n%s"
+                    % "\n".join(stuck))
+        messagebox.showwarning("ARKIpelago Launcher - corrupt mod files", msg.strip())
+
     def _check_previous_update_result(self):
         """Local file read only, no network - reports the outcome of an update-helper run
         that happened just before this process started (see _build_update_ps_script)."""
@@ -8125,31 +12668,30 @@ class ArkAPLauncher(tk.Tk):
             self._cleanup_failed_download(os.path.join(b, name))
 
     # -------------------------------------------- ArkAP plugin install ----- #
-    def _fetch_latest_plugin_release(self, q):
-        """Query GitHub for the latest ArkAP plugin release and its ArkAP_Plugin.zip asset.
+    def _fetch_latest_release_asset(self, asset_name, q):
+        """Query GitHub for the newest ARKipelago release carrying `asset_name`.
 
         Returns (tag, asset_name, download_url, size_bytes). Raises RuntimeError/OSError/
-        ValueError on failure - the worker turns that into a log line + failure result."""
-        req = urllib.request.Request(
-            ARKAP_PLUGIN_RELEASES_API,
-            headers={"User-Agent": GITHUB_API_USER_AGENT,
-                     "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            releases = json.loads(resp.read().decode("utf-8"))
-        data = next((r for r in releases or [] if isinstance(r, dict) and not r.get("draft")),
-                     None)
-        if not data:
+        ValueError on failure - the caller turns that into a log line + failure result.
+        Pre-release-aware via _fetch_arkap_release_list; asset lookup (including the
+        scan DOWN the list for the newest release that actually ships this file) is
+        _release_for_asset, shared with the update check."""
+        releases = [r for r in _fetch_arkap_release_list()
+                    if isinstance(r, dict) and not r.get("draft")]
+        if not releases:
             raise RuntimeError("No releases found (checked %s)." % ARKAP_PLUGIN_RELEASES_API)
-        tag = data.get("tag_name") or "unknown"
-        assets = data.get("assets") or []
-        want = ARKAP_PLUGIN_ASSET_NAME.lower()
-        asset = next((a for a in assets if (a.get("name") or "").lower() == want), None)
-        if not asset:
+        data, asset = _release_for_asset(releases, asset_name)
+        if asset is None:
             raise RuntimeError(
-                "Latest release (%s) has no %s asset. Use \"Manual downloads\" below."
-                % (tag, ARKAP_PLUGIN_ASSET_NAME))
+                "No release has a %s asset (newest checked: %s). Download it by hand from %s."
+                % (asset_name, releases[0].get("tag_name") or "unknown", RELEASES_URL))
+        tag = data.get("tag_name") or "unknown"
         q.put(("line", "Latest release: %s - asset %s" % (tag, asset["name"])))
         return tag, asset["name"], asset["browser_download_url"], asset.get("size", 0)
+
+    def _fetch_latest_plugin_release(self, q):
+        """The plugin installer's asset lookup - see _fetch_latest_release_asset."""
+        return self._fetch_latest_release_asset(ARKAP_PLUGIN_ASSET_NAME, q)
 
     def _locate_extracted_plugin(self, root):
         """Find the folder inside `root` that holds ArkAP\\ArkAP.dll (the plugin payload),
@@ -8316,7 +12858,7 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showwarning(
                 "Install Plugin",
                 "Win64 folder not found under SERVER_ROOT:\n\n%s\n\nInstall the ARK "
-                "dedicated server first (Server Install -> Install ARK Server)." % win64)
+                "dedicated server first (Install Server/Api/Plugin -> Install ARK Server)." % win64)
             return
         if not os.path.isdir(arkapi):
             messagebox.showwarning(
@@ -8618,44 +13160,70 @@ class ArkAPLauncher(tk.Tk):
 
     # ------------------------------------------------- new-seed reset ------ #
     def _arkap_plugin_dir(self):
-        """Resolve the ArkAP plugin folder (<...>\\ArkApi\\Plugins\\ArkAP), or None.
-
-        Deliberately reuses the same path variables that already drive ipc_dir, the
-        "Open Plugins folder" button, and the plugin-install target, so every reset /
-        open / install action points at one folder rather than a parallel one:
-          1. PLUGINS_DIR (the ArkApi Plugins folder) + \\ArkAP
-          2. SERVER_ROOT-derived fixed subpath
-          3. ipc_dir's parent (ipc_dir == <...>\\ArkAP\\ipc)
-        """
-        plugins = self.get("PLUGINS_DIR")
-        if plugins:
-            return os.path.normpath(os.path.join(plugins, "ArkAP"))
-        root = self.get("SERVER_ROOT")
-        if root:
-            return os.path.normpath(os.path.join(
-                root, "ShooterGame", "Binaries", "Win64", "ArkApi", "Plugins", "ArkAP"))
-        ipc = self.get("ipc_dir")
-        if ipc:
-            return os.path.dirname(os.path.normpath(ipc))
-        return None
+        """Resolve the ArkAP plugin folder (<...>\\ArkApi\\Plugins\\ArkAP), or None, from
+        the live Tk fields. The precedence itself lives in resolve_plugin_dir, shared with
+        the version check (which reads the saved config on a worker thread)."""
+        return resolve_plugin_dir(self.get)
 
     # ------------------------------------------------------ debug log ------ #
     def _arkap_debug_log_path(self):
         plugin_dir = self._arkap_plugin_dir()
         return os.path.join(plugin_dir, "ArkAP_debug.log") if plugin_dir else None
 
+    def _log_source_target(self, key):
+        """(path, note) for one dropdown entry.
+
+        path is "" when the launcher can't work out where that file would live (no
+        SERVER_ROOT yet, say); note is what to tell the user when it isn't there - a
+        missing log is normal (no crashes, server never installed), so it gets a plain
+        explanation rather than an empty box or an error."""
+        srv = os.path.normpath(self.get("SERVER_ROOT")) if self.get("SERVER_ROOT") else ""
+        if key == "plugin":
+            return (self._arkap_debug_log_path() or "",
+                    "set PLUGINS_DIR or SERVER_ROOT on the Configuration tab first. The "
+                    "plugin writes this log once it has run at least once.")
+        if key == "launcher":
+            return (launcher_log_path(),
+                    "the launcher writes this as it works - install something, scan for "
+                    "paths or save, and it will appear.")
+        if key == "crash":
+            return (crash_log_path(),
+                    "nothing here is good news: this file only appears if the launcher "
+                    "hits an unexpected error.")
+        if key == "shootergame":
+            return (os.path.join(srv, "ShooterGame", "Saved", "Logs", "ShooterGame.log")
+                    if srv else "",
+                    "set SERVER_ROOT on the Configuration tab. ARK writes this once the "
+                    "dedicated server has been started at least once.")
+        # SteamCMD's own logs, in the bundled steamcmd folder. Note that a --onefile build
+        # unpacks that folder fresh per run (see resource_dir), so these cover the current
+        # session's downloads rather than all history.
+        name = {"steam_console": "console_log.txt", "steam_workshop": "workshop_log.txt",
+                "steam_content": "content_log.txt"}[key]
+        return (os.path.join(steamcmd_dir(), "logs", name),
+                "SteamCMD writes its logs the first time it runs - install the server or "
+                "download a mod and they will appear.")
+
+    def _selected_log_key(self):
+        label = self.debug_log_source_var.get()
+        for src_label, key in LOG_SOURCES:
+            if src_label == label:
+                return key
+        return LOG_SOURCES[0][1]
+
     def _refresh_debug_log(self):
-        path = self._arkap_debug_log_path()
-        if path and os.path.isfile(path):
+        """Load the selected log into the viewer. Reads only the tail of a big file
+        (read_log_tail) so switching to ShooterGame.log doesn't freeze the UI."""
+        path, note = self._log_source_target(self._selected_log_key())
+        if not path:
+            content = "(no log to show - %s)" % note
+        elif os.path.isfile(path):
             try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
+                content = read_log_tail(path) or "(the log exists but is empty: %s)" % path
             except OSError as exc:
-                content = "(could not read log: %s)" % exc
-        elif path:
-            content = "(no log yet at %s)" % path
+                content = "(could not read %s: %s)" % (path, exc)
         else:
-            content = "(set PLUGINS_DIR or SERVER_ROOT on the Configuration tab first)"
+            content = "(no log yet at\n %s\n\n %s)" % (path, note)
 
         widget = self.debug_log_text
         widget.configure(state="normal")
@@ -8747,6 +13315,17 @@ class ArkAPLauncher(tk.Tk):
                     deleted.append(entry.path + os.sep + "  (player mailbox folder)")
                 except OSError as exc:
                     errors.append("%s: %s" % (entry.path, exc))
+
+        # VERIFY, the same way the world-save half verifies itself: re-scan the folder
+        # and fail loudly on anything that isn't installed payload. Both reset buttons
+        # route through here, so both get the check. A hit is either AP state whose
+        # filename nobody added above (the ap_connections.json class of bug - it must be
+        # added to AP_RESET_PLUGIN_FILES / AP_RESET_IPC_FILES), or a file the user put
+        # there themselves; either way the reset is not clean and must not claim it is.
+        for path in find_ap_leftovers(plugin_dir):
+            errors.append("%s: still present after reset - not installed plugin payload, "
+                          "so it is leftover AP state (add it to AP_RESET_PLUGIN_FILES / "
+                          "AP_RESET_IPC_FILES)" % path)
         return deleted, missing, errors
 
     def _backup_and_clear_dir(self, path, ts):
@@ -8826,7 +13405,7 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showwarning(
                 "ARKIpelago Launcher",
                 "The ArkAP plugin folder doesn't exist yet:\n\n%s\n\nInstall the plugin "
-                "first (Server Install -> Install Plugin)." % plugin_dir)
+                "first (Install Server/Api/Plugin -> Install Plugin)." % plugin_dir)
             return
 
         if not self._reset_preflight("Reset AP data"):
@@ -8834,6 +13413,8 @@ class ArkAPLauncher(tk.Tk):
         msg = ("This clears ALL Archipelago tracking the plugin and connector generate "
                "(incoming items AND outgoing checks) in:\n\n%s\n\n"
                "  - plugin state / queues / logs\n"
+               "  - the saved in-game connection (ap_connections.json) - the server "
+               "will NOT auto-reconnect to the old room; /connect again in chat\n"
                "  - ipc mailbox files (session.json, checks_out.jsonl, ...)\n"
                "  - every ipc\\<player> mailbox subfolder\n\n"
                "Your world save, the plugin DLL, ArkAP.config.json and the naming data "
@@ -9120,6 +13701,32 @@ class ArkAPLauncher(tk.Tk):
         except OSError as exc:
             messagebox.showerror("ARKIpelago Launcher",
                                  "Could not run %s:\n%s" % (batname, exc))
+            return
+        if batname == "start_ase_server.bat":
+            # After the launch, never before - it must not delay the server starting.
+            self._show_server_patience_popup()
+
+    def _show_server_patience_popup(self):
+        """Non-blocking "it's starting, give it a minute" note. A plain Toplevel rather
+        than messagebox.showinfo: no grab, no modal loop, closing it isn't required, and
+        the server is already starting behind it either way."""
+        win = tk.Toplevel(self)
+        win.title("Starting the ARK server")
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, wraplength=420, justify="left",
+                  text="The server's starting up now. This takes a while - sometimes up "
+                       "to 15 minutes if it's installed on a hard drive rather than an "
+                       "SSD. Be patient, and leave the console window it opened alone.\n\n"
+                       "Once it's running, look for it under LAN in ARK: Survival "
+                       "Evolved.\n\n"
+                       "If it's still unresponsive after 15 minutes, something may have "
+                       "gone wrong and is worth investigating - Setup Status and the "
+                       "ArkAP Debug Log tabs are the places to look."
+                  ).pack(anchor="w")
+        ttk.Button(frm, text="Got it", command=win.destroy).pack(anchor="e", pady=(10, 0))
 
     # ---------------------------------------------------- in-app search ---- #
     # Searches the ENTIRE app - every tab, not just the active one - and
@@ -9269,6 +13876,11 @@ class ArkAPLauncher(tk.Tk):
         tooltip = getattr(widget, "_tooltip", None)
 
         if isinstance(widget, tk.Text):
+            # The Instructions tab keeps both guides built at once (so collapse state
+            # survives switching modes) but only one packed - skip whichever guide isn't
+            # currently showing, so search only finds matches in the active one.
+            if hasattr(widget, "_instr_vars") and widget is not self._active_instructions_text():
+                return
             widget.tag_configure("search_hl", background=self.SEARCH_HL_COLOR, foreground="black")
             widget.tag_configure("search_hl_current", background=self.SEARCH_HL_CURRENT_COLOR,
                                   foreground="black")
@@ -9420,6 +14032,13 @@ class ArkAPLauncher(tk.Tk):
                 except tk.TclError:
                     pass
 
+    def _update_find_btns(self):
+        """Show Find Prev/Next only while the search box has text in it."""
+        if self.search_var.get().strip():
+            self._find_btns.pack(side="left", before=self._search_status_label)
+        else:
+            self._find_btns.pack_forget()
+
     def _find_next(self):
         self._step_match(1)
 
@@ -9478,7 +14097,7 @@ class ArkAPLauncher(tk.Tk):
             return
 
         if mtype == "text":
-            if widget is getattr(self, "instructions_text", None):
+            if hasattr(widget, "_instr_vars"):
                 self._expand_instruction_step_for_index(widget, match["start"])
             self._center_text_index(widget, match["start"])
             return
@@ -9565,17 +14184,19 @@ class ArkAPLauncher(tk.Tk):
         """If `index` falls inside a collapsed instruction section or step, open it -
         otherwise a search match hiding under an elided (collapsed) region would be
         "found" but never actually become visible when scrolled to."""
+        section_vars, step_vars, step_label_vars = getattr(
+            widget, "_instr_vars", ({}, {}, {}))
         for tag_name in widget.tag_names(index):
             # Re-open the whole section first (its fold hides everything inside it).
-            svar = getattr(self, "_instr_section_vars", {}).get(tag_name)
+            svar = section_vars.get(tag_name)
             if svar is not None and svar.get():
                 svar.set(False)
-            var = self._instruction_step_vars.get(tag_name)
+            var = step_vars.get(tag_name)
             if var is not None and var.get():
                 var.set(False)
             # The "Step N" stub is the mirror case: it's hidden while the step is
             # expanded, so a match landing in it needs the step collapsed instead.
-            var = getattr(self, "_instruction_step_label_vars", {}).get(tag_name)
+            var = step_label_vars.get(tag_name)
             if var is not None and not var.get():
                 var.set(True)
 

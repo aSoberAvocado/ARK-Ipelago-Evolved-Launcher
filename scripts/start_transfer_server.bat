@@ -49,8 +49,12 @@ if "%MAP%"=="" (
 )
 
 :gotmap
-REM ---- must match start_ase_server.bat's SERVER_ROOT + cluster settings exactly ----
-set "SERVER_ROOT=E:\ARK\Server"
+REM SERVER_ROOT / ADMINPASS / SERVERPASS / CLUSTERID / CLUSTERDIR / SAVESROOT come from
+REM paths.cmd now - edit that ONE file (or the launcher's Configuration tab) rather than
+REM this copy, so this always matches start_ase_server.bat exactly.
+call "%~dp0paths.cmd"
+REM ---- edit these (per-script only - this bridge deliberately runs its own SESSION /
+REM ports / MAXPLAYERS alongside the main server) --------------------------
 set "SESSION=ArchipelagoSolo-Bridge"
 set "MAXPLAYERS=2"
 REM distinct ports so this can run ALONGSIDE the main server briefly.
@@ -59,12 +63,6 @@ REM occupies 7778 - the bridge must start at 7779 or higher (it will use 7779+77
 set "GAMEPORT=7779"
 set "QUERYPORT=27016"
 set "RCONPORT=27021"
-set "ADMINPASS=changeme_admin"
-REM If your ports are forwarded on the router (internet-visible), keep a password set here.
-set "SERVERPASS="
-set "CLUSTERID=MyCluster"
-set "CLUSTERDIR=E:\ARK\ServerCluster\ClusterData"
-set "SAVESROOT=E:\ARK\ServerCluster\Saves"
 REM ------------------------------------------------------------------------
 
 set "EXE=%SERVER_ROOT%\ShooterGame\Binaries\Win64\ShooterGameServer.exe"
@@ -72,15 +70,32 @@ if not exist "%EXE%" (
     echo ShooterGameServer.exe not found at %EXE%
     goto end
 )
+REM Same guard as start_ase_server.bat: ARK hangs on its launch sequence (no error) when
+REM -ClusterDirOverride points at a missing/empty path, so stop here rather than launch
+REM into a silent stall. SteamCMD never creates this folder - the launcher does, right
+REM after "Install ARK Server".
+if "%CLUSTERDIR%"=="" goto badcluster
+if not "%CLUSTERDIR:~1,1%"==":" goto badcluster
 if not exist "%CLUSTERDIR%" mkdir "%CLUSTERDIR%"
+if not exist "%CLUSTERDIR%" goto badcluster
 
 REM Per-map save dir: real folder in SAVESROOT, junction inside Saved so ARK can use it.
 REM Must match start_ase_server.bat exactly so main + bridge share each map's world.
+REM SAVESROOT must be a FULL path (X:\...) for the same reason as CLUSTERDIR above.
+if "%SAVESROOT%"=="" goto badsaves
+if not "%SAVESROOT:~1,1%"==":" goto badsaves
 set "MAPSAVEDIR=%SAVESROOT%\%MAP%"
 set "JUNCTION=%SERVER_ROOT%\ShooterGame\Saved\Cluster-%MAP%"
 if not exist "%SERVER_ROOT%\ShooterGame\Saved" mkdir "%SERVER_ROOT%\ShooterGame\Saved"
 if not exist "%MAPSAVEDIR%" mkdir "%MAPSAVEDIR%"
 if not exist "%JUNCTION%" mklink /J "%JUNCTION%" "%MAPSAVEDIR%" >nul
+REM Self-heal a junction that doesn't resolve (stale target from an old SAVESROOT),
+REM then verify - launching through a dangling junction makes ARK save into the void.
+if not exist "%JUNCTION%\" (
+    rmdir "%JUNCTION%" 2>nul
+    mklink /J "%JUNCTION%" "%MAPSAVEDIR%" >nul
+)
+if not exist "%JUNCTION%\" goto badjunction
 
 set "OPTS=%MAP%?listen?SessionName=%SESSION%?Port=%GAMEPORT%?QueryPort=%QUERYPORT%?MaxPlayers=%MAXPLAYERS%?AltSaveDirectoryName=Cluster-%MAP%?RCONEnabled=True?RCONPort=%RCONPORT%?ServerAdminPassword=%ADMINPASS%"
 if not "%SERVERPASS%"=="" set "OPTS=%OPTS%?ServerPassword=%SERVERPASS%"
@@ -92,7 +107,38 @@ echo Save dir: %MAPSAVEDIR%
 echo Cluster: %CLUSTERID%  (%CLUSTERDIR%)
 echo Run 'saveworld' in this console BEFORE closing it once your character has transferred in.
 echo.
-"%EXE%" "%OPTS%" -server -log -NoBattlEye -ClusterId=%CLUSTERID% -ClusterDirOverride=%CLUSTERDIR% -NoTransferFromFiltering
+"%EXE%" "%OPTS%" -server -log -NoBattlEye -ClusterId=%CLUSTERID% -ClusterDirOverride="%CLUSTERDIR%" -NoTransferFromFiltering
+goto end
+
+:badcluster
+echo.
+echo Cluster folder is not usable, so the bridge server was NOT started.
+echo   CLUSTERDIR=%CLUSTERDIR%
+echo.
+echo Starting with a missing cluster folder makes ARK hang on its launch sequence with
+echo no error, and a RELATIVE path silently builds a second cluster folder inside
+echo ShooterGame\Saved - so this script stops instead. Set CLUSTERDIR to a full path
+echo on the launcher's Configuration tab (then Save), or create the folder by hand.
+goto end
+
+:badsaves
+echo.
+echo SAVESROOT is not usable, so the bridge server was NOT started.
+echo   SAVESROOT=%SAVESROOT%
+echo.
+echo It must be a FULL path starting with a drive letter, and must match
+echo start_ase_server.bat's SAVESROOT exactly. Set it on the launcher's
+echo Configuration tab, then Save.
+goto end
+
+:badjunction
+echo.
+echo The per-map save junction does not resolve, so the bridge server was NOT started:
+echo   %JUNCTION%  -^>  %MAPSAVEDIR%
+echo.
+echo ARK would launch but silently fail to save. Delete the Cluster-%MAP% entry inside
+echo ShooterGame\Saved by hand (rmdir removes only the link, never your saves) and
+echo re-run this script to recreate it cleanly.
 
 :end
 endlocal

@@ -8,12 +8,11 @@ REM   switch_map.bat                 (interactive menu)
 REM   switch_map.bat ScorchedEarth_P (direct - map ID from the list below)
 
 setlocal enabledelayedexpansion
-set "SERVER_ROOT=E:\ARK\Server"
-REM Must match start_ase_server.bat's SAVESROOT/CLUSTERDIR exactly - real per-map save data
-REM lives in SAVESROOT now (ShooterGame\Saved\Cluster-<Map> is just a junction pointing at it).
-set "SAVESROOT=E:\ARK\ServerCluster\Saves"
-set "CLUSTERDIR=E:\ARK\ServerCluster\ClusterData"
-set "BACKUPROOT=E:\ARK\ServerCluster\Backups"
+REM SERVER_ROOT / SAVESROOT / CLUSTERDIR / BACKUPROOT all come from paths.cmd now - edit
+REM that ONE file (or the launcher's Configuration tab) rather than this copy, so this
+REM always matches start_ase_server.bat exactly (real per-map save data lives in
+REM SAVESROOT; ShooterGame\Saved\Cluster-<Map> is just a junction pointing at it).
+call "%~dp0paths.cmd"
 set "HERE=%~dp0"
 
 REM ---- known real ASE map IDs (Lost Colony / Astraeos are ASA-only, not listed) ----

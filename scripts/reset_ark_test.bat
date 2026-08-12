@@ -4,13 +4,13 @@ REM Run on the SERVER PC. The save is MOVED to a timestamped backup (not deleted
 REM !! STOP the ARK dedicated server first (save files are locked while it runs) !!
 
 setlocal enabledelayedexpansion
-REM ---- edit if your paths differ ----
-set "SERVER_ROOT=E:\ARK\Server"
-REM Must match start_ase_server.bat's CLUSTERDIR / SAVESROOT. Leave either blank to skip it
-REM (e.g. if you're not running the pseudo-cluster setup and only use plain SavedArks).
-set "CLUSTER=E:\ARK\ServerCluster\ClusterData"
-set "MAPSAVES=E:\ARK\ServerCluster\Saves"
-REM -----------------------------------
+REM SERVER_ROOT / CLUSTERDIR / SAVESROOT come from paths.cmd now - edit that ONE file (or
+REM the launcher's Configuration tab) rather than this copy. CLUSTER/MAPSAVES below are
+REM just this script's own local names for the same two paths (leave either blank to skip
+REM it - e.g. if you're not running the pseudo-cluster setup and only use plain SavedArks).
+call "%~dp0paths.cmd"
+set "CLUSTER=%CLUSTERDIR%"
+set "MAPSAVES=%SAVESROOT%"
 set "PLUGIN=%SERVER_ROOT%\ShooterGame\Binaries\Win64\ArkApi\Plugins\ArkAP"
 set "SAVED=%SERVER_ROOT%\ShooterGame\Saved\SavedArks"
 
@@ -85,6 +85,18 @@ del /q "%PLUGIN%\kill_check_queue.jsonl" 2>nul
 del /q "%PLUGIN%\dino_queue.jsonl"      2>nul
 del /q "%PLUGIN%\crate_queue.jsonl"     2>nul
 del /q "%PLUGIN%\ArkAP_debug.log"       2>nul
+del /q "%PLUGIN%\ArkAP_dino_classes.jsonl" 2>nul
+del /q "%PLUGIN%\ArkAP_loaded.txt"      2>nul
+del /q "%PLUGIN%\ArkAP_engrams_dump.json" 2>nul
+del /q "%PLUGIN%\ArkAP_notes_dump.json" 2>nul
+del /q "%PLUGIN%\ap_restart.bat"        2>nul
+del /q "%PLUGIN%\ap_restart.log"        2>nul
+del /q "%PLUGIN%\ipc\conn_status.txt"   2>nul
+del /q "%PLUGIN%\ipc\boss_out.jsonl"    2>nul
+REM The plugin's own embedded connector (in-game /connect) persists the room here -
+REM host:port, slot, password - and RESUMES it on the next server start. Leaving it
+REM behind is what made a fresh seed reconnect to the previous room.
+del /q "%PLUGIN%\ap_connections.json"   2>nul
 REM multiplayer: each player's mailbox is an ipc\<CharacterName> subfolder - wipe them all.
 for /d %%D in ("%PLUGIN%\ipc\*") do rd /s /q "%%D" 2>nul
 

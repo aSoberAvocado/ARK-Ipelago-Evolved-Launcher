@@ -1,0 +1,59 @@
+('E:\\ARK\\New folder\\ArkAP_Launcher\\build\\ARKipelago Launcher\\ARKipelago '
+ 'Launcher.pkg',
+ {'BINARY': True,
+  'DATA': True,
+  'EXECUTABLE': True,
+  'EXTENSION': True,
+  'PYMODULE': True,
+  'PYSOURCE': True,
+  'PYZ': False,
+  'SPLASH': True,
+  'SYMLINK': False},
+ [('pyi-contents-directory _internal', '', 'OPTION'),
+  ('PYZ-00.pyz',
+   'E:\\ARK\\New folder\\ArkAP_Launcher\\build\\ARKipelago '
+   'Launcher\\PYZ-00.pyz',
+   'PYZ'),
+  ('struct',
+   'E:\\ARK\\New folder\\ArkAP_Launcher\\build\\ARKipelago '
+   'Launcher\\localpycs\\struct.pyc',
+   'PYMODULE'),
+  ('pyimod01_archive',
+   'E:\\ARK\\New folder\\ArkAP_Launcher\\build\\ARKipelago '
+   'Launcher\\localpycs\\pyimod01_archive.pyc',
+   'PYMODULE'),
+  ('pyimod02_importers',
+   'E:\\ARK\\New folder\\ArkAP_Launcher\\build\\ARKipelago '
+   'Launcher\\localpycs\\pyimod02_importers.pyc',
+   'PYMODULE'),
+  ('pyimod03_ctypes',
+   'E:\\ARK\\New folder\\ArkAP_Launcher\\build\\ARKipelago '
+   'Launcher\\localpycs\\pyimod03_ctypes.pyc',
+   'PYMODULE'),
+  ('pyimod04_pywin32',
+   'E:\\ARK\\New folder\\ArkAP_Launcher\\build\\ARKipelago '
+   'Launcher\\localpycs\\pyimod04_pywin32.pyc',
+   'PYMODULE'),
+  ('pyiboot01_bootstrap',
+   'C:\\Users\\a drunk '
+   'avocado\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyInstaller\\loader\\pyiboot01_bootstrap.py',
+   'PYSOURCE'),
+  ('pyi_rth_inspect',
+   'C:\\Users\\a drunk '
+   'avocado\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
+   'PYSOURCE'),
+  ('pyi_rth__tkinter',
+   'C:\\Users\\a drunk '
+   'avocado\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth__tkinter.py',
+   'PYSOURCE'),
+  ('arkap_launcher',
+   'E:\\ARK\\New folder\\ArkAP_Launcher\\arkap_launcher.py',
+   'PYSOURCE')],
+ 'python313.dll',
+ True,
+ False,
+ False,
+ [],
+ None,
+ None,
+ None)
