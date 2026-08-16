@@ -75,6 +75,7 @@ import threading
 import subprocess
 import collections
 import configparser
+import urllib.error
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -88,6 +89,27 @@ from tkinter import font as tkfont
 # GUI groups: (group title, [(key, label, kind), ...])
 # kind: "folder" -> askdirectory Browse ; "file" -> askopenfilename Browse ; "text" -> no Browse
 GROUPS = [
+    ("Network", [
+        ("MAP",        "MAP",        "text"),
+        ("SESSION",    "SESSION",    "text"),
+        ("MAXPLAYERS", "MAXPLAYERS", "text"),
+        ("GAMEPORT",   "GAMEPORT",   "text"),
+        ("QUERYPORT",  "QUERYPORT",  "text"),
+        ("RCONPORT",   "RCONPORT",   "text"),
+        ("ADMINPASS",  "ADMINPASS",  "text"),
+        ("SERVERPASS", "SERVERPASS", "text"),
+        ("TRIBUTEEXP", "TRIBUTEEXP", "text"),
+        # Used to be its own "Cluster" group - a whole section for one field was more
+        # clutter than the setting warranted, and it's as much a network-identity
+        # setting (which maps share one world) as MAP/SESSION are.
+        ("CLUSTERID",  "CLUSTERID",  "text"),
+    ]),
+    # Paths, Plugin files & DeathLink and Locations are set once during initial setup
+    # and rarely touched again, unlike Network above (and the Increase stacks / Upload
+    # server config sections that follow it) - see CONFIG_GROUPS_SETUP_ONCE, which is
+    # what actually pins these three to the bottom of the Configuration tab regardless
+    # of this list's order. Order within the three matters here: Plugin files &
+    # DeathLink sits between Paths and Locations.
     ("Paths", [
         ("SERVER_ROOT", "SERVER_ROOT",           "folder"),
         ("SAVESROOT",   "SAVESROOT",             "folder"),
@@ -106,26 +128,44 @@ GROUPS = [
         ("data_dir",   "data_dir",   "folder"),
         ("game_ini",   "game_ini",   "file"),
     ]),
-    ("Network", [
-        ("MAP",        "MAP",        "text"),
-        ("SESSION",    "SESSION",    "text"),
-        ("MAXPLAYERS", "MAXPLAYERS", "text"),
-        ("GAMEPORT",   "GAMEPORT",   "text"),
-        ("QUERYPORT",  "QUERYPORT",  "text"),
-        ("RCONPORT",   "RCONPORT",   "text"),
-        ("ADMINPASS",  "ADMINPASS",  "text"),
-        ("SERVERPASS", "SERVERPASS", "text"),
-        ("TRIBUTEEXP", "TRIBUTEEXP", "text"),
-    ]),
-    ("Cluster", [
-        ("CLUSTERID", "CLUSTERID", "text"),
-    ]),
-    # Optional and rarely touched, so it sits last - below Paths/Network/Connector/
-    # Cluster - rather than being the first thing the user scrolls past.
     ("Locations", [
         ("connector_ini", "connector.ini file (not required)",                                "file"),
     ]),
 ]
+
+# Rendered last on the Configuration tab, below Network/Increase stacks/Upload server
+# config files - see _build_ui's two _render_field_groups() calls, split by this set
+# rather than by GROUPS' list order so a future reorder of GROUPS can't silently move
+# the wrong groups. The three still render in GROUPS' own order (Paths, Plugin files &
+# DeathLink, Locations).
+CONFIG_GROUPS_SETUP_ONCE = {"Paths", "Plugin files & DeathLink", "Locations"}
+
+# Configuration-tab group title -> persisted collapse-state id (GROUP_COLLAPSE_KEY).
+# These five fold under a header checkbox via _make_collapsible_group, same as the
+# Increase stacks and Upload server config files sections (built separately - see
+# _build_stack_section / _build_config_upload_section, STACKS_GROUP_COLLAPSE_ID /
+# UPLOAD_CONFIG_GROUP_COLLAPSE_ID). The Archipelago Setup tab's groups
+# (ARCHIPELAGO_GROUPS, rendered by the same _render_field_groups()) stay plain.
+GROUP_COLLAPSE_IDS = {
+    "Paths": "paths",
+    "Plugin files & DeathLink": "plugin_deathlink",
+    "Network": "network",
+    "Locations": "locations",
+}
+STACKS_GROUP_COLLAPSE_ID = "stacks"          # Increase stacks section - see _build_stack_section
+UPLOAD_CONFIG_GROUP_COLLAPSE_ID = "upload_config"  # Upload server config files section
+
+# The three Network fields collapsed into their own inline toggle (_make_inline_collapsible)
+# since they're rarely changed and take up a chunk of the group - see _render_field_groups.
+NETWORK_PORT_KEYS = {"GAMEPORT", "QUERYPORT", "RCONPORT"}
+NETWORK_PORTS_GROUP_COLLAPSE_ID = "network_ports"
+
+# Config JSON key for every collapse toggle above: {group_id: bool} where True = collapsed.
+# Missing entirely (first run, or an existing config from before this existed) means every
+# id defaults per _make_collapsible_group/_make_inline_collapsible's default_collapsed -
+# expanded for the five field groups, collapsed for the ports. Written the moment a toggle
+# changes, like THEME_KEY/REMINDER_HIDE_KEY above (see _save_group_collapse_state).
+GROUP_COLLAPSE_KEY = "config_group_collapsed"
 
 # Rendered onto the Archipelago Setup tab by the same _render_field_groups() loop that
 # builds GROUPS on the Configuration tab, so these fields get identical labels, Browse
@@ -664,8 +704,8 @@ FIELD_HELP = {
     ),
     "MAP": (
         "The ARK map ID to launch, e.g. TheIsland, Ragnarok, ScorchedEarth_P.\n"
-        "Note: TheIsland is the only officially supported map right now - other maps "
-        "may work but are untested."
+        "Note: TheIsland is the only officially supported map right now - Ragnarok and Scorched earth"
+        " are in early testing"
     ),
     "SESSION": "The server's session name, shown to players in the ARK server browser.",
     "MAXPLAYERS": "Maximum number of players allowed on the server at once.",
@@ -676,8 +716,24 @@ FIELD_HELP = {
     ),
     "QUERYPORT": "UDP query port used by the Steam server browser and query tools.",
     "RCONPORT": "TCP port for RCON (remote console admin commands).",
-    "ADMINPASS": "Admin password (ServerAdminPassword) for RCON and in-game admin commands.",
-    "SERVERPASS": "Optional password required for players to join. Leave blank for no password.",
+    "ADMINPASS": (
+        "Admin password (ServerAdminPassword) for RCON and in-game admin commands.\n"
+        "\n"
+        "Applied at launch: this is written to paths.cmd and passed to ARK on its command "
+        "line as ?ServerAdminPassword=, which OVERRIDES the ServerAdminPassword key in "
+        "GameUserSettings.ini. The launcher never edits that file (ARK rewrites it on "
+        "shutdown), so it keeps whatever ARK last put there - a different value in the ini "
+        "is expected and harmless, and this field is the one that takes effect."
+    ),
+    "SERVERPASS": (
+        "Optional password required for players to join. Leave blank for no password.\n"
+        "\n"
+        "Applied at launch, like ADMINPASS, as ?ServerPassword= - which overrides "
+        "GameUserSettings.ini's ServerPassword. One catch: when this is BLANK no option is "
+        "passed at all, so a leftover ServerPassword already in GameUserSettings.ini is "
+        "what players will be asked for. To truly have no join password, also clear "
+        "ServerPassword in that file while the server is stopped."
+    ),
     "TRIBUTEEXP": (
         "How many seconds an Obelisk upload (items/dinos/characters) survives before "
         "expiring.\n"
@@ -947,12 +1003,13 @@ def script_requirements(batname):
 CONFIG_FILENAME = "arkap_launcher_config.json"
 
 # Separate from CONFIG_FILENAME on purpose - saving/loading/deleting a named profile
-# (Profiles tab) must never read or write the single active-config JSON above.
+# (the Profiles section of the Settings tab) must never read or write the single
+# active-config JSON above.
 PROFILES_FILENAME = "arkap_launcher_profiles.json"
 
 # --- Reserved autosave profile ---------------------------------------------- #
 # One profile slot the app owns and rewrites on a timer, so a crash/mistake can never
-# cost more than the last few minutes of Configuration edits. It lives in the same
+# cost more than the last few minutes of setup work. It lives in the same
 # PROFILES_FILENAME file as user profiles but is deliberately NOT one of them:
 #   * it never counts as "the user has profiles" (see _ensure_default_profile)
 #   * it can't be created, renamed, or updated by hand (see the _on_*_profile guards)
@@ -968,18 +1025,40 @@ AUTOSAVE_PROFILE_NAME = "Autosave"
 # something actually changed (see _autosave_tick), so an idle app does no disk I/O.
 AUTOSAVE_INTERVAL_MS = 10 * 60 * 1000
 
-AUTOSAVE_PROFILE_NOTES = (
-    "Written automatically by the launcher every 10 minutes - do not edit.\n"
-    "It always holds only the most recent snapshot of the Configuration tab; each "
-    "autosave replaces the last one. Load it to recover settings, then use \"Save as "
-    "new profile\" if you want to keep them."
-)
+# The intervals the Settings tab offers, in minutes. 10 stays the default (see
+# AUTOSAVE_MINUTES_KEY); the rest are there for people who edit constantly (5) or who
+# find a 10-minute write too chatty (30/60).
+AUTOSAVE_MINUTE_CHOICES = (5, 10, 30, 60)
+AUTOSAVE_MINUTES_DEFAULT = AUTOSAVE_INTERVAL_MS // 60000
+
+
+def autosave_profile_notes(minutes):
+    """The Autosave profile's own notes text. Takes the interval rather than hardcoding
+    "10 minutes", so a profile written on a changed interval doesn't describe itself
+    wrongly."""
+    return (
+        "Written automatically by the launcher every %d minutes - do not edit.\n"
+        "It always holds only the most recent snapshot of your whole setup - the "
+        "Configuration and Archipelago Setup fields, the Increase stacks settings and "
+        "the Mods tab; each autosave replaces the last one. Load it to recover "
+        "settings, then use \"Save as new profile\" if you want to keep them." % minutes
+    )
 
 
 def is_autosave_profile(name):
     """True for the reserved autosave slot. Case/whitespace-insensitive so a user
     can't sidestep the guards by typing "autosave " or "AUTOSAVE"."""
     return (name or "").strip().lower() == AUTOSAVE_PROFILE_NAME.lower()
+
+
+# What a stored profile holds, minus the bookkeeping the launcher adds to it (only
+# "autosaved_at" so far - which is why "did anything change?" compares these keys
+# rather than whole profile dicts). "values" is every self.vars field - both tabs'
+# worth - while "stacks" and "mods" carry the two parts of a setup that are NOT
+# self.vars fields. Every one of them is OPTIONAL on read: a profile written before a
+# section existed simply has no key for it, and must keep loading rather than blanking
+# that section (see _apply_profile - the ARCHIPELAGO_DIR bug is why that rule exists).
+PROFILE_STATE_KEYS = ("values", "notes", "stacks", "mods")
 
 
 # --- Pre-created first profile ------------------------------------------------ #
@@ -1001,7 +1080,63 @@ ACTIVE_PROFILE_KEY = "active_profile"
 
 
 # JSON key that persists the "don't show again" choice for the install reminder banner.
+# Legacy: the banner now stores its choice as PROMPT_INSTALL_REMINDER inside
+# HIDDEN_PROMPTS_KEY like every other suppressible prompt, but this key is still READ
+# (never written) so a config written by an older build doesn't forget the choice.
 REMINDER_HIDE_KEY = "hide_install_reminder"
+
+# --- Suppressible informational prompts -------------------------------------- #
+# JSON key holding the list of prompt IDs the user ticked "Don't show this again" on.
+# Keyed on a stable ID rather than the message text so rewording a prompt can't
+# resurrect it for everyone who already dismissed it. One list rather than one key per
+# prompt, so "Restore all hidden prompts" on the Settings tab is a single delete.
+HIDDEN_PROMPTS_KEY = "hidden_prompts"
+
+# Every ID that can end up in that list. Deliberately NOT applied to anything asking to
+# confirm a destructive action, any error/failure message, or a dialog seen only once -
+# suppressing those leaves the user blind to what actually went wrong. These are the
+# purely informational "here's what happened, now go do X" notices a repeat user has
+# already read, and each is shown through _info_once.
+PROMPT_INSTALL_REMINDER = "install_reminder"        # the Configuration-tab banner
+PROMPT_SERVER_PATIENCE = "server_patience"          # "the server takes a while to load"
+PROMPT_SAVE_COMPLETE = "save_complete"              # fires on every single Save
+PROMPT_UPLOAD_CONFIG = "upload_server_config"       # uploaded -> restart the server
+PROMPT_PLUGIN_INSTALLED = "plugin_installed"        # plugin copied -> restart the server
+PROMPT_GAME_INI_PATCHED = "game_ini_patched"        # Game.ini patched -> restart
+PROMPT_STACK_SIZES_APPLIED = "stack_sizes_applied"  # stack settings written -> restart
+PROMPT_POPTRACKER_INSTALLED = "poptracker_installed"  # -> click Save on this tab
+PROMPT_TRACKER_PACK_INSTALLED = "tracker_pack_installed"  # -> Ctrl+F5 PopTracker
+PROMPT_CLUSTER_FOLDERS = "cluster_folders_ready"    # -> press Save
+PROMPT_SERVER_INSTALL_DONE = "server_install_done"  # re-run on every server update
+PROMPT_ARKAPI_INSTALL_DONE = "arkapi_install_done"  # re-run on every ArkApi update
+PROMPT_DIAGNOSTICS_SAVED = "diagnostics_saved"      # repeatable; Explorer opens anyway
+PROMPT_POPTRACKER_ROOM = "poptracker_room_hint"     # already once-per-session
+
+# --- Launcher-level settings (Settings tab) ---------------------------------- #
+# All written the moment they change via _write_config_key, like THEME_KEY - none of
+# them belong to a profile, and none should wait for the Configuration tab's Save.
+UPDATE_CHECK_KEY = "check_updates_on_startup"
+LAST_TAB_KEY = "last_tab"
+REOPEN_LAST_TAB_KEY = "reopen_last_tab"
+AUTOSAVE_ENABLED_KEY = "autosave_enabled"
+AUTOSAVE_MINUTES_KEY = "autosave_minutes"
+# The "Scan intensity" default, shared by the Configuration tab's combobox and the
+# Settings tab's - one StringVar drives both, so they can't disagree. See
+# SCAN_LEVEL_KEY usage in __init__.
+SCAN_LEVEL_KEY = "scan_level"
+
+# How many timestamped backups every backup mechanism keeps for a given source
+# (file/folder/pack) before deleting the oldest. One shared number, not per-mechanism -
+# see prune_backups() and _backup_retention_count(). Minimum 1: 0 would mean "keep no
+# backups", which is backup deletion, not retention, and isn't what this setting is for.
+BACKUP_RETENTION_KEY = "backup_retention_count"
+BACKUP_RETENTION_DEFAULT = 3
+
+# How many days of launcher-log history to keep. Sits next to "Backups to keep" on the
+# Settings tab because it's the same kind of setting: how much history is worth its disk.
+# The default and the reasoning live on LAUNCHER_LOG_RETENTION_DAYS_DEFAULT; the trimming
+# itself is trim_launcher_log(), run once per startup.
+LAUNCHER_LOG_RETENTION_DAYS_KEY = "launcher_log_retention_days"
 
 # JSON key set once, at the end of the very first launch (the same launch that
 # auto-creates DEFAULT_PROFILE_NAME). While it is missing the app opens on the
@@ -1033,6 +1168,12 @@ UPDATE_COMPONENTS = ("launcher", "plugin", "apworld", "trackerpack")
 # config JSON, like REMINDER_HIDE_KEY above.
 ARKAPI_INSTALLED_VERSION_KEY = "arkapi_installed_version"
 PLUGIN_INSTALLED_VERSION_KEY = "plugin_installed_version"
+# The top-level names the ArkApi release zip actually extracted into Win64, recorded at
+# install time. "Remove ArkApi + plugin" removes exactly what an installer put there, and
+# the only honest record of that is the zip's own contents - a hand-maintained list goes
+# stale the first time a release adds a file. ARKAPI_WIN64_NAMES is the fallback for an
+# install that predates this key (or one done by hand).
+ARKAPI_INSTALLED_FILES_KEY = "arkapi_installed_win64_names"
 # Same idea for the .apworld: stamped by "Update .apworld" (_on_apworld_done) from the tag
 # the GitHub download reported.
 APWORLD_INSTALLED_VERSION_KEY = "apworld_installed_version"
@@ -1107,6 +1248,16 @@ THEMES = {
         "search_hl":            "#fff176",
         "search_hl_current":    "#ffb300",
         "search_hl_fg":         "#000000",
+        # Chrome colours (borders, scrollbar troughs/thumbs, combobox drop-downs).
+        # Light mode runs on the native "vista" engine, which draws these itself and
+        # ignores the values - they exist so both palettes have the same key set and
+        # nothing has to branch on theme name.
+        "border":               "#a0a0a0",
+        "trough":               "#e6e6e6",
+        "scroll_thumb":         "#c8c8c8",
+        "scroll_thumb_active":  "#a8a8a8",
+        "select_bg":            "#0078d7",
+        "select_fg":            "#ffffff",
     },
     "dark": {
         "bg":                   "#2b2b2b",
@@ -1130,6 +1281,16 @@ THEMES = {
         "search_hl":            "#fff176",
         "search_hl_current":    "#ffb300",
         "search_hl_fg":         "#000000",
+        # Deliberately mid-greys, not black: a border darker than "bg" reads as a hole
+        # punched in the panel, while these read as an edge. The trough is one step
+        # darker than bg and the thumb one step lighter, so a scrollbar is legible
+        # without becoming the brightest thing on the tab.
+        "border":               "#555555",
+        "trough":               "#232323",
+        "scroll_thumb":         "#4a4a4a",
+        "scroll_thumb_active":  "#5e5e5e",
+        "select_bg":            "#0a5c9e",
+        "select_fg":            "#ffffff",
     },
 }
 
@@ -1268,28 +1429,38 @@ CONNECTOR_PROCESS = "ArkConnector.exe"
 # standalone Python connector never wrote it, which is why an ipc-shaped delete list
 # could not have covered it.
 AP_RESET_PLUGIN_FILES = [
-    "state.json", "seed.json", "applied_index.json", "counters.json",
+    "state.json", "state.json.bak", "seed.json", "applied_index.json", "counters.json",
     "events_queue.jsonl", "ArkAP_note_hits.jsonl", "note_queue.jsonl",
     "tame_check_queue.jsonl", "kill_check_queue.jsonl", "dino_queue.jsonl",
     "crate_queue.jsonl", "ArkAP_debug.log",
     "ap_connections.json", "ap_restart.bat", "ap_restart.log",
-    "ArkAP_dino_classes.jsonl", "ArkAP_loaded.txt",
+    "ArkAP_dino_classes.jsonl", "ArkAP_item_classes.jsonl", "ArkAP_loaded.txt",
+    "ArkAP_positions.jsonl", "ArkAP_note_positions.jsonl",
     "ArkAP_engrams_dump.json", "ArkAP_notes_dump.json",
 ]
 AP_RESET_IPC_FILES = [
     "session.json", "state.json", "checks_out.jsonl", "items_in.jsonl",
     "death_out.jsonl", "death_in.jsonl", "msg_in.jsonl", "hint_out.jsonl",
     "hint_status.json", "flags.json", "game_ini_fragment.txt",
-    "conn_status.txt", "boss_out.jsonl",
+    "conn_status.txt", "boss_out.jsonl", "remaining.json",
 ]
 
 # Everything the plugin INSTALLER puts in the ArkAP folder (payload, not state): the
 # DLL, its config, the shipped naming data, and the per-mod naming data under mods\.
 # A reset must leave exactly these and nothing else - see find_ap_leftovers().
+#
+# This list drifts exactly like the delete lists above do, and in the more dangerous
+# direction: explore_areas.json (exploration-check polygons) and maps.json (the map
+# registry) ship in ArkAP_Plugin.zip alongside engrams/dinos, but were missing here, so
+# the reset verification reported them as leftover STATE and invited someone to add
+# them to AP_RESET_PLUGIN_FILES - which would delete authored payload on every reset and
+# silently break exploration checks and map filtering. New plugin data file => it belongs
+# HERE, not in a delete list. Only files the plugin WRITES belong above.
 AP_PLUGIN_PAYLOAD_FILES = {
     "arkap.dll", "arkap.config.json", "arkap.config.default.json",
     "engrams.json", "locations.json", "dinos.json", "crates.json",
     "filler.json", "tek_grants.json", "spawn_classes.json",
+    "explore_areas.json", "maps.json",
 }
 AP_PLUGIN_PAYLOAD_DIRS = {"mods"}
 
@@ -1310,13 +1481,161 @@ def fmt_bytes(n):
     return "%d B" % n
 
 
-def count_dir_files(path):
+# Windows caps a path at MAX_PATH (260 chars) unless it is handed to the API in
+# extended-length form, which raises the ceiling to ~32,767. This is not theoretical here:
+# a mod's own asset tree is deep on its own (Excalibur Buffs reaches
+# ...\WindowsNoEditor\PrimalEarth\CoreBlueprints\Items\Consumables\Vday\
+# PrimalItemConsumable_ValentinesChocolate.uasset.z.uncompressed_size, 141 chars), so a
+# SteamCMD or SERVER_ROOT prefix of any length pushes it over and every copy dies with
+# "[WinError 3] The system cannot find the path specified" - which reads like the mod is
+# missing when the file is right there.
+#
+# Windows' own opt-out of MAX_PATH is not a substitute. It needs BOTH a longPathAware
+# manifest (PyInstaller's bootloader does emit one - verified in the built exe) AND the
+# machine-wide LongPathsEnabled registry value, which is off by default on Windows 10 and
+# needs an admin registry edit plus a reboot. So on a default machine the manifest alone
+# buys nothing, and the \\?\ prefix is the only fix that works without asking the user to
+# edit their registry.
+_EXT_PATH_PREFIX = "\\\\?\\"
+
+
+def ext_path(path):
+    """A Windows path in extended-length (\\\\?\\) form, which lifts the 260-char MAX_PATH
+    limit. Returns `path` unchanged off Windows, on a falsy value, or if already prefixed.
+
+    The prefix turns OFF all path parsing in the Win32 API: forward slashes stay forward
+    slashes and `.` / `..` are never resolved, so a relative or non-normalized path is
+    silently NOT fixed by it - it just becomes a differently broken path. Hence the
+    abspath() first, which both absolutizes and normalizes. UNC paths take the \\\\?\\UNC\\
+    spelling instead; \\\\server\\share prefixed literally does not resolve.
+
+    Use this at the filesystem call, not for display or storage: it leaks into log lines,
+    error messages and os.walk() results, where users read it as a corrupted path."""
+    if os.name != "nt" or not path:
+        return path
+    path = os.path.abspath(path)
+    if path.startswith(_EXT_PATH_PREFIX):
+        return path
+    if path.startswith("\\\\"):
+        return _EXT_PATH_PREFIX + "UNC\\" + path.lstrip("\\")
+    return _EXT_PATH_PREFIX + path
+
+
+def plain_path(path):
+    """The inverse of ext_path() - for putting a path back in front of a user. A raw
+    \\\\?\\C:\\... in an error message reads as a corrupted path and gets reported as one."""
+    if not path or os.name != "nt":
+        return path
+    if path.startswith(_EXT_PATH_PREFIX + "UNC\\"):
+        return "\\\\" + path[len(_EXT_PATH_PREFIX) + 4:]
+    if path.startswith(_EXT_PATH_PREFIX):
+        return path[len(_EXT_PATH_PREFIX):]
+    return path
+
+
+def _tree_stats(root):
+    """(file_count, longest_full_path) for every file under root, in one walk.
+
+    Both halves answer a question the mod install has to ask: the count is "did every file
+    actually arrive" (a 90%-copied mod passes every existence check and then crashes the
+    server), and the longest path is what a MAX_PATH diagnosis needs to name."""
+    count, longest = 0, root
+    for curdir, _subdirs, files in os.walk(root):
+        for fn in files:
+            count += 1
+            full = os.path.join(curdir, fn)
+            if len(full) > len(longest):
+                longest = full
+    return count, longest
+
+
+_MAX_PATH = 260
+
+
+def _copy_error_text(exc, limit=3):
+    """Readable text for a copy failure. shutil.copytree collects every failed file and
+    raises ONE shutil.Error whose args[0] is a list of (src, dst, why) tuples - str() on
+    that prints the raw repr of the whole list, doubled backslashes and all, which for a
+    mod means hundreds of lines of unreadable escaping around the one sentence that
+    matters. Take the distinct `why` strings instead."""
+    inner = exc.args[0] if isinstance(exc, shutil.Error) and exc.args else None
+    if not isinstance(inner, list):
+        return str(exc)
+    whys = []
+    for item in inner:
+        why = str(item[2]) if isinstance(item, tuple) and len(item) >= 3 else str(item)
+        if why not in whys:
+            whys.append(why)
+    if not whys:
+        return str(exc)
+    text = "; ".join(whys[:limit])
+    if len(inner) > limit:
+        text += " (and %d more file(s))" % (len(inner) - limit)
+    return text
+
+
+def _long_path_hint(exc, path):
+    """A trailing sentence naming path length as the likely cause, when the length of
+    `path` makes that plausible - else "". Appended to the raw error text rather than
+    replacing it: the error is still the evidence, this only says what it usually means.
+
+    Fires on either of two grounds. A path that is genuinely over MAX_PATH is a problem
+    whatever the error says, so length gets named regardless. Below that, it takes a
+    matching error code: WinError 3 (path not found), 206 (filename too long) or 123
+    (invalid name) are what an over-length path raises, and 3 is the misleading one -
+    it is also what a genuinely missing file raises, which is why the raw message reads
+    like the mod was never downloaded."""
+    if os.name != "nt" or not path:
+        return ""
+    over = len(path) >= _MAX_PATH
+    # shutil.copytree collects per-file failures and re-raises them as a shutil.Error
+    # holding their *text*, so the winerror attribute is gone by then - hence the string
+    # check as well.
+    coded = (getattr(exc, "winerror", None) in (3, 206, 123)
+             or any(s in str(exc) for s in ("WinError 3]", "WinError 206", "WinError 123")))
+    if not over and not (coded and len(path) >= 180):
+        return ""
+    return ("\n\nThe longest file path involved is %d characters:\n  %s\n\nWindows refuses "
+            "paths over %d characters, so that is the likely cause here rather than a "
+            "missing file. Moving the ARK server to a shorter SERVER_ROOT (for example "
+            "C:\\ark) shortens every path under it and fixes this."
+            % (len(path), path, _MAX_PATH))
+
+
+def path_is_within(child, parent):
+    """True when child IS parent or lives inside it (normalized, case-insensitive).
+
+    The cluster paths are three INDEPENDENT settings, so nothing stops one from
+    containing another - CLUSTERDIR=C:\\ARK\\ServerCluster with SAVESROOT and BACKUPROOT
+    inside it is a layout users really run. Anything that moves or deletes one cluster
+    folder has to ask this first, or it takes the others with it."""
+    if not child or not parent:
+        return False
+    child = os.path.normcase(os.path.normpath(child))
+    parent = os.path.normcase(os.path.normpath(parent))
+    # The + os.sep matters: "...\ServerCluster2" must not read as inside
+    # "...\ServerCluster".
+    return child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def _walk_skipping(root, skip):
+    """os.walk(root) with every directory at or under one of `skip` pruned."""
+    for dp, dns, fns in os.walk(root):
+        if skip:
+            dns[:] = [d for d in dns
+                      if not any(path_is_within(os.path.join(dp, d), s) for s in skip)]
+        yield dp, dns, fns
+
+
+def count_dir_files(path, skip=()):
     """(file_count, total_bytes, save_file_count) for everything under path.
 
     save_file_count is the subset matching ARK_SAVE_EXTS. Used by the full reset
-    both before a backup move (what SHOULD arrive) and after (what actually did)."""
+    both before a backup move (what SHOULD arrive) and after (what actually did) -
+    `skip` prunes the folders a selective backup is deliberately leaving behind, so
+    "what should arrive" and "what did" stay the same question."""
     files = total = saves = 0
-    for dp, _dns, fns in os.walk(path):
+    for dp, _dns, fns in _walk_skipping(path, skip):
         for fn in fns:
             files += 1
             if fn.lower().endswith(ARK_SAVE_EXTS):
@@ -1328,9 +1647,13 @@ def count_dir_files(path):
     return files, total, saves
 
 
-def find_save_files(roots):
+def find_save_files(roots, skip=()):
     """Every ARK_SAVE_EXTS file under any of `roots`, skipping timestamped
     _backup_ folders (those are already moved aside - finding them is fine).
+
+    `skip` prunes whole configured folders: BACKUPROOT is where old world saves are
+    SUPPOSED to sit, and when it's nested inside CLUSTERDIR the walk reaches it - "your
+    backups still contain saves" is not a failed reset.
 
     Junction-aware dedupe: ShooterGame\\Saved\\Cluster-<Map> and SAVESROOT\\<Map>
     are the same folder seen through two paths, so hits are deduped by realpath.
@@ -1345,7 +1668,7 @@ def find_save_files(roots):
         if rkey in seen_roots or not os.path.isdir(root):
             continue
         seen_roots.add(rkey)
-        for dp, dns, fns in os.walk(root):
+        for dp, dns, fns in _walk_skipping(root, skip):
             dns[:] = [d for d in dns if not re.search(r"_backup_\d", d)]
             for fn in fns:
                 if not fn.lower().endswith(ARK_SAVE_EXTS):
@@ -1422,6 +1745,57 @@ def list_map_junctions(saved_dir):
         out.append((e.path, target, resolves))
     return out
 
+
+def repair_cluster_layout(cluster_paths, saved_dir):
+    """After a reset has moved folders around: every configured cluster folder exists
+    again and every Cluster-<Map> junction resolves. Returns (lines, errors).
+
+    cluster_paths is [(gui_key, path)] - normally CLUSTERDIR / SAVESROOT / BACKUPROOT.
+
+    This runs regardless of layout because the reset cannot know which folders its
+    moves disturbed. The nested layout (SAVESROOT and BACKUPROOT inside CLUSTERDIR) is
+    what made this necessary: backing up CLUSTERDIR took the other two with it and only
+    the per-map junction target was ever recreated, so users had to run "Create
+    ServerCluster folders" by hand - after a reset that reported success. A missing
+    cluster folder is reported as a PROBLEM here rather than left for the user to
+    discover as an ARK server that hangs on startup with no error message."""
+    lines, errors = [], []
+    for key, path in cluster_paths:
+        if not path:
+            continue
+        path = os.path.normpath(path)
+        if os.path.isdir(path):
+            continue
+        try:
+            os.makedirs(path, exist_ok=True)
+            lines.append("%s: recreated after the reset (%s)" % (key, path))
+        except OSError as exc:
+            lines.append("! %s: could not be recreated (%s: %s)" % (key, path, exc))
+
+    # A junction whose target went with a moved folder saves nowhere - ARK writes
+    # through it silently and the world never lands on disk.
+    for jpath, target, resolves in list_map_junctions(saved_dir):
+        if resolves or target is None:
+            continue
+        try:
+            os.makedirs(target, exist_ok=True)
+            lines.append("junction %s -> %s: target recreated (was dangling)"
+                         % (os.path.basename(jpath), target))
+        except OSError as exc:
+            lines.append("! junction %s -> %s is DANGLING and could not be repaired "
+                         "(%s). ARK cannot save through it." % (os.path.basename(jpath),
+                                                                target, exc))
+            errors.append("%s: dangling junction (%s)" % (jpath, exc))
+
+    # The post-reset check proper: state what is true NOW, not what we tried to do.
+    for key, path in cluster_paths:
+        if path and not os.path.isdir(os.path.normpath(path)):
+            lines.append("! %s does NOT exist after the reset: %s - the server will not "
+                         "start until it does (Configuration -> Create ServerCluster "
+                         "folders)" % (key, path))
+            errors.append("%s: %s is missing after the reset" % (key, path))
+    return lines, errors
+
 # The plugin's actual payload filename we key auto-detection of a plugin SOURCE folder on.
 PLUGIN_PAYLOAD_MARKER = os.path.join("ArkAP", "ArkAP.dll")
 # Preserved on upgrade (never overwritten) so a reinstall keeps the user's live settings.
@@ -1474,7 +1848,7 @@ GITHUB_API_USER_AGENT = "ArkAPLauncher"
 # and lays down an --onedir install, permanently ending the "Failed to load Python DLL" race
 # (which was the --onefile bootloader losing a lock-timing fight with AV over the freshly
 # extracted _MEI\python313.dll on the first launch after an update). See build.py --bridge.
-APP_VERSION = "0.4.10"
+APP_VERSION = "0.5.3"
 UPDATE_REPO = "aSoberAvocado/ARK-Ipelago-Evolved-Launcher"
 # NEW clients discover updates from the releases LIST (newest release carrying a launcher
 # folder-zip wins), NOT from /releases/latest - that deliberately ignores GitHub's "Latest"
@@ -1622,6 +1996,27 @@ def base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def other_launcher_installs():
+    """Launcher exes on disk that are NOT the running one - in base_dir() or one folder
+    below it.
+
+    Extracting the release zip by hand into an existing install folder is what produces
+    one: the zip carries a top-level "ARKipelago Launcher\\" folder (it has to - that folder
+    IS the app), so the new copy lands NESTED beside the old exe rather than replacing it,
+    complete with its own blank config and its own log. A desktop shortcut still points at
+    the old exe, so the user keeps running the version they believe they just replaced, and
+    the log they send keeps reporting the old version number."""
+    running = os.path.normcase(os.path.abspath(sys.executable))
+    hits = []
+    for pattern in ("*.exe", os.path.join("*", "*.exe")):
+        for path in glob.glob(os.path.join(glob.escape(base_dir()), pattern)):
+            if os.path.basename(path).lower() not in _KNOWN_LAUNCHER_EXE_NAMES:
+                continue
+            if os.path.normcase(os.path.abspath(path)) != running:
+                hits.append(path)
+    return sorted(hits)
+
+
 # Unhandled-crash log. Lives next to the config JSON (base_dir()), NOT in the per-run
 # _MEI temp extraction folder, so it survives the process dying and the next launch, and
 # a user can actually find it / drag it into Discord. Appended to across restarts (see
@@ -1674,11 +2069,92 @@ def write_crash_log(exc_type, exc_value, exc_tb):
 # on-screen console boxes before this, and was gone the moment the window closed - which is
 # exactly the history you want when someone asks "what did it do before it broke?".
 LAUNCHER_LOG_FILENAME = "arkipelago_launcher.log"
-LAUNCHER_LOG_MAX_BYTES = 1024 * 1024  # ~1 MB - many sessions, still small enough to upload.
+# Size ceiling, as a second trigger alongside the age one below - whichever is hit first.
+# 4 MB rather than the 1 MB this started at: the age window is what should normally decide
+# what goes, and 1 MB was small enough that a couple of SteamCMD-heavy sessions could evict
+# a fortnight's history before it aged out. Still small enough to drop into a Discord
+# message or a diagnostics zip.
+LAUNCHER_LOG_MAX_BYTES = 4 * 1024 * 1024
+# How long a session stays in the log. Two weeks, not a few days: bug reports routinely
+# arrive a day or two after the fact, and a log that has already discarded the session
+# being reported is useless for support. User-adjustable - see
+# LAUNCHER_LOG_RETENTION_DAYS_KEY and _launcher_log_retention_days().
+LAUNCHER_LOG_RETENTION_DAYS_DEFAULT = 14
+
+# One session header, e.g. "2026-08-11 22:02:16 ===== ARKipelago Launcher 0.4.10 started
+# =====". Trimming cuts ONLY on these lines: a log starting halfway through a session has
+# lost the version banner, the loaded profile, the resolved paths and the scripts folder,
+# which is most of what makes the rest of it diagnosable. The capture group is the session's
+# start time, which is what the age check compares against.
+LAUNCHER_LOG_SESSION_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ===== ARKipelago Launcher .* started =====")
 
 
 def launcher_log_path():
     return os.path.join(base_dir(), LAUNCHER_LOG_FILENAME)
+
+
+def _launcher_log_session_starts(lines):
+    """[(line index, epoch seconds)] for every session header in `lines`, oldest first."""
+    out = []
+    for i, line in enumerate(lines):
+        m = LAUNCHER_LOG_SESSION_RE.match(line)
+        if m:
+            try:
+                out.append((i, time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))))
+            except (ValueError, OverflowError):
+                pass  # unreadable stamp - not a cut point, so it rides with its neighbours
+    return out
+
+
+def trim_launcher_log(path, days=LAUNCHER_LOG_RETENTION_DAYS_DEFAULT,
+                      max_bytes=LAUNCHER_LOG_MAX_BYTES, now=None):
+    """Drop whole sessions off the OLDEST end of the launcher log until it is both within
+    `days` and under `max_bytes`. Returns how many sessions were dropped (0 = file left
+    untouched). Never raises - see launcher_log.
+
+    Two triggers, whichever is reached first: age, then size. Both cut only on session
+    boundaries, including the size one - truncating to a byte count would leave a headless
+    partial session at the top, which is the state this is designed to avoid.
+
+    The most recent session is ALWAYS kept, even if it alone is over `max_bytes` or older
+    than the window. Someone who hasn't opened the launcher in a month should still have
+    their last session to report against.
+
+    Call this at startup AFTER the new session header is written, so the current session is
+    the one that can't be dropped."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines(True)
+    except OSError:
+        return 0
+
+    starts = _launcher_log_session_starts(lines)
+    if len(starts) < 2:
+        return 0  # nothing to drop that wouldn't take the only session with it
+
+    # Age: keep from the first header at or after the cutoff. Capped at len-1 so the newest
+    # session survives a window that has aged out everything.
+    cutoff = (time.time() if now is None else now) - max(1, days) * 86400
+    keep = 0
+    while keep < len(starts) - 1 and starts[keep][1] < cutoff:
+        keep += 1
+
+    # Size: same cut points, walked further forward until what remains fits.
+    size = sum(len(l.encode("utf-8", "replace")) for l in lines[starts[keep][0]:])
+    while keep < len(starts) - 1 and size > max_bytes:
+        size -= sum(len(l.encode("utf-8", "replace"))
+                    for l in lines[starts[keep][0]:starts[keep + 1][0]])
+        keep += 1
+
+    if keep == 0 and starts[0][0] == 0:
+        return 0  # already within both limits, and nothing orphaned above the first header
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[starts[keep][0]:])
+    except OSError:
+        return 0
+    return keep
 
 
 def launcher_log(msg, source=""):
@@ -1696,15 +2172,12 @@ def launcher_log(msg, source=""):
     try:
         with open(path, "a", encoding="utf-8", errors="replace") as f:
             f.write(line)
-        # Trim only once it's actually oversized, so the common path stays a plain append
-        # rather than a read-rewrite of the whole file on every line.
-        if os.path.getsize(path) > LAUNCHER_LOG_MAX_BYTES:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                trimmed = _trim_to_tail(f.read(), LAUNCHER_LOG_MAX_BYTES)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(trimmed)
     except OSError:
         pass
+    # Deliberately a plain append with no trimming of its own. This used to _trim_to_tail
+    # here on every line once the file was oversized, which both re-wrote the whole file
+    # per line and cut on a byte count mid-session, decapitating the session at the top.
+    # Trimming now happens once per run, on session boundaries - see trim_launcher_log.
 
 
 def _log_dialog(fn, kind):
@@ -1907,12 +2380,57 @@ def read_for_diagnostics(path, max_lines=DIAG_MAX_LINES):
     if not path:
         return ("(not collected: the launcher doesn't know where this file lives - set "
                 "SERVER_ROOT / PLUGINS_DIR / the Archipelago directory and export again.)\n")
-    if not os.path.isfile(path):
-        return "(not found at %s)\n" % path
+    if not os.path.isfile(ext_path(path)):
+        return "(not found at %s)\n" % plain_path(path)
     try:
-        return _tail_lines(read_text(path)[0], max_lines)
+        return _tail_lines(read_text(ext_path(path))[0], max_lines)
     except OSError as exc:
-        return "(could not read %s: %s)\n" % (path, exc)
+        return "(could not read %s: %s)\n" % (plain_path(path), exc)
+
+
+# ArkApi's own log: <SERVER_ROOT>\ShooterGame\Binaries\Win64\logs\ArkApi_<pid>_<date>_
+# <time>.log, one file per server launch. It is the single most diagnostic file for a
+# startup failure because it records how far the boot actually got: a server that dies
+# during engine init stops right after "API was successfully loaded" and never reaches
+# "UGameEngine::Init was called". Neither of the other logs shows that - ShooterGame.log
+# just records an immediate RequestExit(1), and the launcher's own log only knows it
+# started the .bat.
+ARKAPI_LOGS_RELDIR = os.path.join("ShooterGame", "Binaries", "Win64", "logs")
+ARKAPI_LOG_GLOB = "ArkApi_*.log"
+# How many launches to ship. Not 1: a user retries several times before asking for help,
+# so the newest run is frequently a different (or already-fixed) attempt from the one
+# that failed - three covers a retry loop without bloating the zip (these are ~1 KB).
+DIAG_ARKAPI_LOGS = 3
+
+
+def find_arkapi_logs(server_root, limit=DIAG_ARKAPI_LOGS):
+    """The newest `limit` ArkApi launch logs, newest first, or []."""
+    if not server_root:
+        return []
+    logs = glob.glob(os.path.join(os.path.normpath(server_root),
+                                  ARKAPI_LOGS_RELDIR, ARKAPI_LOG_GLOB))
+    # A file that vanishes between the glob and the stat sorts oldest rather than
+    # blowing up the whole export.
+    logs.sort(key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0, reverse=True)
+    return logs[:limit]
+
+
+def collect_arkapi_log_entries(server_root, limit=DIAG_ARKAPI_LOGS):
+    """[(name_in_zip, text)] for the ArkApi launch logs, newest first and numbered so
+    the reading order is obvious in the zip (1_ is the most recent launch).
+
+    Always returns at least one entry: an empty arkapi_logs/ folder can't be told apart
+    from "we never looked", same reasoning as read_for_diagnostics."""
+    logs = find_arkapi_logs(server_root, limit)
+    if not logs:
+        where = os.path.join(os.path.normpath(server_root), ARKAPI_LOGS_RELDIR) \
+            if server_root else "(SERVER_ROOT is not set)"
+        return [("arkapi_logs/none_found.txt",
+                 "(no %s found in %s - ArkApi writes one per server launch, so this "
+                 "means ArkApi is not installed, or the server has not been started "
+                 "since it was.)\n" % (ARKAPI_LOG_GLOB, where))]
+    return [("arkapi_logs/%d_%s" % (i, os.path.basename(p)), read_for_diagnostics(p))
+            for i, p in enumerate(logs, start=1)]
 
 
 def collect_ipc_entries(ipc_dir):
@@ -1928,14 +2446,19 @@ def collect_ipc_entries(ipc_dir):
     obviously a mailbox file. Same truncation note as the big logs, at a much smaller cap
     (DIAG_IPC_MAX_LINES) - these grow for the whole session. Redaction is the caller's one
     shared pass, like every other entry."""
-    if not ipc_dir or not os.path.isdir(ipc_dir):
+    if not ipc_dir or not os.path.isdir(ext_path(ipc_dir)):
         return []
     out = []
-    for root, dirs, files in os.walk(ipc_dir):
+    # ext_path here for a different reason than the installers: nothing is being written,
+    # but os.walk swallows the error from a directory it can't open, so an over-MAX_PATH
+    # mailbox would drop out of the bundle silently and read as "the plugin wrote no ipc
+    # files". A diagnostics export that quietly omits things is worse than one that fails.
+    ipc_x = ext_path(ipc_dir)
+    for root, dirs, files in os.walk(ipc_x):
         dirs.sort()
         for name in sorted(files):
             path = os.path.join(root, name)
-            rel = os.path.relpath(path, ipc_dir).replace(os.sep, "/")
+            rel = os.path.relpath(path, ipc_x).replace(os.sep, "/")
             out.append(("ipc/" + rel, read_for_diagnostics(path, DIAG_IPC_MAX_LINES)))
     return out
 
@@ -2024,11 +2547,11 @@ def format_dir_listing(path, label):
 
     The sizes are the whole point: a 0-byte .mod file crashes the ARK server on startup
     and is completely invisible in a screenshot of Explorer's default view."""
-    lines = ["%s: %s" % (label, path or "(not set)")]
-    if not path or not os.path.isdir(path):
+    lines = ["%s: %s" % (label, plain_path(path) or "(not set)")]
+    if not path or not os.path.isdir(ext_path(path)):
         return "\n".join(lines + ["(folder not found)"]) + "\n"
     try:
-        entries = sorted(os.scandir(path), key=lambda e: e.name.lower())
+        entries = sorted(os.scandir(ext_path(path)), key=lambda e: e.name.lower())
     except OSError as exc:
         return "\n".join(lines + ["(could not list: %s)" % exc]) + "\n"
     if not entries:
@@ -2219,6 +2742,30 @@ def _pick_best_release(releases, installed_version):
         if best is None or _version_is_newer(ver, best_ver):
             best, best_ver = rel, ver
     return best, best_ver
+
+
+def update_error_text(exc):
+    """Human-readable message for a failed update check.
+
+    GitHub's anonymous API allowance (60 requests per hour per IP, shared by every app on
+    the connection) is the one failure users hit repeatedly, and each launcher start spends
+    several of them - so a few restarts while troubleshooting is enough to trip it. Raw
+    "HTTP Error 403: rate limit exceeded" reads as a broken launcher when the only fix is to
+    wait, and the response says exactly how long via X-RateLimit-Reset."""
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in (403, 429):
+        headers = exc.headers or {}
+        if "rate limit" in str(exc).lower() or headers.get("X-RateLimit-Remaining") == "0":
+            when = "within the hour"
+            try:
+                mins = int((int(headers["X-RateLimit-Reset"]) - time.time()) // 60) + 1
+                if 0 < mins <= 90:
+                    when = "in about %d minute(s)" % mins
+            except (KeyError, TypeError, ValueError):
+                pass
+            return ("GitHub is rate-limiting update checks from this network (it allows 60 "
+                    "anonymous requests an hour). Nothing is wrong with your install or "
+                    "your connection - try again %s." % when)
+    return str(exc)
 
 
 def _fetch_arkap_release_list():
@@ -2473,6 +3020,12 @@ $appDir      = @@APPDIR@@
 $currentExe  = @@CURRENTEXE@@
 $stagedDir   = @@STAGEDDIR@@
 $stagedExe   = @@STAGEDEXE@@
+# Where the new exe LANDS. Deliberately the staged exe's own filename in the install
+# folder, NOT $currentExe: renaming the app's exe in a release only reaches existing users
+# if the updater stops forcing the incoming exe back to the name it was launched from.
+# Identical to $currentExe whenever the name hasn't changed, so the common path is unchanged.
+$newExe      = Join-Path $appDir ([System.IO.Path]::GetFileName($stagedExe))
+$renamed     = ($newExe -ne $currentExe)
 $internalDir = @@INTERNAL@@
 $dllGlob     = @@DLLGLOB@@
 $zipPath     = @@ZIPPATH@@
@@ -2511,8 +3064,20 @@ for ($i = 0; $i -lt 60; $i++) {
 
 $curInternal = Join-Path $appDir $internalDir
 $stagedInternal = Join-Path $stagedDir $internalDir
-$bakInternal = "$curInternal.old"
-$bakExe = "$currentExe.old"
+
+# A FIXED ".old" backup name is what made this update fail forever: if an earlier run left
+# one behind and it can NOT be deleted (AV still holding a DLL inside it, a second launcher
+# instance running, read-only attributes), the Remove-Item below fails silently and
+# Rename-Item onto that existing name throws "Cannot create a file when that file already
+# exists" - and does so identically on every retry, so the user can never update again.
+# Pick a name that is free RIGHT NOW instead, the same way _backup_and_clear_dir() picks a
+# free save-backup folder. A stuck leftover then costs disk space, not the update.
+function New-BackupPath($base) {
+  $p = "$base.old"
+  $n = 2
+  while (Test-Path -LiteralPath $p) { $p = "$base.old$n"; $n++ }
+  return $p
+}
 
 # 2. Validate the staged payload really is there before touching the install.
 $stagedDll = Get-ChildItem -LiteralPath $stagedInternal -Filter $dllGlob -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -2527,8 +3092,12 @@ Wait-Unlocked $stagedDll.FullName | Out-Null
 
 # 4. Swap in the new program files (exe + _internal), rolling back on any failure so the
 #    user is never left without a working launcher. Config/profiles are never touched.
-Remove-Item -Recurse -Force $bakInternal -ErrorAction SilentlyContinue
-Remove-Item -Force $bakExe -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$curInternal.old" -ErrorAction SilentlyContinue
+Remove-Item -Force "$currentExe.old" -ErrorAction SilentlyContinue
+$bakInternal = New-BackupPath $curInternal   # after the cleanup above, so .old is reused when free
+# The OLD exe is renamed out of the way and deleted in step 6, so a rename leaves exactly
+# one executable behind - never both, which would leave the user guessing which is current.
+$bakExe = New-BackupPath $currentExe
 try {
   if (Test-Path -LiteralPath $curInternal) {
     Rename-Item -LiteralPath $curInternal -NewName ([System.IO.Path]::GetFileName($bakInternal))
@@ -2537,9 +3106,12 @@ try {
   if (Test-Path -LiteralPath $currentExe) {
     Rename-Item -LiteralPath $currentExe -NewName ([System.IO.Path]::GetFileName($bakExe))
   }
-  Move-Item -LiteralPath $stagedExe -Destination $currentExe
+  Move-Item -LiteralPath $stagedExe -Destination $newExe
 } catch {
   $err = $_.Exception.Message
+  # On a rename these are two different files, so the half-installed new one has to go
+  # before the old name is restored, or the rollback leaves both on disk.
+  if ($renamed) { Remove-Item -Force $newExe -ErrorAction SilentlyContinue }
   if ((-not (Test-Path -LiteralPath $currentExe)) -and (Test-Path -LiteralPath $bakExe)) {
     Rename-Item -LiteralPath $bakExe -NewName ([System.IO.Path]::GetFileName($currentExe))
   }
@@ -2557,12 +3129,21 @@ try {
 #    races the scanner and the 'Failed to load Python DLL' dialog can never appear.
 $finalDll = Get-ChildItem -LiteralPath $curInternal -Filter $dllGlob -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($finalDll) { Wait-Unlocked $finalDll.FullName | Out-Null }
-Wait-Unlocked $currentExe | Out-Null
+Wait-Unlocked $newExe | Out-Null
 
-Write-Result 'OK' 'Updated successfully.'
-Start-Process -FilePath $currentExe -WorkingDirectory $appDir
+# A rename silently breaks every shortcut the user made to the old filename, and a shortcut
+# to a missing file is the sort of thing people blame on the update. Say so once, in the
+# dialog the relaunched app shows (see _check_previous_update_result). No stub left behind
+# at the old name on purpose: an exe that starts nothing is worse than an obvious absence.
+if ($renamed) {
+  Write-Result 'OK' ('The launcher is now called "' + [System.IO.Path]::GetFileName($newExe) + '" (it was "' + [System.IO.Path]::GetFileName($currentExe) + '"). Any desktop or Start Menu shortcut you made points at the old name and will no longer work - right-click the new file and create a fresh shortcut.')
+} else {
+  Write-Result 'OK' ''
+}
+Start-Process -FilePath $newExe -WorkingDirectory $appDir
 
-# 6. Best-effort cleanup (the relaunched app also sweeps these on startup).
+# 6. Best-effort cleanup (the relaunched app also sweeps these on startup). $bakExe is the
+#    OLD exe when the name changed - deleting it is what stops two launchers coexisting.
 Remove-Item -Recurse -Force $bakInternal -ErrorAction SilentlyContinue
 Remove-Item -Force $bakExe -ErrorAction SilentlyContinue
 Clean-Temp
@@ -2990,6 +3571,46 @@ def write_text(path, text, encoding="utf-8"):
         f.write(text)
 
 
+# A write that leaves less than this fraction of the file behind is treated as a bug
+# rather than an edit. The floor keeps the ratio from firing on genuinely tiny files,
+# where removing a couple of lines really is half the file.
+INI_SHRINK_RATIO = 0.5
+INI_SHRINK_FLOOR = 512
+
+
+def write_ini_guarded(path, text, encoding="utf-8", expect_shrink=False):
+    """write_text for Game.ini / GameUserSettings.ini, with a refusal if the new contents
+    are drastically smaller than what is already on disk.
+
+    Every edit this launcher makes to those two files is a targeted splice of a handful
+    of lines, so the result is always about the size of the original. Text that comes out
+    a fraction of the file's current size was not built from that file's real contents,
+    and writing it would destroy every setting the launcher doesn't model - comments,
+    unknown sections, unknown keys, the lot. Cheap to check, and it turns a silent
+    config wipe into an error message.
+
+    expect_shrink=True is for the writes whose whole purpose is bulk removal (stripping a
+    randomized-creatures wall, taking the stack block back out); there a large shrink is
+    the intended result, not a symptom.
+
+    Raises OSError so every caller's existing write-failure handling - backup kept, error
+    surfaced to the user, file left alone - applies unchanged."""
+    if not expect_shrink:
+        try:
+            old = os.path.getsize(path)
+        except OSError:
+            old = 0        # nothing there yet: nothing to shrink, nothing to protect
+        new = len(text.encode(encoding, errors="replace"))
+        if old > INI_SHRINK_FLOOR and new < old * INI_SHRINK_RATIO:
+            raise OSError(
+                "refusing to write %s: %d bytes on disk, but the new contents are only "
+                "%d. A targeted setting change never shrinks a config that much, so this "
+                "write looks like it was built from something other than the file itself "
+                "and would drop settings this launcher doesn't manage. Nothing was "
+                "written - your file is unchanged." % (path, old, new))
+    write_text(path, text, encoding)
+
+
 def _fragment_payload_lines(fragment_text):
     """The NPCReplacements lines from a game_ini_fragment.txt, minus its own section
     header (so merging never emits a second [/script/shootergame.shootergamemode])."""
@@ -2997,13 +3618,48 @@ def _fragment_payload_lines(fragment_text):
             if ln.strip() and ln.strip().lower() != GAME_INI_SECTION.lower()]
 
 
-def remove_game_ini_marked_block(text):
-    """Strip the app's marker-wrapped NPCReplacements block (BEGIN..END, inclusive) from
-    Game.ini text. Returns (new_text, removed). Everything else is left byte-for-byte -
-    the section header and any of the user's own lines in it stay put."""
-    new = re.sub(re.escape(GAME_INI_BLOCK_BEGIN) + r".*?" + re.escape(GAME_INI_BLOCK_END)
+def remove_game_ini_marked_block(text, begin=GAME_INI_BLOCK_BEGIN,
+                                 end=GAME_INI_BLOCK_END):
+    """Strip one of the app's marker-wrapped blocks (BEGIN..END, inclusive) from Game.ini
+    text. Returns (new_text, removed). Everything else is left byte-for-byte - the section
+    header and any of the user's own lines in it stay put.
+
+    Defaults to the NPCReplacements markers; the stack-size block passes its own pair
+    (STACK_BLOCK_BEGIN/END) so the two managed blocks never touch each other."""
+    new = re.sub(re.escape(begin) + r".*?" + re.escape(end)
                  + r"(?:\r?\n)?", "", text, flags=re.S)
     return new, (new != text)
+
+
+def merge_game_ini_block(existing_text, payload_lines, begin, end):
+    """Splice `payload_lines`, wrapped in the begin/end markers, into Game.ini's
+    [/script/shootergame.shootergamemode] section, and return the new text.
+
+    Any previous block with the SAME markers is stripped first, so re-applying replaces
+    rather than stacks. If the section header already exists ANYWHERE the block is merged
+    in right under it (ARK honours only one instance of that section); otherwise a fresh
+    section + block is placed at the top. Every other line is preserved, and the file's
+    existing line endings are matched.
+
+    Shared by the randomized-creatures fragment and the stack-size overrides - the splice
+    is identical for both, only the markers and the payload differ."""
+    nl = "\r\n" if "\r\n" in existing_text else "\n"
+    txt, _ = remove_game_ini_marked_block(existing_text, begin, end)
+    block = begin + nl + nl.join(payload_lines) + nl + end + nl
+
+    idx = txt.lower().find(GAME_INI_SECTION.lower())
+    if idx == -1:
+        # No section yet: fresh section + block at the very top, user's content below it.
+        prefix = GAME_INI_SECTION + nl + block
+        return prefix + nl + txt if txt.strip() else prefix
+    # Section present: splice the block in right under its header - no duplicate header.
+    line_end = txt.find("\n", idx)
+    if line_end == -1:                     # header is the final line with no newline
+        txt += nl
+        at = len(txt)
+    else:
+        at = line_end + 1
+    return txt[:at] + block + txt[at:]
 
 
 def game_ini_unmarked_fragment_count(text):
@@ -3033,31 +3689,16 @@ def merge_game_ini_fragment(existing_text, fragment_text, remove_unmarked=False)
     if not payload:
         return None, 0
 
-    nl = "\r\n" if "\r\n" in existing_text else "\n"
-    # Drop any previous auto-managed block so a re-apply replaces it instead of stacking.
-    txt, _ = remove_game_ini_marked_block(existing_text)
+    txt = existing_text
     if remove_unmarked:
-        # Also remove hand-pasted / leftover fragment lines (now the only ones left, the
-        # marker block having just gone) so the confirmed replace collapses to one wall.
+        # Remove hand-pasted / leftover fragment lines. Lines inside our own marker block
+        # match this too, but merge_game_ini_block drops that block whole anyway, so the
+        # confirmed replace still collapses to exactly one wall.
         txt = re.sub(r'(?im)^[ \t]*' + re.escape(GAME_INI_FRAGMENT_KEY)
                      + r'[ \t]*=.*(?:\r?\n)?', "", txt)
 
-    block = (GAME_INI_BLOCK_BEGIN + nl + nl.join(payload) + nl
-             + GAME_INI_BLOCK_END + nl)
-
-    idx = txt.lower().find(GAME_INI_SECTION.lower())
-    if idx == -1:
-        # No section yet: fresh section + block at the very top, user's content below it.
-        prefix = GAME_INI_SECTION + nl + block
-        return (prefix + nl + txt if txt.strip() else prefix), len(payload)
-    # Section present: splice the block in right under its header - no duplicate header.
-    line_end = txt.find("\n", idx)
-    if line_end == -1:                     # header is the final line with no newline
-        txt += nl
-        at = len(txt)
-    else:
-        at = line_end + 1
-    return txt[:at] + block + txt[at:], len(payload)
+    return (merge_game_ini_block(txt, payload, GAME_INI_BLOCK_BEGIN, GAME_INI_BLOCK_END),
+            len(payload))
 
 
 # --------------------------------------------------------------------------- #
@@ -3147,54 +3788,435 @@ def upsert_ini_key(text, section, key, value):
     return out
 
 
+def remove_ini_key(text, section, key):
+    """Return (new_text, removed) with `key`'s line deleted from inside [section].
+
+    The mirror of upsert_ini_key, and just as targeted: the section header, the user's
+    other keys, the comments and the line endings all stay exactly as they were. Used when
+    the "Increase stacks" toggle goes off - the launcher takes back only the one line it
+    put there."""
+    lines = text.splitlines()
+    bounds = _ini_section_bounds(lines, section)
+    if bounds is None:
+        return text, False
+    start, end = bounds
+    key_re = re.compile(r'^\s*' + re.escape(key) + r'\s*=', re.I)
+    keep = [ln for i, ln in enumerate(lines)
+            if not (start < i < end and key_re.match(ln))]
+    if len(keep) == len(lines):
+        return text, False
+    nl = "\r\n" if "\r\n" in text else ("\r" if "\r" in text and "\n" not in text else "\n")
+    out = nl.join(keep)
+    if text.endswith(("\n", "\r")):
+        out += nl
+    return out, True
+
+
 def _gameusersettings_path(server_root):
     return os.path.join(os.path.normpath(server_root), SERVER_CONFIG_RELDIR,
                         "GameUserSettings.ini")
+
+
+def read_active_mods_or_none(server_root):
+    """Ordered list of active mod IDs from GameUserSettings.ini's [ServerSettings]
+    ActiveMods, or None when there is no answer to be had on disk.
+
+    The distinction read_active_mods flattens away, and the whole reason this exists:
+
+      []   - ActiveMods really is there and really is blank. NO mods are active.
+      None - SERVER_ROOT isn't set, the file isn't there, the file can't be read, or it
+             has no ActiveMods line at all. We do not KNOW what is active.
+
+    Both used to come back as [], so "I couldn't read it" was indistinguishable from "the
+    answer is: nothing". Anything that overwrites the user's ticks from this value has to
+    tell the two apart - unticking the whole Mods tab because the line momentarily wasn't
+    there throws away real state, and the next Save then writes that loss to disk."""
+    if not server_root:
+        return None
+    path = _gameusersettings_path(server_root)
+    if not os.path.isfile(path):
+        return None
+    try:
+        text, _enc = read_text(path)
+    except OSError:
+        # Locked/unreadable (AV holds it open, the server is mid-write, ...) - unknown,
+        # emphatically not "no mods active".
+        return None
+    raw = read_ini_key(text, ACTIVE_MODS_SECTION, ACTIVE_MODS_KEY)
+    if raw is None:
+        return None                       # no ActiveMods line at all -> unknown
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
 
 def read_active_mods(server_root):
     """Ordered list of active mod IDs from GameUserSettings.ini's [ServerSettings]
     ActiveMods - the AUTHORITATIVE on-disk activation state, read straight off disk so the
     GUI reflects truth, not in-memory intent. [] if the file/section/key is absent or the
-    value is blank."""
-    if not server_root:
-        return []
-    path = _gameusersettings_path(server_root)
-    if not os.path.isfile(path):
-        return []
-    text, _enc = read_text(path)
-    raw = read_ini_key(text, ACTIVE_MODS_SECTION, ACTIVE_MODS_KEY)
-    if not raw:
-        return []
-    return [p.strip() for p in raw.split(",") if p.strip()]
+    value is blank.
+
+    For read-only reporting. Anything that WRITES the ticks back from this must use
+    read_active_mods_or_none instead - see its docstring."""
+    return read_active_mods_or_none(server_root) or []
 
 
 def set_active_mods(server_root, mod_ids, backup=True):
     """Write the ordered list of active mod IDs into GameUserSettings.ini's
     [ServerSettings] ActiveMods, comma-joined in order (left blank when the list is empty,
     which disables all mods without removing the line). Targeted upsert - all other keys
-    and sections are preserved. Creates the file/section if missing. Backs the file up to
-    <file>.bak first (like the config-upload flow). Returns (ok, message)."""
+    and sections are preserved. Creates the section if missing, but never the file - see
+    below. Backs the file up to <file>.bak first (like the config-upload flow). Returns
+    (ok, message)."""
     if not server_root or not os.path.isdir(os.path.join(server_root, "ShooterGame")):
         return False, ("SERVER_ROOT isn't set to an installed ARK server "
                        "(no ShooterGame folder).")
     value = ",".join(str(m).strip() for m in mod_ids)
     path = _gameusersettings_path(server_root)
+    # A config that doesn't exist yet is a server that has never been started, not an
+    # invitation to leave a stub behind - the same rule apply_stack_settings states. This
+    # used to write one from scratch, and the result was a GameUserSettings.ini holding
+    # ActiveMods, whatever the stacks feature added next, and none of ARK's own settings:
+    # indistinguishable, from the user's side, from the launcher having eaten the file.
+    if not os.path.isfile(path):
+        return False, ("GameUserSettings.ini doesn't exist yet at %s - start the ARK "
+                       "server once so it writes its own config, then apply the mods "
+                       "again. (Writing a new file here would leave the server running "
+                       "on this one setting and none of its defaults.)" % path)
     try:
-        if os.path.isfile(path):
-            text, _enc = read_text(path)
-        else:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            text = ""
+        text, _enc = read_text(path)
         new_text = upsert_ini_key(text, ACTIVE_MODS_SECTION, ACTIVE_MODS_KEY, value)
-        if backup and os.path.isfile(path):
+        if backup:
             shutil.copyfile(path, path + ".bak")
-        write_text(path, new_text)  # utf-8, no BOM (write_text passes no BOM)
+        # utf-8, no BOM (write_text passes no BOM), and guarded against a write that
+        # would shrink the file - see write_ini_guarded.
+        write_ini_guarded(path, new_text)
     except OSError as exc:
         return False, "Couldn't write ActiveMods to GameUserSettings.ini: %s" % exc
     if value:
         return True, "Set ActiveMods=%s" % value
     return True, "Cleared ActiveMods (all mods disabled)."
+
+
+# --------------------------------------------------------------------------- #
+#  Increase stacks - ItemStackSizeMultiplier + ConfigOverrideItemMaxQuantity
+# --------------------------------------------------------------------------- #
+# Two settings in two different files, because that is where ARK reads each of them:
+#
+#   GameUserSettings.ini  [ServerSettings]
+#       ItemStackSizeMultiplier=10.00
+#   Game.ini              [/script/shootergame.shootergamemode]
+#       ConfigOverrideItemMaxQuantity=(ItemClassString="...",Quantity=(...))
+#
+# They are NOT redundant with each other. The multiplier only scales items that ALREADY
+# stack, so an item whose vanilla stack is 1 - raw prime meat, prime fish meat, mutton,
+# honey, fertilizer - is multiplied to 1 and still eats a slot each, which is exactly the
+# inventory-cap loss this feature exists to stop. The per-item overrides are the only
+# thing that helps those, and each is written with bIgnoreMultiplier=true so the number in
+# the box is used literally instead of being multiplied on top.
+#
+# Deliberately not a stack mod: a stack mod ships replacement item blueprints, and the
+# ArkAP plugin's engram-grant script matches on blueprint data, so a stack mod breaks item
+# grants. These two settings change quantities only and leave blueprints alone.
+#
+# Both writes are targeted (upsert_ini_key / a marker-wrapped merge_game_ini_block), never
+# a full-file rewrite, so a config the user uploaded keeps every other key byte-for-byte.
+
+STACK_MULT_SECTION = "ServerSettings"
+STACK_MULT_KEY = "ItemStackSizeMultiplier"  # capitalization matters to ARK - keep it exact
+STACK_BLOCK_BEGIN = "; === ArkAP stack sizes BEGIN (auto-managed, do not edit) ==="
+STACK_BLOCK_END = "; === ArkAP stack sizes END ==="
+STACK_MULT_DEFAULT = "10.00"
+STACK_QTY_DEFAULT = "500"
+
+# (label, class string, vanilla stack size). Every class string was verified against BOTH
+# the ARK wiki's Item IDs table and the item's own page's spawn command, because a wrong
+# PrimalItem*_C produces a line ARK silently ignores - worse than leaving the item out,
+# since the setting then looks applied and isn't.
+#
+# Scoped to what the multiplier cannot fix (the five stack-1 items) plus organic polymer,
+# whose stack of 20 is far below what one harvesting run produces. Anything stacking to 30
+# or more - cooked prime meat, black pearl, element, cementing paste, silica pearls, rare
+# flowers - is already handled by the multiplier and would only be noise here.
+STACK_ITEMS = [
+    ("Raw Prime Meat",      "PrimalItemConsumable_RawPrimeMeat_C",       1),
+    ("Raw Prime Fish Meat", "PrimalItemConsumable_RawPrimeMeat_Fish_C",  1),
+    ("Raw Mutton",          "PrimalItemConsumable_RawMutton_C",          1),
+    ("Giant Bee Honey",     "PrimalItemConsumable_Honey_C",              1),
+    ("Fertilizer",          "PrimalItemConsumable_Fertilizer_Compost_C", 1),
+    ("Organic Polymer",     "PrimalItemResource_Polymer_Organic_C",     20),
+]
+STACK_ITEM_LABELS = {cls: label for label, cls, _vanilla in STACK_ITEMS}
+
+# JSON key (in CONFIG_FILENAME) holding the section's INTENT:
+#   {"enabled": bool, "multiplier": "10.00", "items": {"<class>": "500", ...}}
+# Written the moment a box changes via _write_config_key, like MODS_KEY - it has nothing
+# to do with the Configuration tab's fields or its Save button. Quantities are stored as
+# the raw text of the box, so a box the user deliberately cleared stays cleared instead of
+# springing back to the default on the next launch.
+STACKS_KEY = "increase_stacks"
+
+
+def stack_override_line(class_string, quantity):
+    """One ConfigOverrideItemMaxQuantity line. bIgnoreMultiplier=true on every one of
+    them: the box says 500, the server gives 500, whatever the global multiplier is."""
+    return ('ConfigOverrideItemMaxQuantity=(ItemClassString="%s",Quantity='
+            '(MaxItemQuantity=%d,bIgnoreMultiplier=true))' % (class_string, quantity))
+
+
+def stack_override_lines(items):
+    """The override lines for {class_string: quantity}, emitted in STACK_ITEMS order so
+    the block on disk is stable and any difference in it is a real change. A class with no
+    quantity is skipped - a blank box means "leave this item at its vanilla stack", not
+    "write a line capping it at nothing"."""
+    return [stack_override_line(cls, items[cls])
+            for _label, cls, _vanilla in STACK_ITEMS if cls in items]
+
+
+def read_stack_overrides(text):
+    """{class_string: quantity} read back out of a Game.ini's ArkAP stack block.
+
+    Only the marker-wrapped block is parsed. Any ConfigOverrideItemMaxQuantity the user
+    wrote themselves elsewhere in the file is theirs, and drift detection must not claim
+    it as ours or offer to overwrite it."""
+    _stripped, had = remove_game_ini_marked_block(text, STACK_BLOCK_BEGIN, STACK_BLOCK_END)
+    if not had:
+        return {}
+    block = text[text.index(STACK_BLOCK_BEGIN):text.index(STACK_BLOCK_END)]
+    line_re = re.compile(r'^\s*ConfigOverrideItemMaxQuantity\s*=.*?ItemClassString\s*=\s*'
+                         r'"([^"]+)".*?MaxItemQuantity\s*=\s*(\d+)', re.I)
+    out = {}
+    for line in block.splitlines():
+        m = line_re.match(line)
+        if m:
+            out[m.group(1)] = int(m.group(2))
+    return out
+
+
+# One override line in EXACTLY the shape stack_override_line emits. Used to recognise our
+# own lines when the markers around them are gone - see remove_stack_block.
+_STACK_LINE_RE = re.compile(
+    r'(?im)^[ \t]*ConfigOverrideItemMaxQuantity[ \t]*=[ \t]*\(ItemClassString[ \t]*=[ \t]*'
+    r'"([^"]+)",Quantity=\(MaxItemQuantity=\d+,bIgnoreMultiplier=true\)\)[ \t]*(?:\r?\n)?')
+
+
+def remove_stack_block(text):
+    """Take the launcher's stack overrides back out of Game.ini text: the marker-wrapped
+    block, plus any of our override lines left orphaned outside it. Returns
+    (new_text, removed). Every other line is untouched.
+
+    The orphans are not hypothetical. ARK rewrites Game.ini and drops comment lines when
+    it shuts down, and the BEGIN/END markers ARE comment lines - so one server run after
+    an apply, the block's fence is gone and the override lines are loose in the section.
+    Matching only the marker then has two failures that compound every cycle: the next
+    apply can't find the block and appends a SECOND one, and toggle-off can never take
+    any of them back. That is the duplicated, marker-less wall users have been reporting.
+
+    A line only counts as ours if its item is in STACK_ITEMS and it is in exactly the
+    format stack_override_line writes, bIgnoreMultiplier and all. A hand-written override
+    for another item, or the same item written differently, is the user's and stays."""
+    out, had_block = remove_game_ini_marked_block(text, STACK_BLOCK_BEGIN, STACK_BLOCK_END)
+    managed = {cls for _label, cls, _vanilla in STACK_ITEMS}
+    dropped = []
+
+    def _drop(m):
+        if m.group(1) in managed:
+            dropped.append(m.group(1))
+            return ""
+        return m.group(0)
+
+    return _STACK_LINE_RE.sub(_drop, out), (had_block or bool(dropped))
+
+
+def stack_settings_writes(gus_text, game_text, multiplier, items):
+    """(new_gus_text, new_game_text) for applying the stack settings - everything
+    "Increase stacks" changes, as text in / text out.
+
+    Both halves are targeted edits OF THE TEXT PASSED IN: a single-key upsert for the
+    multiplier, a marker-wrapped splice for the overrides. Neither file is regenerated
+    from the launcher's model of it, so comments, blank lines, unknown sections and
+    unknown keys all come through untouched. Kept out of the GUI method so the guarantee
+    is testable without tkinter - see test_stack_sizes.py."""
+    return (upsert_ini_key(gus_text, STACK_MULT_SECTION, STACK_MULT_KEY, multiplier),
+            merge_game_ini_block(remove_stack_block(game_text)[0],
+                                 stack_override_lines(items),
+                                 STACK_BLOCK_BEGIN, STACK_BLOCK_END))
+
+
+def stack_settings_removals(gus_text, game_text):
+    """(new_gus, gus_removed, new_game, game_removed) for the toggle going off - the
+    mirror of stack_settings_writes, and just as targeted.
+
+    The Game.ini block is the receipt: with nothing of ours in Game.ini, an
+    ItemStackSizeMultiplier on disk is the user's own (plenty of servers had one set by
+    hand long before this feature existed) and is left strictly alone."""
+    new_game, receipt = remove_stack_block(game_text)
+    if not receipt:
+        return gus_text, False, game_text, False
+    new_gus, gus_removed = remove_ini_key(gus_text, STACK_MULT_SECTION, STACK_MULT_KEY)
+    return new_gus, gus_removed, new_game, True
+
+
+def stack_block_receipt(game_ini_path):
+    """True if Game.ini holds the launcher's stack overrides (marker-wrapped, or orphaned
+    by ARK having stripped the markers - see remove_stack_block).
+
+    That block is the ONLY proof these settings came from here, and the toggle-off path
+    leans on it: ItemStackSizeMultiplier is an ordinary ARK setting with no marker on it,
+    and plenty of servers had one set by hand long before this feature existed. Removing
+    (or nagging about) a multiplier the launcher never wrote would be taking away a
+    setting we never gave, so the multiplier is only ever removed alongside a block that
+    proves we applied it."""
+    if not game_ini_path or not os.path.isfile(game_ini_path):
+        return False
+    return remove_stack_block(read_text(game_ini_path)[0])[1]
+
+
+def _same_multiplier(a, b):
+    """True if two ItemStackSizeMultiplier values mean the same number. Compared
+    numerically, not textually: ARK rewrites GameUserSettings.ini on shutdown and can
+    hand back "10.000000" for the "10.00" we wrote, which is not drift."""
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return str(a).strip() == str(b).strip()
+
+
+def check_stack_settings_applied(gus_path, game_ini_path, multiplier, items):
+    """(ok, detail) - do the two files on disk actually hold the stack settings the
+    launcher is showing?
+
+    The Configuration tab holds INTENT; these files are what the server reads, and they
+    only agree after "Apply to server config". They drift for a reason worth naming: ARK
+    rewrites GameUserSettings.ini when it shuts down, so a multiplier applied while the
+    server was up is silently gone by the next start, with the tab still showing it set."""
+    problems = []
+
+    if not gus_path:
+        problems.append("SERVER_ROOT is not set, so GameUserSettings.ini can't be checked")
+    elif not os.path.isfile(gus_path):
+        problems.append("GameUserSettings.ini not found at %s" % gus_path)
+    else:
+        on_disk = read_ini_key(read_text(gus_path)[0], STACK_MULT_SECTION, STACK_MULT_KEY)
+        if on_disk is None:
+            problems.append("%s is missing from GameUserSettings.ini" % STACK_MULT_KEY)
+        elif not _same_multiplier(on_disk, multiplier):
+            problems.append("%s on disk is %s, the launcher shows %s"
+                            % (STACK_MULT_KEY, on_disk, multiplier))
+
+    if not game_ini_path:
+        problems.append("Game.ini's location isn't known, so it can't be checked")
+    elif not os.path.isfile(game_ini_path):
+        problems.append("Game.ini not found at %s" % game_ini_path)
+    else:
+        on_disk = read_stack_overrides(read_text(game_ini_path)[0])
+        if not on_disk and items:
+            problems.append("Game.ini has no ArkAP stack-size block")
+        elif on_disk != items:
+            # Name the items that differ and which way, rather than printing two lists
+            # and leaving the numbers to be diffed by eye.
+            diffs = []
+            for cls in sorted(set(on_disk) | set(items),
+                              key=lambda c: list(STACK_ITEM_LABELS).index(c)
+                              if c in STACK_ITEM_LABELS else 99):
+                label = STACK_ITEM_LABELS.get(cls, cls)
+                if cls not in on_disk:
+                    diffs.append("%s: not in Game.ini (launcher shows %d)"
+                                 % (label, items[cls]))
+                elif cls not in items:
+                    diffs.append("%s: %d in Game.ini, but the launcher has no value for it"
+                                 % (label, on_disk[cls]))
+                else:
+                    diffs.append("%s: %d in Game.ini, %d in the launcher"
+                                 % (label, on_disk[cls], items[cls]))
+            problems.append("; ".join(diffs))
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, ("GameUserSettings.ini and Game.ini hold the values shown in the "
+                  "Configuration tab's \"Increase stacks\" section.")
+
+
+# --------------------------------------------------------------------------- #
+#  Excalibur Buffs - the weight half of inventory management
+# --------------------------------------------------------------------------- #
+# "Increase stacks" raises how much fits in an inventory slot; this mod lowers what the
+# contents weigh. Same job from opposite ends, which is why it sits in that section
+# rather than getting one of its own.
+#
+# Exactly two of the mod's keys are written:
+#
+#   [EU_Buffs]
+#   DisableEngramUnlocker=true     <- non-negotiable, NOT a user setting
+#   DisableWeightReduction=false   <- the one that actually reduces weight
+#
+# DisableEngramUnlocker is deliberately not exposed as a toggle anywhere. The mod's
+# engram unlocker hands out engrams the ArkAP plugin never granted, which breaks the
+# plugin's engram-grant script and takes the whole run with it - silently, mid-game. It
+# is a condition of installing this mod at all, so it is written unconditionally and
+# re-checked on Setup Status as a red X (see check_excalibur_unlocker).
+#
+# The mod's remaining options (DisableFogRemover, DisableClearWater, DisableDinoCounter,
+# DisablePreventSteal, DisableRiderProtection) are poorly documented and have nothing to
+# do with weight, so they are left out entirely and the mod uses its own defaults for
+# them. Anyone who wants one adds it by hand inside the marker block.
+EXCALIBUR_MOD_ID = "3509653500"
+EXCALIBUR_MOD_NAME = "Excalibur Buffs"
+EU_BUFFS_SECTION = "EU_Buffs"
+EU_BUFFS_UNLOCKER_KEY = "DisableEngramUnlocker"  # capitalization matters - keep it exact
+EU_BUFFS_BLOCK_BEGIN = "; === ArkAP Excalibur Buffs BEGIN (auto-managed, do not edit) ==="
+EU_BUFFS_BLOCK_END = "; === ArkAP Excalibur Buffs END ==="
+EU_BUFFS_LINES = [
+    "[%s]" % EU_BUFFS_SECTION,
+    "%s=true" % EU_BUFFS_UNLOCKER_KEY,
+    "DisableWeightReduction=false",
+]
+
+
+def merge_ini_marked_block(text, payload_lines, begin, end):
+    """Append `payload_lines`, wrapped in the begin/end markers, to the END of an ini
+    file's text and return the new text. Any previous block with the SAME markers is
+    stripped first, so re-applying replaces rather than stacks.
+
+    The end of the file is the only correct place for a payload that carries its own
+    [section] header - splicing it mid-file would cut whatever section it landed in.
+    Everything already there is preserved byte-for-byte and the file's existing line
+    endings are matched: the same contract merge_game_ini_block keeps for Game.ini, and
+    the reason neither of them ever regenerates a file. (The regex in
+    remove_game_ini_marked_block is marker-generic despite its Game.ini-flavoured name.)"""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    txt, _removed = remove_game_ini_marked_block(text, begin, end)
+    if txt and not txt.endswith(("\n", "\r")):
+        txt += nl
+    return txt + begin + nl + nl.join(payload_lines) + nl + end + nl
+
+
+def excalibur_config_write(gus_text):
+    """GameUserSettings.ini text with the [EU_Buffs] block merged in at the bottom."""
+    return merge_ini_marked_block(gus_text, EU_BUFFS_LINES,
+                                  EU_BUFFS_BLOCK_BEGIN, EU_BUFFS_BLOCK_END)
+
+
+def check_excalibur_unlocker(gus_path):
+    """(ok, detail) - is [EU_Buffs] DisableEngramUnlocker=true actually on disk?
+
+    Only meaningful once the mod is installed; the caller gates on that (see
+    _gather_setup_status). A missing key counts as a failure rather than "probably
+    fine": with it absent the mod falls back to its own default, and if that default
+    leaves the unlocker on, the plugin's engram grants break with no error anywhere.
+
+    read_ini_key finds the FIRST [EU_Buffs] section, so a hand-written one sitting above
+    our marker block - the one arrangement where the block we wrote could end up ignored
+    by the mod - reads as a failure here instead of quietly passing on our own copy."""
+    if not gus_path or not os.path.isfile(gus_path):
+        return False, ("GameUserSettings.ini not found - can't check what %s is set to."
+                       % EU_BUFFS_UNLOCKER_KEY)
+    value = read_ini_key(read_text(gus_path)[0], EU_BUFFS_SECTION, EU_BUFFS_UNLOCKER_KEY)
+    if value is None:
+        return False, ("[%s] %s is missing from GameUserSettings.ini."
+                       % (EU_BUFFS_SECTION, EU_BUFFS_UNLOCKER_KEY))
+    if value.strip().lower() != "true":
+        return False, ("%s=%s in [%s] - it has to be true."
+                       % (EU_BUFFS_UNLOCKER_KEY, value, EU_BUFFS_SECTION))
+    return True, "%s=true in [%s]." % (EU_BUFFS_UNLOCKER_KEY, EU_BUFFS_SECTION)
 
 
 def bat_read_var(text, var):
@@ -3343,13 +4365,64 @@ def is_backup_snapshot_path(path):
                for part in re.split(r"[\\/]", path or "") if part)
 
 
+# The exact yyyymmdd-hhmmss stamp every backup mechanism stamps its own name with
+# (ts = time.strftime("%Y%m%d-%H%M%S")), plus the "-2"/"-3"/... suffix a same-second
+# collision gets. Anchored (^...$) against a bare filename by each mechanism's own
+# pattern below, so only entries this app itself created are ever candidates for
+# retention pruning - never something else a user happens to have sitting there.
+BACKUP_TS_RE = r"\d{8}-\d{6}(-\d+)?"
+
+
+def prune_backups(backup_dir, name_pattern, keep):
+    """Delete the oldest entries in `backup_dir` whose basename fully matches the
+    compiled regex `name_pattern`, until at most `keep` remain (min 1). Sorted by
+    mtime, so the ones removed are genuinely the oldest regardless of any dupe-suffix
+    in the name. Entries that don't match `name_pattern` are never touched, so a
+    backup mechanism can never delete something that merely happens to share its
+    folder, nor a different source's backups.
+
+    Never raises - a delete failure (permissions, file in use) is reported back per
+    entry instead of blocking or undoing the backup that was just made. Returns
+    (removed, failed): removed is the list of paths actually deleted, failed is
+    [(path, exception), ...]."""
+    keep = max(1, keep)
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return [], []
+    matches = [os.path.join(backup_dir, n) for n in names if name_pattern.match(n)]
+    if len(matches) <= keep:
+        return [], []
+    matches.sort(key=lambda p: os.path.getmtime(p))
+    removed, failed = [], []
+    for old in matches[:len(matches) - keep]:
+        try:
+            if os.path.isdir(old):
+                shutil.rmtree(old)
+            else:
+                os.remove(old)
+            removed.append(old)
+        except OSError as exc:
+            failed.append((old, exc))
+    return removed, failed
+
+
+def _log_prune_failures(failed):
+    """Persistent-log (never the on-screen console - some callers run off the main
+    thread) each entry prune_backups() could not delete. A prune failure is logged
+    and otherwise ignored: the backup that triggered it already succeeded."""
+    for path, exc in failed:
+        launcher_log("! Backup retention: could not remove old backup %s: %s"
+                     % (path, exc), "Console")
+
+
 # Tallest the Folder suggestions list gets before it starts scrolling. Roughly a
 # dozen candidate rows - enough that the ordinary 2-3 hit scan never scrolls, low
 # enough that an Exhaustive sweep's dozens of hits can't push the popup off-screen.
 SUGGEST_POPUP_MAX_LIST_H = 420
 
 
-def suggestion_sections(keys, suggestions, current_getter):
+def suggestion_sections(keys, suggestions, current_getter, only_empty=False):
     """Which of `keys` are worth showing in the Folder suggestions popup, and with
     what current value, given `suggestions` (key -> [candidate path, ...]) and
     `current_getter(key)` -> the field's current value ("" if unset).
@@ -3360,6 +4433,12 @@ def suggestion_sections(keys, suggestions, current_getter):
     candidate found for it is exactly the value it already has, since there's nothing
     to compare there.
 
+    `only_empty` narrows that to fields that hold nothing at all. It's the difference
+    between a scan the user ASKED for (a manual "Scan for paths" - reviewing
+    alternatives to an existing value is the whole point, so only_empty=False) and one
+    they didn't (focus-out, post-install - a field the user already set or accepted is
+    a decision, not a question, so it's left alone silently).
+
     Returns [(key, current, cur_norm, matches), ...] in `keys` order, where cur_norm is
     normcase(normpath(current)) (or None if current is empty) - the same normalized
     form callers need to spot which candidate (if any) equals the current value."""
@@ -3369,6 +4448,8 @@ def suggestion_sections(keys, suggestions, current_getter):
         if not matches:
             continue
         current = current_getter(key)
+        if current and only_empty:
+            continue
         cur_norm = os.path.normcase(os.path.normpath(current)) if current else None
         if cur_norm and all(os.path.normcase(os.path.normpath(m)) == cur_norm
                              for m in matches):
@@ -3396,18 +4477,22 @@ def is_ark_server_root(path):
 
 
 def bounded_drive_scan(log_fn, is_cancelled, matches=is_ark_server_root,
-                       skip_names=SKIP_SCAN_DIR_NAMES, max_depth=MAX_SCAN_DEPTH):
+                       skip_names=SKIP_SCAN_DIR_NAMES, max_depth=MAX_SCAN_DEPTH,
+                       max_dirs=MAX_SCAN_DIRS,
+                       time_budget=SCAN_TIME_BUDGET_SECONDS):
     """Depth-limited, filtered walk of common drive roots returning the first folder
-    `matches` accepts (by default, an ARK server root). Bounded by MAX_SCAN_DIRS and
-    SCAN_TIME_BUDGET_SECONDS so a slow/huge disk degrades to "gave up" instead of
-    hanging. Meant for a background thread - this alone is why it's safe to point at
-    whole drive roots at all.
+    `matches` accepts (by default, an ARK server root). Bounded by `max_dirs` and
+    `time_budget` so a slow/huge disk degrades to "gave up" instead of hanging. Meant
+    for a background thread - this alone is why it's safe to point at whole drive roots
+    at all.
 
     `matches`/`skip_names`/`max_depth` are parameters rather than hardcoded so the
     Archipelago scan can reuse this exact walker: it looks for a different marker
     (is_archipelago_dir) and must NOT inherit SKIP_SCAN_DIR_NAMES, which skips
     "programdata" and "program files" - the two places Archipelago is most likely to
-    actually be installed."""
+    actually be installed. `max_dirs`/`time_budget` default to the module constants so
+    existing callers are unchanged; the "Scan for Archipelago"/"Scan for PopTracker"
+    buttons pass all three from DIR_SCAN_LEVEL_LIMITS to honour the chosen intensity."""
     start = time.monotonic()
     visited = 0
     for letter in COMMON_DRIVE_LETTERS:
@@ -3418,12 +4503,12 @@ def bounded_drive_scan(log_fn, is_cancelled, matches=is_ark_server_root,
         while stack:
             if is_cancelled():
                 return None
-            if time.monotonic() - start > SCAN_TIME_BUDGET_SECONDS:
+            if time.monotonic() - start > time_budget:
                 log_fn("Scan time budget reached - stopping the drive scan.")
                 return None
             path, depth = stack.pop()
             visited += 1
-            if visited > MAX_SCAN_DIRS:
+            if visited > max_dirs:
                 log_fn("Scan directory limit reached - stopping the drive scan.")
                 return None
             if matches(path):
@@ -3476,6 +4561,26 @@ SCAN_LEVEL_DEFAULT = SCAN_QUICK
 SCAN_LEVEL_LIMITS = {
     SCAN_THOROUGH:   (4, 8000, 15.0),
     SCAN_EXHAUSTIVE: (8, 80000, 120.0),
+}
+
+# Same idea for the two whole-drive walks - "Scan for Archipelago" and "Scan for
+# PopTracker" - which share bounded_drive_scan. Deliberately NOT the SCAN_LEVEL_LIMITS
+# above: those are tuned for a scan STARTING at SERVER_ROOT, and reusing them here would
+# make Thorough *weaker* than what these buttons already do today (8000 dirs / 15s
+# against the current 15000 / 20s). So Quick reproduces today's behaviour exactly - no
+# regression for anyone who never opens Settings - and the two higher levels genuinely
+# widen it. (depth, max dirs, seconds), same shape as SCAN_LEVEL_LIMITS.
+DIR_SCAN_LEVEL_LIMITS = {
+    SCAN_QUICK:      (MAX_SCAN_DEPTH, MAX_SCAN_DIRS, SCAN_TIME_BUDGET_SECONDS),
+    SCAN_THOROUGH:   (5, 40000, 45.0),
+    SCAN_EXHAUSTIVE: (8, 150000, 120.0),
+}
+
+# What each level costs on the two drive-walk buttons, for their tooltip/status text.
+DIR_SCAN_LEVEL_ETA = {
+    SCAN_QUICK:      "up to ~20s",
+    SCAN_THOROUGH:   "up to ~45s",
+    SCAN_EXHAUSTIVE: "a minute or more",
 }
 
 SCAN_LEVEL_HELP = {
@@ -3881,10 +4986,10 @@ def _decompress_z_file(src, dst):
     with open(src, "rb") as f:
         header = f.read(32)
         if len(header) < 32:
-            raise ValueError("truncated .z header in %s" % src)
+            raise ValueError("truncated .z header in %s" % plain_path(src))
         sig, _chunk_max, _packed_total, unpacked_total = struct.unpack("<qqqq", header)
         if sig != _Z_FILE_SIGNATURE:
-            raise ValueError("bad .z signature in %s" % src)
+            raise ValueError("bad .z signature in %s" % plain_path(src))
         chunks = []
         acc = 0
         while acc < unpacked_total:
@@ -3895,7 +5000,7 @@ def _decompress_z_file(src, dst):
             for packed, unpacked in chunks:
                 data = zlib.decompress(f.read(packed))
                 if len(data) != unpacked:
-                    raise ValueError("chunk size mismatch in %s" % src)
+                    raise ValueError("chunk size mismatch in %s" % plain_path(src))
                 out.write(data)
 
 
@@ -4147,10 +5252,15 @@ def download_and_install_mod(mod_id, server_root, steamcmd_exe, log=None):
                                     "Couldn't launch SteamCMD: %s" % exc)
         download_dir = _workshop_download_dir(steamcmd_exe, mod_id)
         candidate = os.path.join(download_dir, "WindowsNoEditor")
-        if not os.path.isdir(candidate):
+        # ext_path on the probes as well as the copy: this is what decides "did the
+        # download land", and an unprefixed isdir() on an over-MAX_PATH folder answers
+        # False. That reads as a failed download, so the retry loop burns all its attempts
+        # and then blames Steam for a mod that is sitting on disk.
+        if not os.path.isdir(ext_path(candidate)):
             # Some items unpack straight into <id>\ with no WindowsNoEditor layer.
             candidate = download_dir
-        if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "mod.info")):
+        if (os.path.isdir(ext_path(candidate))
+                and os.path.isfile(ext_path(os.path.join(candidate, "mod.info")))):
             content_dir = candidate
             break
     if content_dir is None:
@@ -4174,20 +5284,49 @@ def download_and_install_mod(mod_id, server_root, steamcmd_exe, log=None):
     mods_dir = os.path.join(server_root, MODS_CONTENT_RELDIR)
     dest_folder = os.path.join(mods_dir, mod_id)
     dot_mod_path = os.path.join(mods_dir, "%s.mod" % mod_id)
+    # Both ends go through ext_path: the SteamCMD side is long because steamcmd lives
+    # under the launcher's install folder, the server side is long whenever SERVER_ROOT
+    # is. Prefixing only one still fails on the other. The plain paths stay in every log
+    # line and message - see ext_path.
+    src_x, dest_x = ext_path(content_dir), ext_path(dest_folder)
+    src_n, src_longest = _tree_stats(src_x)
+    if not src_n:
+        # os.walk reports an unreadable directory as empty rather than raising, and
+        # "copied 0 of 0 files" would otherwise sail through every check below and install
+        # a mod folder with nothing in it. mod.info was just confirmed present, so zero
+        # here means the walk failed, not that the mod is empty.
+        return ModInstallResult(False, mod_id, "install",
+                                "Downloaded %s but couldn't read any files back out of "
+                                "%s - the download may be incomplete. Try again."
+                                % (mod_id, content_dir))
+    # Where that same deepest file is about to land. The destination is the longer of the
+    # two whenever SERVER_ROOT is longer than the SteamCMD folder, so a length diagnosis
+    # has to consider both rather than assume the download side is the problem.
+    longest = max(plain_path(src_longest),
+                  os.path.join(dest_folder, os.path.relpath(src_longest, src_x)), key=len)
     try:
-        os.makedirs(mods_dir, exist_ok=True)
-        if os.path.isdir(dest_folder):
-            shutil.rmtree(dest_folder)
-        log("Copying into %s" % dest_folder)
-        shutil.copytree(content_dir, dest_folder)
+        os.makedirs(ext_path(mods_dir), exist_ok=True)
+        if os.path.isdir(dest_x):
+            shutil.rmtree(dest_x)
+        log("Copying %d file(s) into %s" % (src_n, dest_folder))
+        shutil.copytree(src_x, dest_x)
+        # copytree raises on a failed file, but "it raised nothing" is not the same promise
+        # as "every file arrived", and a mod missing 10% of its assets passes every
+        # existence check here and then crashes the server with nothing pointing back at
+        # this step. One extra walk of a tree we just wrote is nothing next to the download.
+        dest_n, _ = _tree_stats(dest_x)
+        if dest_n != src_n:
+            raise OSError("only %d of %d file(s) arrived" % (dest_n, src_n))
     except OSError as exc:
         return ModInstallResult(False, mod_id, "install",
                                 "Downloaded %s but couldn't copy it into the server's "
-                                "Content\\Mods folder: %s" % (mod_id, exc))
+                                "Content\\Mods folder: %s%s"
+                                % (mod_id, _copy_error_text(exc),
+                                   _long_path_hint(exc, longest)))
 
     log("Decompressing mod files...")
     try:
-        extracted = _extract_z_files(dest_folder)
+        extracted = _extract_z_files(dest_x)
     except ValueError as exc:
         return ModInstallResult(False, mod_id, "extract",
                                 "Couldn't decompress the downloaded files for %s - the "
@@ -4237,15 +5376,20 @@ def uninstall_mod(server_root, mod_id):
     folder = os.path.join(mods_dir, mod_id)
     dot_mod = os.path.join(mods_dir, "%s.mod" % mod_id)
     removed = False
+    # Same tree the install wrote, so the same MAX_PATH exposure: without ext_path an
+    # over-length mod cannot be uninstalled either, and the leftover folder then makes
+    # every later reinstall of it fail too.
+    folder_x = ext_path(folder)
     try:
-        if os.path.isdir(folder):
-            shutil.rmtree(folder)
+        if os.path.isdir(folder_x):
+            shutil.rmtree(folder_x)
             removed = True
         if os.path.isfile(dot_mod):
             os.remove(dot_mod)
             removed = True
     except OSError as exc:
-        return False, "Couldn't remove %s: %s" % (mod_id, exc)
+        return False, "Couldn't remove %s: %s%s" % (mod_id, exc,
+                                                    _long_path_hint(exc, folder))
     return True, ("Uninstalled %s." % mod_id if removed
                   else "%s was not installed - nothing to remove." % mod_id)
 
@@ -4258,6 +5402,107 @@ def check_arkapi_installed(server_root):
     version_dll = os.path.join(win64, "version.dll")
     arkapi_dir = os.path.join(win64, "ArkApi")
     return (os.path.isfile(version_dll) and os.path.isdir(arkapi_dir)), win64
+
+
+# --- ArkApi / plugin teardown ("Remove ArkApi + plugin (troubleshooting)") --- #
+# Everything below is about ONE folder: <SERVER_ROOT>\ShooterGame\Binaries\Win64.
+ARKAPI_WIN64_RELDIR = os.path.join("ShooterGame", "Binaries", "Win64")
+
+# What an ArkApi install leaves in Win64 when no manifest was recorded
+# (ARKAPI_INSTALLED_FILES_KEY). Confirmed against a real install rather than assumed:
+# the AseApi zip drops version.dll + version.pdb, its msdia140.dll dependency, its own
+# config.json, and the ArkApi\ folder; ArkApi then creates logs\ at RUNTIME (so it is in
+# no zip manifest and has to be listed here). The plugin installer writes nothing outside
+# ArkApi\Plugins\ArkAP, so removing ArkApi\ covers the plugin, Permissions and the
+# per-launch logs under it.
+ARKAPI_WIN64_NAMES = ("version.dll", "version.pdb", "msdia140.dll", "config.json",
+                      "ArkApi", "logs")
+
+# Hard backstop. Nothing here is ever removed even if a (corrupt, or hand-edited)
+# manifest names it - these are Steam's, and the cost of a wrong delete is a full
+# ~18gb re-download. Compared lowercased.
+ARKAPI_TEARDOWN_PROTECTED = frozenset((
+    "shootergameserver.exe", "shootergameserver.pdb", "battleye", "x64",
+    "steamclient64.dll", "steam_appid.txt", "arkegslauncher.exe", "procdump.exe",
+))
+
+
+def _manifest_top_names(manifest):
+    """The top-level Win64 entry names a recorded zip manifest refers to
+    ("ArkApi/Plugins/Permissions/x.dll" -> "ArkApi"). Anything that would escape Win64
+    (absolute, drive-qualified or ..-relative) is dropped rather than resolved - a zip
+    is untrusted input and this list feeds a delete."""
+    names = []
+    for raw in manifest or []:
+        if not isinstance(raw, str):  # the config JSON is user-editable; nulls happen
+            continue
+        parts = [p for p in re.split(r"[\\/]", raw) if p not in ("", ".")]
+        if not parts or ".." in parts or ":" in parts[0]:
+            continue
+        names.append(parts[0])
+    return names
+
+
+def arkapi_teardown_targets(win64, manifest=None):
+    """Plan the removal of ArkApi + the plugin from `win64`, without touching anything.
+
+    Returns (targets, notes):
+      targets - [(path, "file"|"dir")] that exist and are ours to remove
+      notes   - human-readable lines for the log about what was deliberately LEFT
+
+    The rule is allow-list only: a Win64 entry is a candidate purely because an
+    installer is known to have written it (ARKAPI_WIN64_NAMES, plus whatever the
+    recorded manifest says this install actually extracted). Everything else in Win64 -
+    every Steam file, anything the user put there - is never even considered, and a
+    protected name showing up in a manifest is reported instead of deleted.
+
+    logs\\ is ArkApi's own runtime log folder and is handled by content, not by name: the
+    ArkApi_*.log files go, and the folder itself goes only if that empties it. A logs\\
+    holding something else keeps that something else, and says so."""
+    targets, notes = [], []
+    win64 = os.path.normpath(win64)
+    seen = set()
+    for name in list(ARKAPI_WIN64_NAMES) + _manifest_top_names(manifest):
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        path = os.path.join(win64, name)
+        if key in ARKAPI_TEARDOWN_PROTECTED:
+            if os.path.exists(path):
+                notes.append("left %s in place - that is a Steam file, not one an "
+                             "ArkApi/plugin installer wrote" % path)
+            continue
+        if key == "logs":
+            targets.extend(_arkapi_logs_teardown(path, notes))
+            continue
+        if os.path.isdir(path):
+            targets.append((path, "dir"))
+        elif os.path.isfile(path):
+            targets.append((path, "file"))
+    return targets, notes
+
+
+def _arkapi_logs_teardown(logs_dir, notes):
+    """The Win64\\logs half of arkapi_teardown_targets - see its docstring."""
+    if not os.path.isdir(logs_dir):
+        return []
+    try:
+        names = os.listdir(logs_dir)
+    except OSError as exc:
+        notes.append("left %s in place - could not read it (%s)" % (logs_dir, exc))
+        return []
+    ours = [n for n in names if n.lower().startswith("arkapi_") and n.lower().endswith(".log")]
+    others = [n for n in names if n not in ours]
+    out = [(os.path.join(logs_dir, n), "file") for n in ours]
+    if others:
+        notes.append("kept %s and the %d file(s) in it the launcher did not put there "
+                     "(%s) - only ArkApi's own %s logs were removed"
+                     % (logs_dir, len(others), ", ".join(sorted(others)[:5]),
+                        ARKAPI_LOG_GLOB))
+    else:
+        out.append((logs_dir, "dir"))
+    return out
 
 
 def check_plugin_installed(plugin_dir):
@@ -4420,8 +5665,13 @@ def check_active_mods_match(server_root, mods):
     unsaved = [i for i in checked if i not in active]
     untracked = [i for i in active if i not in checked]
     if unsaved:
-        problems.append("ticked but missing from ActiveMods, so never saved: %s"
-                        % _labels(unsaved))
+        # Deliberately states the FACT and not a cause. This used to end "so never
+        # saved", which is only one of the two ways to get here: the other is a Save that
+        # did work, followed by something rewriting GameUserSettings.ini without the
+        # ActiveMods line - after which the accusation sends the user off to re-Save a
+        # tab that was already correct.
+        problems.append("ticked but not in ActiveMods (either not saved yet, or "
+                        "GameUserSettings.ini was rewritten since): %s" % _labels(unsaved))
     if untracked:
         problems.append("in ActiveMods but not ticked, so the server loads it without the "
                         "Mods tab showing it: %s" % _labels(untracked))
@@ -4583,6 +5833,11 @@ class ArkAPLauncher(tk.Tk):
         self._poptracker_room_hint_shown = False
         self._last_scoped_scan_root = None
         self._last_cluster_dir_scan = None
+        # True only while a scan the user explicitly asked for is in flight - see
+        # _scoped_scan. Everything else (focus-out, post-install, first-launch
+        # auto-detect) leaves it False, which is what keeps the Folder suggestions popup
+        # to empty fields on a scan nobody asked for.
+        self._scan_manual = False
         # Scripts folder is no longer a user field - it's the working folder next to the
         # launcher that bundled scripts are extracted into (set in _discover_locations).
         self._scripts_dir = working_scripts_dir()
@@ -4603,17 +5858,19 @@ class ArkAPLauncher(tk.Tk):
         # user's face before the window is even usable. See set().
         self._cluster_autoscan = False
 
-        # Profiles tab state - named snapshots of every Configuration field + notes,
-        # persisted separately from CONFIG_FILENAME (see PROFILES_FILENAME).
+        # Profiles state - named snapshots of the user's whole setup (both field tabs,
+        # the Increase stacks settings, the Mods tab and the notes), persisted separately
+        # from CONFIG_FILENAME (see PROFILES_FILENAME and PROFILE_STATE_KEYS).
         self.profiles_path = os.path.join(base_dir(), PROFILES_FILENAME)
-        self._profiles = {}             # name -> {"values": {key: str, ...}, "notes": str}
+        self._profiles = {}             # name -> _profile_record() (+ "autosaved_at")
         self._loaded_profile_name = None
         # Which profile Save writes into, remembered across launches (ACTIVE_PROFILE_KEY).
         # Tracked separately from _loaded_profile_name because loading the reserved
         # autosave slot must NOT retarget Save at it - see _set_active_profile.
         self._active_profile = None
-        self._loaded_profile_values = None  # snapshot of Configuration values as loaded
+        self._loaded_profile_values = None  # self.vars snapshot as loaded
         self._loaded_profile_notes = None   # notes text as loaded
+        self._loaded_profile_extras = None  # stacks + mods state as loaded
         # Baseline for the Save-button highlights: the field values as last written to
         # disk by on_save, seeded once startup has finished loading. None means "not
         # loaded yet", which keeps every halo dark while _build_ui/_load_json are still
@@ -4624,11 +5881,11 @@ class ArkAPLauncher(tk.Tk):
         # the disk) on every keystroke. See _update_save_hint.
         self._fields_dirty = False
         self._mods_dirty_flag = False
+        self._stacks_dirty_flag = False
         self._save_hint_shown = False
-        # Reserved autosave slot (see AUTOSAVE_PROFILE_NAME). _autosave_last_values is
-        # what was last written, so an idle app rewrites nothing.
+        # Reserved autosave slot (see AUTOSAVE_PROFILE_NAME). The slot itself is what an
+        # idle app compares against, so there is nothing else to remember here.
         self._autosave_after_id = None
-        self._autosave_last_values = None
 
         # In-app search / highlight state.
         self.search_var = tk.StringVar()
@@ -4653,7 +5910,7 @@ class ArkAPLauncher(tk.Tk):
         # install_status_var widgets (see _any_install_running).
         self._plugin_queue = queue.Queue()
         self._plugin_thread = None
-        self._hide_install_reminder = self._read_hide_reminder_flag()
+        self._hide_install_reminder = self._is_prompt_hidden(PROMPT_INSTALL_REMINDER)
 
         # Mods tab state - ordered list of {"id","name","enabled","supported"} dicts;
         # order IS load priority (see MODS_KEY). Loaded once here, every mutation
@@ -4674,6 +5931,83 @@ class ArkAPLauncher(tk.Tk):
         # through an auto-detect run to the scoped scan that follows it - see
         # _on_scan_button / _on_auto_detect_done.
         self._pending_scan_level = None
+
+        # --- Launcher-level settings (Settings tab) ------------------------------- #
+        # Created here, before _build_ui, because two tabs bind widgets to the same
+        # StringVar: the Configuration tab's "Scan intensity" combobox and the Settings
+        # tab's. One var means they cannot disagree and there is no sync code to write -
+        # Tk propagates the change to every widget watching it.
+        saved_settings = self._read_settings()
+        level = saved_settings.get(SCAN_LEVEL_KEY)
+        self.scan_level_var = tk.StringVar(
+            value=level if level in SCAN_LEVELS else SCAN_LEVEL_DEFAULT)
+        self.scan_level_var.trace_add(
+            "write", lambda *_a: self._write_config_key(
+                SCAN_LEVEL_KEY, self.scan_level_var.get(), "scan intensity"))
+
+        # Configuration-tab group collapse state (GROUP_COLLAPSE_KEY) - read once here so
+        # each group's BooleanVar can be built with the right initial value as it's
+        # rendered; self._group_collapse_vars fills in as _make_collapsible_group /
+        # _make_inline_collapsible run (see _render_field_groups, _build_stack_section).
+        loaded_collapse = saved_settings.get(GROUP_COLLAPSE_KEY)
+        self._group_collapse_state = loaded_collapse if isinstance(loaded_collapse, dict) else {}
+        self._group_collapse_vars = {}
+
+        # --- "Increase stacks" (Configuration tab) -------------------------------- #
+        # Intent only. Nothing reaches Game.ini / GameUserSettings.ini until "Apply to
+        # server config" is pressed, because that write needs the ARK server stopped, a
+        # timestamped backup and a confirm. Persisted the moment a box changes (like the
+        # Mods tab's ticks), so a number typed but not yet applied survives a restart -
+        # and so the Setup Status drift row has something to compare disk against.
+        stacks = saved_settings.get(STACKS_KEY)
+        if not isinstance(stacks, dict):
+            stacks = {}
+        saved_qty = stacks.get("items")
+        if not isinstance(saved_qty, dict):
+            saved_qty = {}
+        self.stacks_enabled_var = tk.BooleanVar(value=bool(stacks.get("enabled", False)))
+        self.stacks_mult_var = tk.StringVar(
+            value=str(stacks.get("multiplier") or STACK_MULT_DEFAULT))
+        self.stacks_item_vars = {
+            cls: tk.StringVar(value=str(saved_qty.get(cls, STACK_QTY_DEFAULT)))
+            for _label, cls, _vanilla in STACK_ITEMS}
+        self._stack_entries = []        # filled by _build_stack_section; greyed when off
+        for _var in ([self.stacks_enabled_var, self.stacks_mult_var]
+                     + list(self.stacks_item_vars.values())):
+            _var.trace_add("write", self._save_stacks_config)
+
+        self.update_check_var = tk.BooleanVar(
+            value=bool(saved_settings.get(UPDATE_CHECK_KEY, True)))
+        self.reopen_last_tab_var = tk.BooleanVar(
+            value=bool(saved_settings.get(REOPEN_LAST_TAB_KEY, False)))
+        self.autosave_enabled_var = tk.BooleanVar(
+            value=bool(saved_settings.get(AUTOSAVE_ENABLED_KEY, True)))
+        minutes = saved_settings.get(AUTOSAVE_MINUTES_KEY)
+        self._autosave_minutes = (minutes if minutes in AUTOSAVE_MINUTE_CHOICES
+                                  else AUTOSAVE_MINUTES_DEFAULT)
+        self.autosave_minutes_var = tk.StringVar(value=str(self._autosave_minutes))
+
+        # "Backups to keep" - applies to every timestamped backup mechanism (see
+        # prune_backups). Written the moment it changes, like the rest of this group.
+        retention = saved_settings.get(BACKUP_RETENTION_KEY)
+        if not isinstance(retention, int) or retention < 1:
+            retention = BACKUP_RETENTION_DEFAULT
+        self.backup_retention_var = tk.StringVar(value=str(retention))
+        self.backup_retention_var.trace_add(
+            "write", lambda *_a: self._on_backup_retention_setting())
+
+        # "Days of log history to keep". Read before the session header is written below,
+        # because the startup trim that follows it needs this value.
+        log_days = saved_settings.get(LAUNCHER_LOG_RETENTION_DAYS_KEY)
+        if not isinstance(log_days, int) or log_days < 1:
+            log_days = LAUNCHER_LOG_RETENTION_DAYS_DEFAULT
+        self.launcher_log_days_var = tk.StringVar(value=str(log_days))
+        self.launcher_log_days_var.trace_add(
+            "write", lambda *_a: self._on_launcher_log_retention_setting())
+        # The tab to reopen on, stored as the tab's TEXT rather than its index: the tab
+        # order is not stable across releases, and an index would silently reopen on a
+        # different tab after any reorder.
+        self._saved_last_tab = saved_settings.get(LAST_TAB_KEY)
 
         # Scoped "Scan for paths" state. Only Thorough/Exhaustive use the thread and
         # queue - Quick still runs inline, since it's a handful of stats.
@@ -4708,6 +6042,27 @@ class ArkAPLauncher(tk.Tk):
 
         # Session marker, so a log spanning weeks reads as "which run was this?".
         launcher_log("===== ARKipelago Launcher %s started =====" % APP_VERSION)
+        # Age/size trim, once per run and deliberately AFTER the header above: that makes
+        # this session the newest one, and the newest is the one trim_launcher_log will
+        # never drop. Whole sessions only - see there.
+        _dropped = trim_launcher_log(launcher_log_path(),
+                                     days=self._launcher_log_retention_days())
+        if _dropped:
+            launcher_log("Log trimmed: dropped the %d oldest session(s) - keeping %d days "
+                         "of history, %d MB max (Settings tab)."
+                         % (_dropped, self._launcher_log_retention_days(),
+                            LAUNCHER_LOG_MAX_BYTES // (1024 * 1024)))
+        # WHICH copy wrote this line. An update replaces the exe in place, so a log that
+        # keeps reporting the old version after a successful update means a DIFFERENT exe
+        # is being launched (the update landed on the copy that isn't the shortcut's).
+        # Without this, that is indistinguishable from a failed update - it cost a whole
+        # round of "did the update work?" once already, so every log now says outright.
+        launcher_log("Running: %s" % (sys.executable if getattr(sys, "frozen", False)
+                                      else os.path.abspath(__file__)))
+        for other in other_launcher_installs():
+            launcher_log("NOTE: another launcher copy is installed here: %s - if you "
+                         "updated recently, make sure your shortcut points at the copy "
+                         "you actually update." % other)
 
         self._build_ui()
         self._load_window_icon()
@@ -4727,10 +6082,16 @@ class ArkAPLauncher(tk.Tk):
         # Before the first Setup Status paint, so the row below reflects the cleaned-up
         # state. SERVER_ROOT is known by now (load_from_files).
         self._sweep_broken_mod_files()
+        # Also before the first paint: self._mods was loaded from config.json (whatever
+        # "enabled" was last persisted), not from ActiveMods on disk. Without this, the
+        # "Mods tab matches ActiveMods on disk" check compares against that stale state
+        # until the Mods tab is visited (its widget build is lazy, but the data sync
+        # below isn't - see _sync_mods_enabled_from_disk).
+        self._sync_mods_enabled_from_disk()
         self._refresh_setup_status()
         self._refresh_debug_log()
         self._profiles = self._load_profiles()
-        # Before the first _refresh_profile_list, so the Profiles tab comes up with
+        # Before the first _refresh_profile_list, so the Profiles section comes up with
         # the pre-created profile already selected on a fresh install.
         self._ensure_default_profile()
         self._refresh_profile_list()
@@ -4762,10 +6123,16 @@ class ArkAPLauncher(tk.Tk):
         # thing a user sees is the step-by-step order rather than a wall of empty paths.
         # Same first-run signal that auto-creates DEFAULT_PROFILE_NAME, plus a stored flag
         # so this greeting happens exactly once (see FIRST_RUN_DONE_KEY).
+        #
+        # Deliberately takes priority over "reopen on the last-used tab" below: on a
+        # brand-new install there is no meaningful last tab, and the greeting is the
+        # whole point of that launch.
         if not (saved or {}).get(FIRST_RUN_DONE_KEY):
             if self._is_first_launch:
                 self.notebook.select(self.tab_instructions)
             self._write_config_key(FIRST_RUN_DONE_KEY, True, "first-run flag")
+        elif self.reopen_last_tab_var.get():
+            self._select_tab_by_text(self._saved_last_tab)
 
         # Local file read only (no network) - reports the outcome of an update helper
         # that ran just before this process started, if there was one.
@@ -4779,7 +6146,96 @@ class ArkAPLauncher(tk.Tk):
         # window appearing, and fails quietly (no popup) if GitHub is unreachable. One pass
         # covers the launcher, the ArkAP plugin, the .apworld and the ArkApi advisory - it
         # feeds both the "!" badge / button highlight and the Setup Status advisory rows.
-        self._start_component_version_check()
+        # Skipped entirely when "Check for updates on startup" is off - that setting's
+        # promise is that the launcher makes no network call of its own accord.
+        if self.update_check_var.get():
+            self._start_component_version_check()
+
+        # Last: everything that can affect the window's natural size now exists and is
+        # filled in, so this is the only point where the "fullest state" measurement is
+        # honest. Must stay after the tab selection above too - see _lock_initial_size.
+        self._lock_initial_size()
+
+    # ------------------------------------------------- window sizing --------- #
+    # Conditionally-shown widgets that are packed into a container OUTSIDE any scrollable
+    # canvas, and so change the toplevel's requested size when they appear. Tk sizes a
+    # toplevel to its requested size until an explicit wm geometry is set, so without the
+    # lock below each of these visibly resized the window mid-session:
+    #
+    #   save_hint_label   +44px wide  - the "make sure to Save" chip in the header
+    #   mods_gate_banner  +56px tall  - the Mods tab's "install the server first" banner
+    #
+    # Anything inside one of the scrollable canvases (the install reminder banner, the
+    # Setup Status advisory rows, the mod rows) is already isolated: a canvas has its own
+    # fixed requested size, so its contents never propagate outwards. The Save halos, the
+    # update badge/highlight and the Find Prev/Next pair are likewise already stable -
+    # they recolour, retext or just go insensitive in place rather than pack/pack_forget
+    # (see _set_halo / update_badge_label / _update_find_btns).
+    def _conditional_size_widgets(self):
+        """(widget, pack_kwargs) for each of the two above, in the exact form its own
+        show-path packs it. Kept in one place so the measurement below and the real
+        show-paths can't drift into disagreeing about what "shown" looks like."""
+        return [
+            (self.save_hint_label, {"side": "left", "padx": 12}),
+            (self.mods_gate_banner,
+             {"fill": "x", "pady": (0, 6), "before": self._mods_top_frame}),
+        ]
+
+    def _lock_initial_size(self):
+        """Size the window once to fit its FULLEST realistic state, then pin it with an
+        explicit geometry so later layout changes can never move it again.
+
+        Measured rather than hardcoded: every conditional widget is packed in, the
+        request is read, then they're all put back exactly as they were. A hardcoded
+        WxH would silently stop covering the fullest state the first time any of this
+        content grows.
+
+        Only the INITIAL size is set - resizable() is untouched and no maxsize is
+        imposed, so the user can still resize freely afterwards; the minsize floor set
+        in __init__ still applies. Once wm geometry is explicit, Tk stops auto-fitting
+        the toplevel to its requested size, which is what actually stops the jumping."""
+        restore = []
+        for widget, kwargs in self._conditional_size_widgets():
+            try:
+                was_mapped = bool(widget.winfo_manager())
+                info = widget.pack_info() if was_mapped else None
+                if not was_mapped:
+                    widget.pack(**kwargs)
+                restore.append((widget, was_mapped, info))
+            except tk.TclError:
+                continue
+        try:
+            self.update_idletasks()
+            want_w, want_h = self.winfo_reqwidth(), self.winfo_reqheight()
+        finally:
+            # Put everything back BEFORE pinning the geometry, so the pinned size is the
+            # fullest state while what's on screen is the real current state.
+            for widget, was_mapped, info in restore:
+                try:
+                    if not was_mapped:
+                        widget.pack_forget()
+                    elif info:
+                        widget.pack(**info)
+                except tk.TclError:
+                    pass
+            self.update_idletasks()
+        min_w, min_h = self.minsize()
+        self.geometry("%dx%d" % (max(want_w, min_w), max(want_h, min_h)))
+
+    def _select_tab_by_text(self, text):
+        """Switch to the tab with this label, if it's still there. Matching on the label
+        rather than an index is what makes a stored "last tab" survive a release that
+        reorders, adds or renames tabs - an unknown label simply leaves the default
+        selection alone."""
+        if not text:
+            return
+        for tab_id in self.notebook.tabs():
+            try:
+                if self.notebook.tab(tab_id, "text") == text:
+                    self.notebook.select(tab_id)
+                    return
+            except tk.TclError:
+                return
 
     def report_callback_exception(self, exc_type, exc_value, exc_tb):
         """Tk calls this when a callback (button command, event binding, after-timer)
@@ -4870,8 +6326,25 @@ class ArkAPLauncher(tk.Tk):
         # reminder banner) via a style, so the toggle repaints it automatically.
         # Deliberately NOT packed here - it's a nag, and a permanent nag is wallpaper.
         # _update_save_hint packs it in only while some section really is unsaved.
-        self.save_hint_label = ttk.Label(title_row, text="make sure to save!",
-                                          style="SaveHint.TLabel", padding=(6, 2))
+        #
+        # The "Save" in it is a real button, not part of the sentence: the hint answers
+        # for all three sections at once, so a user who sees it still has to work out
+        # WHICH Save button they missed. This one just saves whatever is actually dirty
+        # (see _on_save_hint_click). A styled Frame holds the wash rather than a Label,
+        # because the yellow has to sit behind the text AND the button - the button
+        # itself stays a normal button (ttk's vista engine ignores background on
+        # TButton anyway), which is what keeps this reading as a reminder strip.
+        self.save_hint_label = ttk.Frame(title_row, style="SaveHint.TFrame",
+                                          padding=(6, 2))
+        ttk.Label(self.save_hint_label, text="make sure to",
+                  style="SaveHint.TLabel").pack(side="left")
+        self.save_hint_btn = ttk.Button(self.save_hint_label, text="Save", width=6,
+                                         command=self._on_save_hint_click)
+        self.save_hint_btn.pack(side="left", padx=(5, 0))
+        Tooltip(self.save_hint_btn,
+                "Saves every section that has unsaved changes right now - the "
+                "Configuration / Archipelago Setup fields, the Mods list, or both. "
+                "Same as clicking those tabs' own Save buttons.", wraplength=520)
 
         # Search bar - left-aligned directly below the title (not centered
         # under the logo). Enter runs the search and jumps to the first match;
@@ -4882,10 +6355,16 @@ class ArkAPLauncher(tk.Tk):
         self.search_entry = ttk.Entry(search_bar, textvariable=self.search_var, width=32)
         self.search_entry.pack(side="left")
         self.search_entry.bind("<Return>", lambda _e: self._run_search(self.search_var.get().strip()))
-        # Both buttons live in one frame so the pair can be hidden as a unit
-        # while the search box is empty - with nothing searched for they do
-        # nothing, and an empty search bar is the app's resting state.
+        # Both buttons live in one frame so the pair can be greyed out as a unit while
+        # the search box is empty - with nothing searched for they do nothing, and an
+        # empty search bar is the app's resting state.
+        #
+        # The frame stays packed and only the buttons' state changes (same reserve-the-
+        # space trick as update_badge_label and the Save halos). Hiding the frame
+        # outright shifted the match-count label ~160px sideways the moment anything was
+        # typed, and grew the window with it.
         self._find_btns = ttk.Frame(search_bar)
+        self._find_btns.pack(side="left")
         self.find_prev_btn = ttk.Button(self._find_btns, text="Find Prev", width=9,
                                          command=self._find_prev)
         self.find_prev_btn.pack(side="left", padx=(8, 2))
@@ -4911,7 +6390,7 @@ class ArkAPLauncher(tk.Tk):
         notebook.pack(fill="both", expand=True)
         tab_config = ttk.Frame(notebook)
         tab_archipelago = ttk.Frame(notebook)
-        tab_profiles = ttk.Frame(notebook)
+        tab_settings = ttk.Frame(notebook)
         tab_install = ttk.Frame(notebook)
         tab_mods = ttk.Frame(notebook)
         tab_status = ttk.Frame(notebook)
@@ -4920,18 +6399,27 @@ class ArkAPLauncher(tk.Tk):
         # Tab ORDER only - nothing reads a tab by position. Every reference in this app
         # is to the tab's frame object (self.tab_status, self.tab_instructions, ...),
         # and the search feature walks notebook.tabs() and stores the frame it found a
-        # match in, so reordering here is purely visual and safe.
+        # match in, so reordering here is purely visual and safe. The stored "last tab"
+        # is matched on the LABEL (_select_tab_by_text) for the same reason.
+        #
+        # The order is the order a user actually does the setup in: configure, install
+        # the server stack, pick mods, then set up the Archipelago side (which needs a
+        # slot name from a seed that mods can change), then check the result.
         notebook.add(tab_config, text="Configuration")
         notebook.add(tab_install, text="Install Server/Api/Plugin")
-        notebook.add(tab_archipelago, text="Archipelago Setup")
         notebook.add(tab_mods, text="Mods")
+        notebook.add(tab_archipelago, text="Archipelago Setup")
         notebook.add(tab_status, text="Setup Status")
-        notebook.add(tab_profiles, text="Profiles")
+        # Settings sits after the setup tabs and before the reference ones: it's launcher
+        # chrome (appearance, prompts, scan defaults, profiles), not a step in getting a
+        # server running, so it doesn't belong in the middle of that sequence.
+        notebook.add(tab_settings, text="Settings")
         notebook.add(tab_debug, text="Debug Log")
         notebook.add(tab_instructions, text="Instructions")
         self.notebook = notebook
+        self.tab_config = tab_config
         self.tab_archipelago = tab_archipelago
-        self.tab_profiles = tab_profiles
+        self.tab_settings = tab_settings
         self.tab_install = tab_install
         self.tab_mods = tab_mods
         self.tab_status = tab_status
@@ -4939,10 +6427,21 @@ class ArkAPLauncher(tk.Tk):
         self.tab_instructions = tab_instructions
         notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
+        # Fixed toolbar (never scrolls away) for the group collapse toggles below -
+        # same pair/labels as the Instructions tab's Expand all / Collapse all.
+        config_toolbar = ttk.Frame(tab_config, padding=(10, 6))
+        config_toolbar.pack(fill="x")
+        ttk.Button(config_toolbar, text="Expand all",
+                   command=lambda: self._set_all_config_groups(False)).pack(side="left")
+        ttk.Button(config_toolbar, text="Collapse all",
+                   command=lambda: self._set_all_config_groups(True)
+                   ).pack(side="left", padx=(6, 0))
+
         # Scrollable field area -------------------------------------------------
         mid = ttk.Frame(tab_config)
         mid.pack(fill="both", expand=True)
-        canvas = tk.Canvas(mid, borderwidth=0, highlightthickness=0)
+        canvas = tk.Canvas(mid, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
         vsb = ttk.Scrollbar(mid, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -4988,8 +6487,40 @@ class ArkAPLauncher(tk.Tk):
         ttk.Button(rbtns2, text="Don't show again",
                    command=self._dismiss_reminder_forever).pack(side="left")
 
-        self._render_field_groups(inner, GROUPS)
-        self._build_config_upload_section(inner)
+        # Paths, Plugin files & DeathLink and Locations render last (in that order),
+        # below Network/Increase stacks/Upload server config files - they're the
+        # setup-once groups (see CONFIG_GROUPS_SETUP_ONCE), everything above them gets
+        # touched far more often. They land right before the fixed Quick Launch bar
+        # at the bottom of the tab
+        # (below `mid`, packed outside this scrollable canvas - see `bottom` further
+        # down), which reads better than the reverse: Quick Launch/Save are the tab's
+        # primary controls and belong anchored at the very bottom, with the rarely-
+        # touched setup fields as the last thing you scroll past on the way there.
+        early_groups = [g for g in GROUPS if g[0] not in CONFIG_GROUPS_SETUP_ONCE]
+        setup_once_groups = [g for g in GROUPS if g[0] in CONFIG_GROUPS_SETUP_ONCE]
+        # _build_stack_section (below) reads self.get("SERVER_ROOT") for its initial
+        # dirty-check, and Setup Status / other build-time code may reach for other
+        # Paths/Locations keys too - pre-register their StringVars (blank, same as
+        # they'd read before load_from_files runs after _build_ui anyway) so those
+        # self.vars[key] lookups don't KeyError just because Paths/Locations now
+        # render after, not before, the sections that touch them.
+        for _title, _fields in setup_once_groups:
+            for _key, _label, _kind in _fields:
+                self.vars.setdefault(_key, tk.StringVar())
+
+        # Every group (all of them collapsible) is placed by grid row in here, never
+        # pack - see _next_config_row / _make_collapsible_group's docstring for why a
+        # collapsed group's LabelFrame has to be a whole separate never-resized
+        # sibling rather than something that shrinks in place.
+        groups_area = ttk.Frame(inner)
+        groups_area.pack(fill="x")
+        groups_area.columnconfigure(0, weight=1)
+        self._config_row = 0
+
+        self._render_field_groups(groups_area, early_groups, collapse_ids=GROUP_COLLAPSE_IDS)
+        self._build_stack_section(groups_area)
+        self._build_config_upload_section(groups_area)
+        self._render_field_groups(groups_area, setup_once_groups, collapse_ids=GROUP_COLLAPSE_IDS)
 
         # Bottom action bar (fixed) --------------------------------------------
         bottom = ttk.Frame(tab_config, padding=(10, 8))
@@ -5036,6 +6567,11 @@ class ArkAPLauncher(tk.Tk):
              "checks will immediately re-send. Use 'Full reset for new seed' instead "
              "when starting a new seed."),
         ]
+        # The two troubleshooting resets deliberately do NOT live here. They're for one
+        # rare symptom (a server that exits during startup), they're destructive, and a
+        # third and fourth button with "reset" in the name next to the two everyday ones
+        # is exactly how the wrong one gets clicked. They're on the Settings tab, under
+        # their own "Troubleshooting" heading - see _build_troubleshooting_section.
         row = ttk.Frame(q)
         row.pack(fill="x")
         for entry in quick_launch:
@@ -5089,7 +6625,7 @@ class ArkAPLauncher(tk.Tk):
         self._build_mods_tab(tab_mods)
         self._build_setup_status_tab(tab_status)
         self._build_debug_log_tab(tab_debug)
-        self._build_profiles_tab(tab_profiles)
+        self._build_settings_tab(tab_settings)
         self._build_instructions_tab(tab_instructions)
         self._tag_instruction_examples()   # both instruction bodies at once
 
@@ -5785,6 +7321,9 @@ class ArkAPLauncher(tk.Tk):
         tmp_dir = tempfile.mkdtemp(prefix="arkap_trackerpack_")
         zip_path = os.path.join(tmp_dir, "trackerpack.zip")
         extract_dir = os.path.join(tmp_dir, "unzipped")
+        # Bound before the try so the failure path can name it - every exit from here
+        # reports against this destination, including ones raised before the move.
+        dest = os.path.join(packs, TRACKER_PACK_DIRNAME)
         try:
             q.put(("line", "Downloading %s %s..." % (TRACKER_PACK_LABEL, tag)))
             self._download_with_progress(url, zip_path, q)
@@ -5797,7 +7336,6 @@ class ArkAPLauncher(tk.Tk):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return None
             _uid, version = read_pack_manifest(src)
-            dest = os.path.join(packs, TRACKER_PACK_DIRNAME)
             # Two things get moved aside: whatever copy of this pack is already installed
             # (under any name, folder or zip - see installed_tracker_pack), and anything
             # else occupying the folder name about to be written. Usually they're the same
@@ -5814,9 +7352,12 @@ class ArkAPLauncher(tk.Tk):
                 moved_from.append(old)
                 backups.append(self._backup_pack_entry(old, ts))
                 q.put(("line", "Moved the existing pack aside: %s" % backups[-1]))
-            shutil.move(src, dest)
+            # A pack's asset tree is several levels deep and packs\ sits under a PopTracker
+            # folder the user picked, so this move is as MAX_PATH-exposed as the mod copy.
+            shutil.move(ext_path(src), ext_path(dest))
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
-            q.put(("line", "! %s install failed: %s" % (TRACKER_PACK_LABEL, exc)))
+            q.put(("line", "! %s install failed: %s%s"
+                   % (TRACKER_PACK_LABEL, exc, _long_path_hint(exc, dest))))
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return None
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -5824,7 +7365,7 @@ class ArkAPLauncher(tk.Tk):
                % (TRACKER_PACK_LABEL, version or tag, dest)))
         return {"tag": tag, "version": version or tag, "dest": dest, "backups": backups}
 
-    def _backup_pack_entry(self, path, ts):
+    def _backup_pack_entry(self, path, ts, keep=None):
         """Move a pack (folder or zip) out of packs\\ into
         <PopTracker dir>\\pack_backups\\<name>.<timestamp>, and return where it went.
 
@@ -5833,7 +7374,9 @@ class ArkAPLauncher(tk.Tk):
         would still carry the same package_uid and turn up as a duplicate in its Load
         list. Timestamped, with a dupe suffix on a same-second collision - the same
         never-delete contract as _backup_file, which can't be reused here because a pack
-        can be a whole folder rather than a single file."""
+        can be a whole folder rather than a single file. Prunes older backups of this
+        same pack down to `keep` (default: the "Backups to keep" setting) afterward -
+        see prune_backups."""
         packs = os.path.dirname(os.path.normpath(path))
         backup_dir = os.path.join(os.path.dirname(packs), TRACKER_PACK_BACKUP_DIRNAME)
         os.makedirs(backup_dir, exist_ok=True)
@@ -5843,7 +7386,12 @@ class ArkAPLauncher(tk.Tk):
         while os.path.exists(target):
             target = os.path.join(backup_dir, "%s.%s-%d" % (name, ts, dupe))
             dupe += 1
-        shutil.move(path, target)
+        shutil.move(ext_path(path), ext_path(target))
+        if keep is None:
+            keep = self._backup_retention_count()
+        pattern = re.compile(r"^%s\.%s$" % (re.escape(name), BACKUP_TS_RE))
+        _removed, failed = prune_backups(backup_dir, pattern, keep)
+        _log_prune_failures(failed)
         return target
 
     def _download_poptracker_app(self, q, dest_root):
@@ -5886,12 +7434,18 @@ class ArkAPLauncher(tk.Tk):
                 # leftover or an unrelated folder in the way. Moved aside, never merged
                 # into or deleted.
                 moved = "%s.%s.bak" % (dest, time.strftime("%Y%m%d-%H%M%S"))
-                shutil.move(dest, moved)
+                shutil.move(ext_path(dest), ext_path(moved))
                 q.put(("line", "Moved an existing \"%s\" folder aside: %s"
                        % (os.path.basename(dest), moved)))
-            shutil.move(src, dest)
+                pattern = re.compile(r"^%s\.%s\.bak$"
+                                     % (re.escape(os.path.basename(dest)), BACKUP_TS_RE))
+                _removed, failed = prune_backups(os.path.dirname(dest) or ".", pattern,
+                                                 self._backup_retention_count())
+                _log_prune_failures(failed)
+            shutil.move(ext_path(src), ext_path(dest))
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
-            q.put(("line", "! PopTracker download failed: %s" % exc))
+            q.put(("line", "! PopTracker download failed: %s%s"
+                   % (exc, _long_path_hint(exc, os.path.join(dest_root, "poptracker")))))
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return None
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -5964,8 +7518,8 @@ class ArkAPLauncher(tk.Tk):
         kept = ("\n\nYour previous copy was moved to:\n%s" % "\n".join(pack["backups"])
                 if pack["backups"] else "")
         if app_dir:
-            messagebox.showinfo(
-                "Download PopTracker",
+            self._info_once(
+                PROMPT_POPTRACKER_INSTALLED, "Download PopTracker",
                 "PopTracker is installed here:\n%s\n\n%s %s was installed into its %s "
                 "folder.%s\n\nThe PopTracker directory has been filled in for you - click "
                 "Save on this tab so it's remembered next time. Then use \"Open "
@@ -5973,8 +7527,8 @@ class ArkAPLauncher(tk.Tk):
                 % (app_dir, TRACKER_PACK_LABEL, pack["version"],
                    POPTRACKER_PACKS_DIRNAME, kept))
             return
-        messagebox.showinfo(
-            "Install/update %s" % TRACKER_PACK_LABEL,
+        self._info_once(
+            PROMPT_TRACKER_PACK_INSTALLED, "Install/update %s" % TRACKER_PACK_LABEL,
             "%s %s installed into:\n%s%s\n\nIf PopTracker is already open, press Ctrl+F5 "
             "(force-reload) or restart it for the new version to be picked up."
             % (TRACKER_PACK_LABEL, pack["version"], pack["dest"], kept))
@@ -6048,9 +7602,11 @@ class ArkAPLauncher(tk.Tk):
         # instructions are on screen while the user waits) and only once per app session:
         # the details are on the clipboard and in the log every time, but a modal box on
         # every click of a button people press repeatedly is a nag, not help.
+        # The session flag stays on top of _info_once: without it the note would return
+        # on the second launch of the same session for anyone who hasn't ticked the box.
         if hand_over and not self._poptracker_room_hint_shown:
             self._poptracker_room_hint_shown = True
-            messagebox.showinfo("Open PopTracker", note)
+            self._info_once(PROMPT_POPTRACKER_ROOM, "Open PopTracker", note)
 
     # ------------------------------------------- Archipelago tab: gating ---- #
     def _archipelago_dir(self):
@@ -6148,24 +7704,38 @@ class ArkAPLauncher(tk.Tk):
                 self.set(key, os.path.normpath(cand))
                 self._log("%s: found %s" % (label, os.path.normpath(cand)))
                 return
-        self._log("%s: not in the common locations - scanning drives (this can take up "
-                  "to ~20s)..." % label)
-        self._dir_scan_status(key, "Scanning drives - this can take up to ~20s...")
+        # The common-locations pass above is the same at every intensity - it's a handful
+        # of os.path.isfile calls and there is nothing to make more thorough. Intensity
+        # only widens the drive walk that follows.
+        level = self._current_scan_level()
+        eta = DIR_SCAN_LEVEL_ETA[level]
+        self._log("%s (%s): not in the common locations - scanning drives (this can take "
+                  "%s)..." % (label, level, eta))
+        self._dir_scan_status(key, "Scanning drives - this can take %s..." % eta)
         self._set_dir_scan_busy(key, True)
         self._dir_scan_queue = queue.Queue()
         self._dir_scan_thread = threading.Thread(
-            target=self._dir_scan_worker, args=(key,), daemon=True)
+            target=self._dir_scan_worker, args=(key, level), daemon=True)
         self._dir_scan_thread.start()
         self.after(150, self._poll_dir_scan_queue, key)
 
-    def _dir_scan_worker(self, key):
+    def _current_scan_level(self):
+        """The intensity every scan button runs at - the shared Configuration/Settings
+        setting, floored to a known level so a hand-edited config can't feed a garbage
+        value into the limit lookups."""
+        level = self.scan_level_var.get()
+        return level if level in SCAN_LEVELS else SCAN_LEVEL_DEFAULT
+
+    def _dir_scan_worker(self, key, level):
         q = self._dir_scan_queue
+        max_depth, max_dirs, budget = DIR_SCAN_LEVEL_LIMITS[level]
         try:
             found = bounded_drive_scan(
                 lambda line: q.put(("line", line)),
                 lambda: False,
                 matches=DIR_SCAN_TARGETS[key]["matches"],
-                skip_names=SKIP_ARCHIPELAGO_SCAN_DIR_NAMES)
+                skip_names=SKIP_ARCHIPELAGO_SCAN_DIR_NAMES,
+                max_depth=max_depth, max_dirs=max_dirs, time_budget=budget)
         except Exception as exc:  # a scan must never take the app down with it
             q.put(("error", str(exc)))
             return
@@ -6426,7 +7996,189 @@ class ArkAPLauncher(tk.Tk):
                 return
         self._open_folder(path, label)
 
-    def _render_field_groups(self, parent, groups):
+    # --------------------------------------- collapsible Configuration groups --- #
+    #
+    # Same checkbox-driven-BooleanVar idea as the Instructions tab's section headers
+    # (_build_instruction_text): a ttk.Checkbutton toggles a var, and the var's trace
+    # applies the fold. That mechanism there hides/shows Text *tag* ranges via elide,
+    # which only makes sense inside one big Text widget.
+    #
+    # A LabelFrame whose BODY shrinks/grows in place (grid_remove/grid on a child
+    # inside an already-shown container) turns out not to work on this Tk build: the
+    # container silently keeps its old size in one or both directions no matter how
+    # the resize is forced (pack/grid_configure, forget+re-add, propagate toggling,
+    # even destroying the child outright) - confirmed with a from-scratch minimal
+    # repro, so it's not this codebase's plumbing. What DOES reliably work is
+    # toggling the PRESENCE of an already-built, never-again-resized sibling within a
+    # stable grid - so each group is really two complete, immutable LabelFrames (one
+    # header-only, one header+body) that swap via grid()/grid_remove() at the same
+    # row, never resizing either one after it's built. See _next_config_row.
+    def _next_config_row(self):
+        row = self._config_row
+        self._config_row += 1
+        return row
+
+    def _make_collapsible_group(self, parent, title, group_id, *, default_collapsed=False):
+        """Two immutable LabelFrames sharing one grid row in `parent` (which must be
+        a grid-only container - see groups_area in _build_ui): `collapsed_lf` (just
+        the header) and `expanded_lf` (header + fields), swapped via grid()/
+        grid_remove() on a checkbox click - never resized once built. Returns the
+        Frame callers should build the group's fields into.
+
+        Initial state comes from self._group_collapse_state (GROUP_COLLAPSE_KEY, read
+        once in __init__); missing means first run (or an older config predating this)
+        and falls back to `default_collapsed`. Every group's BooleanVar lands in
+        self._group_collapse_vars, which is what _reveal_group_for_widget and the
+        Setup Status jump links (_goto_config_field) walk to auto-expand on demand."""
+        collapsed = bool(self._group_collapse_state.get(group_id, default_collapsed))
+        var = tk.BooleanVar(value=collapsed)
+        self._group_collapse_vars[group_id] = var
+        row = self._next_config_row()
+
+        def _make_header(container):
+            header = ttk.Frame(container)
+            cb = ttk.Checkbutton(header, variable=var)
+            cb.pack(side="left")
+            Tooltip(cb, "Collapse this section down to its heading, or expand it.")
+            ttk.Label(header, text=title, style="TLabelframe.Label"
+                      ).pack(side="left", padx=(2, 0))
+            return header
+
+        expanded_lf = ttk.LabelFrame(parent, padding=(10, 6))
+        expanded_lf.configure(labelwidget=_make_header(expanded_lf))
+        expanded_lf.columnconfigure(0, weight=1)
+        body = ttk.Frame(expanded_lf)
+        body.grid(row=0, column=0, sticky="ew")
+        body._collapse_group_id = group_id
+
+        # A plain Frame, not a second LabelFrame: an empty ttk.LabelFrame whose only
+        # content is its labelwidget doesn't reserve any height for that labelwidget
+        # (reqheight comes out ~1px, silently swallowing the header) - a bordered box
+        # only sizes correctly once something is actually inside its content area.
+        collapsed_lf = ttk.Frame(parent, padding=(10, 6))
+        _make_header(collapsed_lf).pack(anchor="w")
+
+        def _apply(*_a):
+            if var.get():
+                expanded_lf.grid_remove()
+                collapsed_lf.grid(row=row, column=0, sticky="ew", pady=6)
+            else:
+                collapsed_lf.grid_remove()
+                expanded_lf.grid(row=row, column=0, sticky="ew", pady=6)
+        _apply()
+        var.trace_add("write", _apply)
+        var.trace_add("write", lambda *_a: self._save_group_collapse_state())
+        return body
+
+    def _make_inline_collapsible(self, parent, title, group_id, row, *,
+                                  default_collapsed=False):
+        """Small inline collapse control for a subsection within an already-collapsible
+        group - currently just the Network group's rarely-touched GAMEPORT/QUERYPORT/
+        RCONPORT trio (see NETWORK_PORT_KEYS). Same two-immutable-siblings swap as
+        _make_collapsible_group, minus the LabelFrame border - it needs to read as
+        "part of this group", not a group of its own. `parent` must be a grid-only
+        container (Network's body - see _render_field_groups) and `row` the grid row
+        both siblings share within it."""
+        collapsed = bool(self._group_collapse_state.get(group_id, default_collapsed))
+        var = tk.BooleanVar(value=collapsed)
+        self._group_collapse_vars[group_id] = var
+
+        def _make_header(container):
+            header = ttk.Frame(container)
+            cb = ttk.Checkbutton(header, variable=var)
+            cb.pack(side="left")
+            Tooltip(cb, "Collapse this down, or expand it again.")
+            ttk.Label(header, text=title, foreground=self.theme["subtle_fg"],
+                      font=("Segoe UI", 8, "italic")).pack(side="left", padx=(2, 0))
+            return header
+
+        expanded = ttk.Frame(parent)
+        expanded.columnconfigure(0, weight=1)
+        _make_header(expanded).grid(row=0, column=0, sticky="w", pady=(4, 2))
+        body = ttk.Frame(expanded)
+        body.grid(row=1, column=0, sticky="ew")
+        body._collapse_group_id = group_id
+
+        collapsed_frame = ttk.Frame(parent)
+        _make_header(collapsed_frame).pack(anchor="w", pady=(4, 2))
+
+        def _apply(*_a):
+            if var.get():
+                expanded.grid_remove()
+                collapsed_frame.grid(row=row, column=0, sticky="ew")
+            else:
+                collapsed_frame.grid_remove()
+                expanded.grid(row=row, column=0, sticky="ew")
+        _apply()
+        var.trace_add("write", _apply)
+        var.trace_add("write", lambda *_a: self._save_group_collapse_state())
+        return body
+
+    def _save_group_collapse_state(self):
+        data = {gid: bool(var.get()) for gid, var in self._group_collapse_vars.items()}
+        self._write_config_key(GROUP_COLLAPSE_KEY, data, "Configuration tab group layout")
+
+    def _set_all_config_groups(self, collapsed):
+        """Configuration tab's "Expand all" / "Collapse all" toolbar buttons - same
+        pairing as the Instructions tab's _set_all_instructions. Covers every group
+        var that exists by the time this runs (the five field groups, Increase
+        stacks, Upload server config files, and the Network ports sub-toggle)."""
+        for var in self._group_collapse_vars.values():
+            var.set(collapsed)
+
+    def _reveal_group_for_widget(self, widget):
+        """Expand every collapsed Configuration-tab group `widget` sits inside (walks
+        the full ancestor chain, so a port field nested inside both the Network group
+        AND its ports sub-toggle re-opens both). A scan filling a value in, a search
+        match, or a Setup Status jump link should never land on a field the user can't
+        see - silently updating a hidden field is worse than the collapse being tidy."""
+        w = widget
+        while w is not None:
+            group_id = getattr(w, "_collapse_group_id", None)
+            if group_id is not None:
+                var = self._group_collapse_vars.get(group_id)
+                if var is not None and var.get():
+                    var.set(False)
+            try:
+                parent_name = w.winfo_parent()
+            except tk.TclError:
+                break
+            if not parent_name:
+                break
+            try:
+                w = w.nametowidget(parent_name)
+            except KeyError:
+                break
+
+    def _goto_config_field(self, keys):
+        """Setup Status hint links: switch to the Configuration tab, expand whichever
+        collapsible group(s) hold `keys` (self.vars field names, or "#<group_id>" to
+        reveal a group with no field of its own, e.g. Increase stacks), and focus/
+        center the first real field."""
+        self.notebook.select(self.tab_config)
+        self.update()
+        target_widget = None
+        for key in keys:
+            if key.startswith("#"):
+                var = self._group_collapse_vars.get(key[1:])
+                if var is not None:
+                    var.set(False)
+                continue
+            entry = self._entries.get(key)
+            if entry is None:
+                continue
+            self._reveal_group_for_widget(entry)
+            if target_widget is None:
+                target_widget = entry
+        if target_widget is not None:
+            self.update_idletasks()
+            self._center_widget_in_canvas(target_widget)
+            try:
+                target_widget.focus_set()
+            except tk.TclError:
+                pass
+
+    def _render_field_groups(self, parent, groups, collapse_ids=None):
         """Render (group title, [(key, label, kind), ...]) groups as LabelFrames of
         labelled fields into `parent`.
 
@@ -6436,26 +8188,48 @@ class ArkAPLauncher(tk.Tk):
         its own key, which is what lets the rest of the app (connector.ini writing,
         profiles, diagnostics, Setup Status) stay completely unaware of which tab a
         field is drawn on. The per-group/per-key special cases below key off the
-        title/field name, never off the parent, for the same reason."""
+        title/field name, never off the parent, for the same reason.
+
+        `collapse_ids` (Configuration tab only - GROUP_COLLAPSE_IDS) makes a group
+        foldable under its header checkbox via _make_collapsible_group, which places
+        it by grid row in `parent` - so on the Configuration tab `parent` must be a
+        grid-only container (groups_area in _build_ui). Groups not in `collapse_ids`
+        (every Archipelago Setup tab group) render as a plain, pack-placed LabelFrame,
+        same as before - `parent` there stays the existing pack-only container."""
+        network_row = 0  # Network only - see NETWORK_PORT_KEYS below; grid row within its body
         for title, fields in groups:
-            lf = ttk.LabelFrame(parent, text=title, padding=(10, 6))
-            lf.pack(fill="x", expand=True, pady=6)
-            lf.columnconfigure(0, weight=1)
+            group_id = (collapse_ids or {}).get(title)
+            if group_id:
+                target = self._make_collapsible_group(parent, title, group_id)
+            else:
+                target = ttk.LabelFrame(parent, text=title, padding=(10, 6))
+                target.pack(fill="x", expand=True, pady=6)
+            target.columnconfigure(0, weight=1)
+
+            ports_body = None  # Network only - see NETWORK_PORT_KEYS below
 
             if title == "Paths":
-                toolrow = ttk.Frame(lf)
+                toolrow = ttk.Frame(target)
                 toolrow.pack(fill="x", pady=(0, 6))
                 # Scan intensity is picked BEFORE scanning, so the user opts into the
-                # slow levels knowingly. Quick is the default and is what a focus-out
-                # of SERVER_ROOT always runs, whatever is selected here.
+                # slow levels knowingly. Quick is the default and is what an IMPLICIT
+                # scan (focus-out of SERVER_ROOT, post-install) always runs, whatever is
+                # selected here - those fire without the user asking, and a minute-long
+                # Exhaustive walk on every focus change would be unusable.
+                #
+                # scan_level_var is created in __init__ and shared with the Settings
+                # tab's identical combobox, so the two are one setting shown in two
+                # places; it persists itself to the config on change.
                 ttk.Label(toolrow, text="Scan intensity:").pack(side="left", padx=(0, 4))
-                self.scan_level_var = tk.StringVar(value=SCAN_LEVEL_DEFAULT)
                 self.scan_level_combo = ttk.Combobox(
                     toolrow, textvariable=self.scan_level_var, values=list(SCAN_LEVELS),
                     state="readonly", width=11)
                 self.scan_level_combo.pack(side="left")
                 Tooltip(self.scan_level_combo,
-                        "How hard \"Scan for paths\" looks:\n"
+                        "How hard every scan button looks - this one, \"Scan for "
+                        "Archipelago\" and \"Scan for PopTracker\". Same setting as "
+                        "\"Default scan intensity\" on the Settings tab, and remembered "
+                        "between sessions.\n"
                         "  Quick - %s\n"
                         "  Thorough - %s\n"
                         "  Exhaustive - %s" % (SCAN_LEVEL_HELP[SCAN_QUICK],
@@ -6499,7 +8273,7 @@ class ArkAPLauncher(tk.Tk):
                 # fills. SteamCMD creates none of this and ARK won't start without
                 # CLUSTERDIR, so the fix for a fresh install is to create the folders,
                 # not to search harder for ones that never existed (default_cluster_paths).
-                crow = ttk.Frame(lf)
+                crow = ttk.Frame(target)
                 crow.pack(fill="x", pady=(0, 6))
                 self.create_cluster_btn = ttk.Button(
                     crow, text="Create %s folders" % CLUSTER_ROOT_DIRNAME,
@@ -6530,29 +8304,48 @@ class ArkAPLauncher(tk.Tk):
                         wraplength=520)
 
             for key, label, kind in fields:
+                # Network's own field rows use grid (row=network_row), never pack:
+                # the ports mini-collapsible below needs to share ONE of those rows
+                # via its own swap-siblings trick (_make_inline_collapsible), and Tk
+                # refuses to mix pack and grid slaves under the same parent.
+                if title == "Network" and key in NETWORK_PORT_KEYS:
+                    if ports_body is None:
+                        ports_body = self._make_inline_collapsible(
+                            target, "Ports (GAMEPORT / QUERYPORT / RCONPORT)",
+                            NETWORK_PORTS_GROUP_COLLAPSE_ID, network_row,
+                            default_collapsed=True)
+                        network_row += 1
+                    field_parent = ports_body
+                else:
+                    field_parent = target
+
                 var = tk.StringVar()
                 self.vars[key] = var
-                row = ttk.Frame(lf)
-                row.pack(fill="x", pady=(2, 6))
-                row.columnconfigure(0, weight=1)
+                field_row = ttk.Frame(field_parent)
+                if title == "Network" and field_parent is target:
+                    field_row.grid(row=network_row, column=0, sticky="ew", pady=(2, 6))
+                    network_row += 1
+                else:
+                    field_row.pack(fill="x", pady=(2, 6))
+                field_row.columnconfigure(0, weight=1)
 
                 if kind == "bool":
-                    entry_widget = ttk.Checkbutton(row, text=label, variable=var,
+                    entry_widget = ttk.Checkbutton(field_row, text=label, variable=var,
                                                     onvalue="true", offvalue="false")
                     entry_widget.grid(row=0, column=0, sticky="w")
                     label_widget = entry_widget
                 else:
-                    label_widget = ttk.Label(row, text=label)
+                    label_widget = ttk.Label(field_row, text=label)
                     label_widget.grid(row=0, column=0, columnspan=2, sticky="w")
-                    entry_widget = ttk.Entry(row, textvariable=var)
+                    entry_widget = ttk.Entry(field_row, textvariable=var)
                     entry_widget.grid(row=1, column=0, sticky="ew", padx=(0, 6))
                     if kind in ("folder", "file"):
-                        ttk.Button(row, text="Browse...", width=10,
+                        ttk.Button(field_row, text="Browse...", width=10,
                                    command=lambda k=key, t=kind: self._browse(k, t)
                                    ).grid(row=1, column=1, sticky="e")
                         if key in PATH_GROUP_KEYS:
                             clear_btn = ttk.Button(
-                                row, text="C", width=2,
+                                field_row, text="C", width=2,
                                 command=lambda k=key: self._clear_path_field(k))
                             clear_btn.grid(row=1, column=2, sticky="e", padx=(4, 0))
                             Tooltip(clear_btn, "Clear this field back to blank. Doesn't "
@@ -6576,8 +8369,8 @@ class ArkAPLauncher(tk.Tk):
                         Tooltip(entry_widget, help_text)
 
                 if key == "MAP":
-                    ttk.Label(row, text="Note: TheIsland is the only officially "
-                                        "supported map currently.",
+                    ttk.Label(field_row, text="Note: TheIsland is the only officially "
+                                        "supported map currently. Ragnarok and Scorched Earth are in early testing",
                               foreground=self.theme["note_fg"], font=("Segoe UI", 8, "italic")
                               ).grid(row=2, column=0, columnspan=2, sticky="w",
                                      pady=(2, 0))
@@ -6586,16 +8379,16 @@ class ArkAPLauncher(tk.Tk):
                 # directory field and its Browse button, so setting the folder and
                 # searching for it read as one thing rather than two unrelated controls.
                 if key == ARCHIPELAGO_DIR_KEY:
-                    self._build_archipelago_scan_row(lf)
+                    self._build_archipelago_scan_row(target)
 
                 # Same idea, one group down: the PopTracker scan row and the three
                 # PopTracker buttons all live in the same LabelFrame as the directory they
                 # act on, so the whole feature reads as one thing.
                 if key == POPTRACKER_DIR_KEY:
-                    self._build_poptracker_controls(lf)
+                    self._build_poptracker_controls(target)
 
                 if key == "password":
-                    crow = ttk.Frame(lf)
+                    crow = ttk.Frame(target)
                     crow.pack(fill="x", pady=(0, 6))
                     copy_btn = ttk.Button(crow, text="Copy ARK connection command",
                                            command=self._copy_connect_command)
@@ -6615,9 +8408,9 @@ class ArkAPLauncher(tk.Tk):
         Deliberately separate from the Save flow above: Save does targeted
         line-rewrites of individual settings, whereas this replaces whole files
         wholesale, which is destructive enough to need its own confirm + backup."""
-        box = ttk.LabelFrame(parent, text="Upload server config files (Game.ini / "
-                                           "GameUserSettings.ini)", padding=(10, 6))
-        box.pack(fill="x", expand=True, pady=6)
+        box = self._make_collapsible_group(
+            parent, "Upload server config files (Game.ini / GameUserSettings.ini)",
+            UPLOAD_CONFIG_GROUP_COLLAPSE_ID)
         ttk.Label(box, wraplength=640, justify="left", foreground=self.theme["subtle_fg"],
                   text="Copies your own copies of these files into "
                        "<SERVER_ROOT>\\%s, replacing the server's. The files being "
@@ -6761,17 +8554,11 @@ class ArkAPLauncher(tk.Tk):
         for name, src in sources.items():
             dest = os.path.join(dest_dir, name)
             # Back up FIRST - if that fails, this file is skipped rather than
-            # overwritten with no way back.
+            # overwritten with no way back. Same pattern (and dupe-suffix handling)
+            # as every other file backup in the app - see _backup_file.
             if os.path.isfile(dest):
-                backup = "%s.%s.bak" % (dest, ts)
-                # Two uploads inside the same second would otherwise land on the
-                # same backup name and silently destroy the first one.
-                dupe = 2
-                while os.path.exists(backup):
-                    backup = "%s.%s-%d.bak" % (dest, ts, dupe)
-                    dupe += 1
                 try:
-                    shutil.copy2(dest, backup)
+                    backup = self._backup_file(dest, ts)
                     self._log("Backed up %s -> %s" % (dest, os.path.basename(backup)))
                 except OSError as exc:
                     errors.append("%s: backup failed (%s) - not overwritten" % (name, exc))
@@ -6795,8 +8582,8 @@ class ArkAPLauncher(tk.Tk):
         self.upload_config_status.configure(
             text="Uploaded %s." % ", ".join(copied) if copied else "Nothing uploaded.")
         if copied and not errors:
-            messagebox.showinfo(
-                "ARKIpelago Launcher",
+            self._info_once(
+                PROMPT_UPLOAD_CONFIG, "ARKIpelago Launcher",
                 "Uploaded %s into:\n\n%s\n\nThe previous version of each is kept "
                 "alongside as a .%s.bak file.\n\nRestart the ARK server for the new "
                 "settings to take effect." % (", ".join(copied), dest_dir, ts))
@@ -6805,6 +8592,525 @@ class ArkAPLauncher(tk.Tk):
                 "ARKIpelago Launcher",
                 "Some files could not be uploaded:\n\n%s\n\nSee the log for details."
                 % "\n".join(errors))
+
+    # ------------------------------------------------- Increase stacks --- #
+    def _build_stack_section(self, parent):
+        """The "Increase stacks" section: one global multiplier plus a per-item stack
+        size for the items the multiplier can't help (see STACK_ITEMS).
+
+        Like the upload section above, this is separate from Save: Save does targeted
+        line-rewrites of the launcher's own .bat/.ini fields, while this writes into the
+        server's two config files and so needs the server stopped, a backup and a
+        confirm of its own."""
+        box = self._make_collapsible_group(parent, "Increase stacks", STACKS_GROUP_COLLAPSE_ID)
+        ttk.Label(box, wraplength=640, justify="left", foreground=self.theme["subtle_fg"],
+                  text="Raises how much fits in one inventory slot, so a prime meat run "
+                       "stops hitting the slot cap and dropping the rest on the floor. "
+                       "Writes ItemStackSizeMultiplier into GameUserSettings.ini and one "
+                       "ConfigOverrideItemMaxQuantity line per item into Game.ini. This "
+                       "is NOT a stack mod on purpose - a stack mod replaces item "
+                       "blueprints, and the ArkAP plugin's engram grants match on "
+                       "blueprint data, so a stack mod breaks them. These are plain "
+                       "server settings and touch no blueprints.").pack(anchor="w")
+
+        chk = ttk.Checkbutton(box, text="Enable increased stack sizes",
+                              variable=self.stacks_enabled_var)
+        chk.pack(anchor="w", pady=(6, 0))
+        Tooltip(chk,
+                "Ticked, \"Apply to server config\" writes the multiplier and the "
+                "per-item block below into your server's config files. Unticked, the "
+                "same button REMOVES them again - the marker-wrapped block and the "
+                "ItemStackSizeMultiplier line only, leaving every other setting in both "
+                "files untouched. If you already had an ItemStackSizeMultiplier of your "
+                "own before turning this on, note that applying overwrites it and "
+                "removing takes it out; the backup taken before each write has your "
+                "original. Nothing is written to disk until you press that button, and "
+                "the ARK server has to be stopped when you do.",
+                wraplength=520)
+
+        mrow = ttk.Frame(box)
+        mrow.pack(fill="x", pady=(6, 0))
+        ttk.Label(mrow, text="Global stack size multiplier:").pack(side="left")
+        mult_entry = ttk.Entry(mrow, textvariable=self.stacks_mult_var, width=8)
+        mult_entry.pack(side="left", padx=6)
+        self._stack_entries.append(mult_entry)
+        Tooltip(mult_entry,
+                "Multiplies the maximum stack size of every item that ALREADY stacks - at "
+                "10.00 a 100-stack of metal becomes 1000. It does nothing for items whose "
+                "vanilla stack is 1 (raw prime meat, prime fish meat, mutton, honey, "
+                "fertilizer), because 1 x 10 is still 1 - that is what the per-item boxes "
+                "below are for, and they pair with this rather than replace it. Written "
+                "to GameUserSettings.ini's [ServerSettings] as ItemStackSizeMultiplier. "
+                "Restart the ARK server after applying.",
+                wraplength=520)
+
+        grid = ttk.Frame(box)
+        grid.pack(fill="x", pady=(6, 0))
+        ttk.Label(grid, wraplength=640, justify="left",
+                  foreground=self.theme["subtle_fg"],
+                  text="Per-item maximum stack size. Each one is written with "
+                       "bIgnoreMultiplier=true, so the number you type is what the server "
+                       "uses - the multiplier above is not applied on top of it. Leave a "
+                       "box empty to leave that item at its vanilla stack."
+                  ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        for i, (label, cls, vanilla) in enumerate(STACK_ITEMS, start=1):
+            ttk.Label(grid, text="%s:" % label).grid(row=i, column=0, sticky="w", pady=1)
+            entry = ttk.Entry(grid, textvariable=self.stacks_item_vars[cls], width=8)
+            entry.grid(row=i, column=1, sticky="w", padx=(8, 0), pady=1)
+            self._stack_entries.append(entry)
+            Tooltip(entry,
+                    "Maximum stack size for %s (vanilla: %d). Written to Game.ini as a "
+                    "ConfigOverrideItemMaxQuantity line for %s with bIgnoreMultiplier="
+                    "true. Empty = leave this item alone. Restart the ARK server after "
+                    "applying." % (label, vanilla, cls),
+                    wraplength=520)
+
+        btnrow = ttk.Frame(box)
+        btnrow.pack(fill="x", pady=(8, 0))
+        # Same warn_bg/warn_border halo as the three Save buttons, and it means the same
+        # thing: "what's on screen isn't on disk yet". The boxes above are intent only, so
+        # without it a typed-and-forgotten 500 looks identical to an applied one.
+        self.stack_apply_halo = tk.Frame(btnrow, background=self.theme["bg"],
+                                         highlightbackground=self.theme["bg"],
+                                         highlightthickness=1)
+        self.stack_apply_halo.pack(side="left")
+        apply_btn = ttk.Button(self.stack_apply_halo, text="Apply to server config",
+                               command=self.apply_stack_settings)
+        apply_btn.pack(padx=2, pady=2)
+        Tooltip(apply_btn,
+                "Writes the settings above into <SERVER_ROOT>\\%s - the multiplier into "
+                "GameUserSettings.ini, the per-item lines into Game.ini's existing "
+                "[/script/shootergame.shootergamemode] section (never a second one). Both "
+                "files are backed up with a timestamp first and only the launcher's own "
+                "lines are touched. With the tick above off it removes those lines "
+                "instead. The ARK server must be stopped - ARK rewrites "
+                "GameUserSettings.ini on shutdown and would throw the change away. "
+                "Restart the server afterwards for it to apply." % SERVER_CONFIG_RELDIR,
+                wraplength=520)
+        self.stack_status = ttk.Label(btnrow, text="",
+                                      foreground=self.theme["subtle_fg"])
+        self.stack_status.pack(side="left", padx=8)
+
+        # The other half of inventory management: stacks say how much fits in a slot,
+        # this says what it weighs. Deliberately a label, one line and one button - this
+        # section is already dense, and none of the mod's other options are ours to
+        # manage (see the EXCALIBUR_MOD_ID block for why).
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=(10, 6))
+        ttk.Label(box, text=EXCALIBUR_MOD_NAME).pack(anchor="w")
+        ttk.Label(box, foreground=self.theme["subtle_fg"],
+                  text="Reduces the weight of all items").pack(anchor="w")
+        eurow = ttk.Frame(box)
+        eurow.pack(fill="x", pady=(4, 0))
+        eu_btn = ttk.Button(eurow, text="Install %s" % EXCALIBUR_MOD_NAME,
+                            command=self.install_excalibur_buffs)
+        eu_btn.pack(side="left")
+        Tooltip(eu_btn,
+                "Downloads Workshop mod %s through the same installer the Mods tab uses, "
+                "adds it there as a ticked entry, and appends this to the bottom of "
+                "GameUserSettings.ini, wrapped in the launcher's own markers:\n\n%s\n\n"
+                "DisableWeightReduction=false is the line that actually reduces weight. "
+                "%s=true is required, not a preference: the mod's engram unlocker hands "
+                "out engrams the ArkAP plugin never granted, which breaks the plugin's "
+                "grant script and silently breaks the whole run - so it is always written "
+                "and Setup Status flags a red X if it ever stops being true.\n\n"
+                "The mod's other options (DisableFogRemover, DisableClearWater, "
+                "DisableDinoCounter, DisablePreventSteal, DisableRiderProtection) are "
+                "poorly documented and unrelated to weight, so they are left out and the "
+                "mod uses its own defaults - add them by hand inside the block if you "
+                "want them.\n\nThe mod is not one the apworld ships engram data for, so "
+                "it is left out of \"Copy IDs for YAML\". The ARK server must be stopped; "
+                "GameUserSettings.ini is backed up with a timestamp first and only the "
+                "marker block is added. Restart the server afterwards."
+                % (EXCALIBUR_MOD_ID, "\n".join(EU_BUFFS_LINES), EU_BUFFS_UNLOCKER_KEY),
+                wraplength=520)
+        self.excalibur_status = ttk.Label(eurow, text="",
+                                          foreground=self.theme["subtle_fg"])
+        self.excalibur_status.pack(side="left", padx=8)
+
+        self._sync_stack_fields()
+        self.stacks_enabled_var.trace_add("write", self._sync_stack_fields)
+        self._update_stacks_dirty()
+
+    def _sync_stack_fields(self, *_args):
+        """Grey the boxes out while the toggle is off, so a number sitting in a disabled
+        box can't read as a setting that's doing something."""
+        state = "normal" if self.stacks_enabled_var.get() else "disabled"
+        for widget in self._stack_entries:
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _stacks_settings(self):
+        """The section's intent, as stored in the config JSON (see STACKS_KEY). Item
+        quantities are the raw box text, so a cleared box stays cleared."""
+        return {
+            "enabled": bool(self.stacks_enabled_var.get()),
+            "multiplier": self.stacks_mult_var.get().strip(),
+            "items": {cls: var.get().strip()
+                      for cls, var in self.stacks_item_vars.items()},
+        }
+
+    def _save_stacks_config(self, *_args):
+        self._write_config_key(STACKS_KEY, self._stacks_settings(),
+                               "increase stacks settings")
+        self._update_stacks_dirty()
+
+    def _stacks_dirty(self):
+        """True when the section's boxes don't match what's actually in the server's two
+        config files - i.e. there is something for "Apply to server config" to do.
+
+        Compared against disk, not a remembered snapshot, for the same reason
+        _mods_dirty() is: it's the same comparison Apply resolves, so typing a number,
+        applying it, toggling the tick, and ARK rewriting GameUserSettings.ini behind our
+        back all come out right with no extra bookkeeping. With the tick off, "dirty"
+        means our lines are still on disk and haven't been taken back out yet."""
+        root = self.get("SERVER_ROOT")
+        gus = _gameusersettings_path(root) if root else ""
+        game_ini = self._game_ini_path()
+        if not self.stacks_enabled_var.get():
+            return stack_block_receipt(game_ini)
+        # Nothing to apply to a server that isn't installed yet - Apply would only tell
+        # the user to set SERVER_ROOT, so lighting the halo would be a nag with no fix.
+        if not gus or not os.path.isfile(gus):
+            return False
+        items, bad = self._stack_items_from_fields()
+        if bad:
+            return True     # junk in a box is definitely not what's on disk
+        ok, _detail = check_stack_settings_applied(
+            gus, game_ini, self.stacks_mult_var.get().strip(), items)
+        return not ok
+
+    def _update_stacks_dirty(self):
+        """Recompute the verdict, light (or blend away) the Apply halo, and let the
+        header's "make sure to save!" hint know. Cached in _stacks_dirty_flag so the hint
+        can reuse it instead of re-reading both ini files."""
+        halo = getattr(self, "stack_apply_halo", None)
+        if halo is None:
+            return          # called from a var trace before the section exists
+        try:
+            self._stacks_dirty_flag = self._stacks_dirty()
+        except OSError:
+            self._stacks_dirty_flag = False   # unreadable config - Apply will say why
+        self._set_halo(halo, self._stacks_dirty_flag)
+        self._update_save_hint()
+
+    def _stack_items_from_fields(self):
+        """(items, bad) - {class_string: quantity} for every box holding a positive whole
+        number, plus the labels of any box holding something that isn't one. Blank boxes
+        are neither: they simply mean "no line for this item"."""
+        items, bad = {}, []
+        for label, cls, _vanilla in STACK_ITEMS:
+            raw = self.stacks_item_vars[cls].get().strip()
+            if not raw:
+                continue
+            try:
+                qty = int(raw)
+            except ValueError:
+                bad.append(label)
+                continue
+            if qty < 1:
+                bad.append(label)
+            else:
+                items[cls] = qty
+        return items, bad
+
+    def apply_stack_settings(self):
+        """Write - or, with the toggle off, take back - the two stack-size settings.
+
+        GameUserSettings.ini gets a targeted ItemStackSizeMultiplier upsert and Game.ini
+        gets a marker-wrapped block merged into its existing
+        [/script/shootergame.shootergamemode] section: the same two patterns
+        set_active_mods and the randomized-creatures patch already use, so neither file is
+        ever rewritten wholesale and nothing the user set themselves is disturbed."""
+        # 1) Both files are read at server startup, and ARK REWRITES GameUserSettings.ini
+        #    when it shuts down - a write now would be ignored and then thrown away. Same
+        #    hard refusal the Game.ini patch makes, not a warning: there is no version of
+        #    "apply anyway" here that ends with the setting still on disk.
+        if is_process_running(ARK_SERVER_PROCESS):
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "%s is currently running.\n\nThese settings are read when the server "
+                "starts, and ARK rewrites GameUserSettings.ini when it shuts down - so "
+                "anything written now would be ignored and then overwritten. Stop the ARK "
+                "dedicated server first.\n\n(Increase stacks: nothing was written.)"
+                % ARK_SERVER_PROCESS)
+            self._log("Increase stacks: aborted - %s is running." % ARK_SERVER_PROCESS)
+            return
+
+        # 2) Where the two files are.
+        config_dir = self._server_config_dir()
+        if not config_dir:
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "Set SERVER_ROOT on this tab first - that's what says where the server's "
+                "config folder is.")
+            return
+        gus_path = os.path.join(config_dir, "GameUserSettings.ini")
+        game_ini = self._game_ini_path()
+
+        enabled = bool(self.stacks_enabled_var.get())
+        multiplier = self.stacks_mult_var.get().strip()
+        items, bad = self._stack_items_from_fields()
+
+        # 3) Validate before touching anything. A junk multiplier or quantity would go
+        #    into the file verbatim and be silently ignored by the server, which looks
+        #    exactly like "the launcher wrote it and it didn't work".
+        if enabled:
+            try:
+                if float(multiplier) <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "ARKIpelago Launcher",
+                    "\"%s\" isn't a valid stack size multiplier.\n\nEnter a positive "
+                    "number, for example %s." % (multiplier, STACK_MULT_DEFAULT))
+                return
+            if bad:
+                messagebox.showerror(
+                    "ARKIpelago Launcher",
+                    "These stack sizes aren't whole numbers of 1 or more:\n\n  %s\n\n"
+                    "Fix them, or clear the box to leave that item at its vanilla stack."
+                    % "\n  ".join(bad))
+                return
+            # Same rule as the randomized-creatures patch: a config that doesn't exist yet
+            # is a server that has never been started, not an invitation to leave a stub
+            # file behind holding one setting and none of ARK's own defaults.
+            missing = [(name, path) for name, path in (("GameUserSettings.ini", gus_path),
+                                                       ("Game.ini", game_ini))
+                       if not path or not os.path.isfile(path)]
+            if missing:
+                messagebox.showwarning(
+                    "ARKIpelago Launcher",
+                    "%s doesn't exist yet:\n\n%s\n\nStart the server once (or upload the "
+                    "file with \"Upload server config files\" above) so it exists, then "
+                    "apply again."
+                    % (" and ".join(name for name, _p in missing),
+                       "\n".join(path or "(location unknown - set SERVER_ROOT or game_ini)"
+                                 for _n, path in missing)))
+                self._log("Increase stacks: %s missing - nothing written."
+                          % ", ".join(name for name, _p in missing))
+                return
+
+        # 4) Work out the new text for both files before writing either. Both come from
+        #    stack_settings_writes / stack_settings_removals, which edit the text read off
+        #    disk and never rebuild a file from what the launcher knows about it.
+        writes = []          # (path, new_text, encoding, what changed, expect_shrink)
+        if enabled:
+            gus_text, gus_enc = read_text(gus_path)
+            game_text, game_enc = read_text(game_ini)
+            new_gus, new_game = stack_settings_writes(gus_text, game_text, multiplier,
+                                                      items)
+            writes.append((gus_path, new_gus, gus_enc,
+                           "%s=%s" % (STACK_MULT_KEY, multiplier), False))
+            writes.append((game_ini, new_game, game_enc,
+                           "%d per-item stack override(s)" % len(items), False))
+            summary = ("Write these into your server's config?\n\n"
+                       "  %s\n    %s=%s\n\n  %s\n    %d ConfigOverrideItemMaxQuantity "
+                       "line(s), wrapped in the launcher's own markers and merged into "
+                       "the existing %s section.\n\nEverything else in both files is left "
+                       "exactly as-is, and each one is backed up with a timestamp first "
+                       "(nothing is deleted).\n\nProceed?"
+                       % (gus_path, STACK_MULT_KEY, multiplier, game_ini, len(items),
+                          GAME_INI_SECTION))
+        else:
+            # Toggle off: take back our own lines and nothing else. Our overrides in
+            # Game.ini are the receipt (marker-wrapped, or orphaned by ARK having stripped
+            # the markers - see remove_stack_block); without them the multiplier on disk
+            # is the user's own and is left strictly alone.
+            if game_ini and os.path.isfile(game_ini):
+                game_text, game_enc = read_text(game_ini)
+                gus_text, gus_enc = (read_text(gus_path)
+                                     if os.path.isfile(gus_path) else ("", "utf-8"))
+                new_gus, gus_removed, new_game, receipt = stack_settings_removals(
+                    gus_text, game_text)
+                # expect_shrink: removal IS the point here, so the size guard would be
+                # firing on the intended result rather than on a bug.
+                if receipt:
+                    writes.append((game_ini, new_game, game_enc,
+                                   "removed the stack-size block", True))
+                if gus_removed and os.path.isfile(gus_path):
+                    writes.append((gus_path, new_gus, gus_enc,
+                                   "removed %s" % STACK_MULT_KEY, True))
+            if not writes:
+                messagebox.showinfo(
+                    "ARKIpelago Launcher",
+                    "\"Enable increased stack sizes\" is off and there's nothing of the "
+                    "launcher's to remove - Game.ini holds no ArkAP stack-size block.\n\n"
+                    "If GameUserSettings.ini has an ItemStackSizeMultiplier in it, it "
+                    "isn't one this launcher wrote, so it's left exactly as it is. Change "
+                    "it by hand if you want it gone.")
+                self.stack_status.configure(text="Nothing of ours to remove.")
+                self._log("Increase stacks: disabled, no ArkAP block on disk to remove.")
+                return
+            summary = ("\"Enable increased stack sizes\" is off. Remove the launcher's "
+                       "stack settings from your server's config?\n\n%s\n\nOnly the "
+                       "%s line and the ConfigOverrideItemMaxQuantity lines this launcher "
+                       "wrote are removed - every other setting in both files is left "
+                       "exactly as-is, and each one is backed up with a timestamp first."
+                       "\n\nProceed?"
+                       % ("\n".join("  %s\n    %s" % (p, what)
+                                    for p, _t, _e, what, _s in writes), STACK_MULT_KEY))
+
+        if not messagebox.askyesno("Increase stacks", summary):
+            self._log("Increase stacks: cancelled.")
+            return
+
+        self._clear_log()
+        # 5) Back each file up BEFORE writing it - if the backup fails that file is
+        #    skipped rather than overwritten with no way back (same rule as the upload).
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        done, errors = [], []
+        for path, new_text, enc, what, expect_shrink in writes:
+            try:
+                backup = self._backup_file(path, ts)
+                self._log("Backed up %s -> %s" % (path, os.path.basename(backup)))
+            except OSError as exc:
+                errors.append("%s: backup failed (%s) - not modified"
+                              % (os.path.basename(path), exc))
+                continue
+            try:
+                write_ini_guarded(path, new_text, encoding=enc,
+                                  expect_shrink=expect_shrink)
+                done.append(what)
+                self._log("Increase stacks: %s in %s" % (what, path))
+            except OSError as exc:
+                errors.append("%s: write failed (%s). Your original is safe at %s"
+                              % (os.path.basename(path), exc, backup))
+
+        # Re-read disk and settle the halo / header hint on what actually landed - after
+        # a partial failure too, where one file was written and the other wasn't.
+        self._update_stacks_dirty()
+
+        for err in errors:
+            self._log("! Increase stacks: %s" % err)
+        if errors:
+            self.stack_status.configure(text="Finished with errors - see the log.")
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "Some of the stack settings could not be written:\n\n%s"
+                % "\n".join(errors))
+            return
+
+        self.stack_status.configure(
+            text="Applied - restart the server." if enabled
+            else "Removed - restart the server.")
+        self._info_once(
+            PROMPT_STACK_SIZES_APPLIED, "ARKIpelago Launcher",
+            "%s\n\nThe previous version of each file is kept alongside it as a .%s.bak "
+            "file.\n\nRestart the ARK server for this to take effect."
+            % ("Stack settings written: " + "; ".join(done) if enabled
+               else "Stack settings removed: " + "; ".join(done), ts))
+
+    def install_excalibur_buffs(self):
+        """Install Excalibur Buffs: its [EU_Buffs] block into GameUserSettings.ini, then
+        the mod itself through the Mods tab's own installer.
+
+        Reuses _start_mods_worker rather than growing a second download path, so the mod
+        lands in exactly the state it would have from the Mods tab - listed, ticked, in
+        ActiveMods, with its icon reading real disk state - and the two can't drift."""
+        if self._any_install_running():
+            messagebox.showinfo("ARKIpelago Launcher",
+                                "An install is already running - wait for it to finish.")
+            return
+        # Same hard refusal as apply_stack_settings: ARK rewrites GameUserSettings.ini on
+        # shutdown, so both the block and ActiveMods would be ignored and then thrown away.
+        if is_process_running(ARK_SERVER_PROCESS):
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "%s is currently running.\n\nActiveMods and the [%s] settings are read "
+                "when the server starts, and ARK rewrites GameUserSettings.ini when it "
+                "shuts down - so anything written now would be ignored and then "
+                "overwritten. Stop the ARK dedicated server first.\n\n(%s: nothing was "
+                "written.)" % (ARK_SERVER_PROCESS, EU_BUFFS_SECTION, EXCALIBUR_MOD_NAME))
+            self._log("%s: aborted - %s is running."
+                      % (EXCALIBUR_MOD_NAME, ARK_SERVER_PROCESS))
+            return
+        gate_ok, server_root = self._mods_gate_state()
+        if not gate_ok:
+            self._mods_gate_warn()
+            return
+        gus_path = os.path.join(self._server_config_dir(), "GameUserSettings.ini")
+        # Same rule as the stack settings and set_active_mods: a config that doesn't exist
+        # yet is a server that has never been started, not an invitation to leave a stub
+        # file behind holding this block and none of ARK's own defaults.
+        if not os.path.isfile(gus_path):
+            messagebox.showwarning(
+                "ARKIpelago Launcher",
+                "GameUserSettings.ini doesn't exist yet:\n\n%s\n\nStart the ARK server "
+                "once so it writes its own config, then install again." % gus_path)
+            self._log("%s: GameUserSettings.ini missing - nothing written."
+                      % EXCALIBUR_MOD_NAME)
+            return
+
+        if not messagebox.askyesno(
+                EXCALIBUR_MOD_NAME,
+                "Download Workshop mod %s (%s) and add it to the Mods tab, ticked?\n\n"
+                "This also appends the following to the bottom of\n%s\n\n%s\n\n"
+                "DisableWeightReduction=false is what reduces item weight. %s=true is "
+                "required, not a setting: the mod's engram unlocker breaks the ArkAP "
+                "plugin's engram grants and would silently break your run.\n\nThe file is "
+                "backed up with a timestamp first and only the launcher's own "
+                "marker-wrapped block is added - every other setting is left exactly "
+                "as-is. Restart the ARK server afterwards.\n\nProceed?"
+                % (EXCALIBUR_MOD_ID, EXCALIBUR_MOD_NAME, gus_path,
+                   "\n".join(EU_BUFFS_LINES), EU_BUFFS_UNLOCKER_KEY)):
+            self._log("%s: cancelled." % EXCALIBUR_MOD_NAME)
+            return
+
+        # 1) The ini block first. It's the cheap half, and doing it in this order means a
+        #    failed download leaves a ticked-but-not-installed row rather than an
+        #    installed mod running with its engram unlocker on.
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            backup = self._backup_file(gus_path, ts)
+            self._log("Backed up %s -> %s" % (gus_path, os.path.basename(backup)))
+        except OSError as exc:
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "GameUserSettings.ini could not be backed up (%s), so it was not "
+                "modified and nothing was downloaded." % exc)
+            self._log("! %s: backup failed (%s) - nothing written."
+                      % (EXCALIBUR_MOD_NAME, exc))
+            return
+        try:
+            text, enc = read_text(gus_path)
+            write_ini_guarded(gus_path, excalibur_config_write(text), encoding=enc)
+        except OSError as exc:
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "The [%s] block could not be written (%s). Your original is safe at %s"
+                % (EU_BUFFS_SECTION, exc, backup))
+            self._log("! %s: write failed (%s)." % (EXCALIBUR_MOD_NAME, exc))
+            return
+        self._log("%s: wrote the [%s] block into %s"
+                  % (EXCALIBUR_MOD_NAME, EU_BUFFS_SECTION, gus_path))
+
+        # 2) The mod row. supported=False because the apworld ships no engram data for it,
+        #    which is what keeps it out of "Copy IDs for YAML" (see split_copyable_mod_ids)
+        #    - it still installs, loads and works as a normal ARK mod. Named rather than
+        #    left as a bare ID: the user didn't type this one, the button did.
+        mod = next((m for m in self._mods if m["id"] == EXCALIBUR_MOD_ID), None)
+        if mod is None:
+            mod = {"id": EXCALIBUR_MOD_ID, "name": EXCALIBUR_MOD_NAME,
+                   "enabled": True, "supported": False}
+            self._mods.append(mod)
+        else:
+            mod["enabled"] = True
+            mod["supported"] = False
+            # Only replace the placeholder "Add mod" leaves behind - a name the user chose
+            # themselves via Rename is theirs to keep.
+            if mod.get("name", "") in ("", EXCALIBUR_MOD_ID,
+                                       "Workshop Mod %s" % EXCALIBUR_MOD_ID):
+                mod["name"] = EXCALIBUR_MOD_NAME
+        self._save_mods_config()
+
+        # 3) Download + activate through the Mods tab's worker, which streams into the
+        #    Mods log and finishes with its own "restart the ARK server" line.
+        self.excalibur_status.configure(text="Installing - see the Mods tab log.")
+        self._start_mods_worker(server_root, [mod],
+                                activate=[m for m in self._mods if m.get("enabled")],
+                                force=False, title="Install %s" % EXCALIBUR_MOD_NAME)
 
     def _build_install_tab(self, parent):
         # Scrollable container - same Canvas + Scrollbar pattern as the Configuration
@@ -7123,17 +9429,41 @@ class ArkAPLauncher(tk.Tk):
             self.mods_gate_banner.pack(fill="x", pady=(0, 6), before=self._mods_top_frame)
         self._refresh_mods_list()  # also updates button enabled-state
 
+    def _sync_mods_enabled_from_disk(self):
+        """Sync in-memory `enabled` on every self._mods entry to GameUserSettings.ini's
+        ActiveMods - data only, no widgets touched, so it's safe to call at startup
+        before the Mods tab (built lazily on first visit) exists. Setup Status's
+        "Mods tab matches ActiveMods on disk" check reads self._mods directly, so
+        without this it would compare against whatever "enabled" state was last
+        persisted to config.json instead of the real file on disk.
+
+        Disk wins here, but ONLY when disk actually said something. There is no disk
+        truth to follow while gated (no SERVER_ROOT / server not installed) or when
+        GameUserSettings.ini has no ActiveMods line, and this used to treat both as "no
+        mods are active" and untick the entire tab. That was the bug: the ticks vanished,
+        Setup Status - which reads self._mods a beat earlier, before this runs - still had
+        the old ones and reported them as "ticked but missing from ActiveMods, so never
+        saved", and the next Save wrote the emptied list over a perfectly good ActiveMods.
+        An unknown leaves the ticks exactly as they are instead."""
+        gate_ok, server_root = self._mods_gate_state()
+        active_ids = read_active_mods_or_none(server_root) if gate_ok else None
+        if active_ids is None:
+            return                        # unknown != empty - keep what we have
+        active = set(active_ids)
+        for mod in self._mods:
+            mod["enabled"] = mod["id"] in active  # in-memory follows disk truth
+        # config.json's copy of `enabled` is otherwise only rewritten by add/rename/
+        # profile-load, so it sat frozen at whatever was last ticked by hand while memory
+        # and disk moved on - a stale third source of truth that made this look like the
+        # ticks were being read from the config rather than from ActiveMods.
+        self._save_mods_config()
+
     def _refresh_mods_list(self):
         """Rebuild every row from REAL disk state: checkbox = is the mod in
         GameUserSettings.ini's ActiveMods (read_active_mods), icon = is_mod_installed.
         This is the "re-verify against disk" path - called on tab load, manual Refresh,
-        reorder, and add. In-memory `enabled` is synced to the on-disk active state so it
-        never drifts from what the server will actually load."""
-        gate_ok, server_root = self._mods_gate_state()
-        # Authoritative active list from disk (empty when gated - nothing to read).
-        active_ids = set(read_active_mods(server_root)) if gate_ok else set()
-        for mod in self._mods:
-            mod["enabled"] = mod["id"] in active_ids  # in-memory follows disk truth
+        reorder, and add."""
+        self._sync_mods_enabled_from_disk()
         self._rebuild_mods_rows()
 
     def _rebuild_mods_rows(self):
@@ -7264,10 +9594,7 @@ class ArkAPLauncher(tk.Tk):
         self._update_mods_button_states()
 
     def on_mods_add(self):
-        win = tk.Toplevel(self)
-        win.title("Add mod")
-        win.transient(self)
-        win.resizable(False, False)
+        win = self._themed_toplevel("Add mod")
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, text="Steam Workshop mod ID:").pack(anchor="w")
@@ -7426,9 +9753,14 @@ class ArkAPLauncher(tk.Tk):
             if ok:
                 removed.add(mod["id"])
         # Defensive: never leave a just-removed mod referenced in ActiveMods (an unchecked
-        # mod shouldn't be active, but don't assume the two are in sync).
-        active = [mid for mid in read_active_mods(server_root) if mid not in removed]
-        set_active_mods(server_root, active)
+        # mod shouldn't be active, but don't assume the two are in sync). Read the
+        # unknown-aware way: read_active_mods would flatten "couldn't read ActiveMods"
+        # into [], and this would then WRITE that empty list back and deactivate every
+        # mod on the server - the same "unknown treated as empty" fault the Mods tab's
+        # disk sync had, except this one reaches disk directly.
+        current = read_active_mods_or_none(server_root)
+        if current is not None:
+            set_active_mods(server_root, [mid for mid in current if mid not in removed])
         self._refresh_mods_list()
 
     def on_mods_rename(self):
@@ -7444,10 +9776,7 @@ class ArkAPLauncher(tk.Tk):
                 % mod["name"])
             return
 
-        win = tk.Toplevel(self)
-        win.title("Rename mod")
-        win.transient(self)
-        win.resizable(False, False)
+        win = self._themed_toplevel("Rename mod")
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, text="Display name for mod %s:" % mod["id"]).pack(anchor="w")
@@ -7678,6 +10007,7 @@ class ArkAPLauncher(tk.Tk):
             "detail": detail,
             "hint": "Set SERVER_ROOT on the Configuration tab, then Install Server/Api/Plugin -> "
                     "Install ARK Server.",
+            "goto_keys": ["SERVER_ROOT"],
         })
 
         ok, detail = check_arkapi_installed(root)
@@ -7707,6 +10037,7 @@ class ArkAPLauncher(tk.Tk):
                     "folder by hand and hit Re-check. A missing cluster folder makes the "
                     "server hang on launch with no error."
                     % CLUSTER_ROOT_DIRNAME,
+            "goto_keys": [key for key, _ in CLUSTER_PATH_SUBDIRS],
         })
 
         # BattlEye isn't a persisted setting, but it doesn't need to be: the only way
@@ -7764,8 +10095,10 @@ class ArkAPLauncher(tk.Tk):
             "detail": detail,
             "hint": "The server reads its mod list from GameUserSettings.ini's ActiveMods, "
                     "and Save is what writes the ticks there. Ticked but not in ActiveMods "
-                    "means it was never saved, so it never loads, and a yaml whose mod_ids "
-                    "name it then expects engrams that aren't in the world. In ActiveMods "
+                    "means it isn't loading, and a yaml whose mod_ids name it then expects "
+                    "engrams that aren't in the world - either the tab was never saved, or "
+                    "the save worked and something rewrote GameUserSettings.ini "
+                    "afterwards, so check the file before re-saving. In ActiveMods "
                     "but not ticked means the server is already loading it while the tab "
                     "(and \"Copy IDs for YAML\") pretends it's off. Either way the tab is "
                     "what wins: tick the mods you actually want - Refresh re-reads disk if "
@@ -7774,6 +10107,59 @@ class ArkAPLauncher(tk.Tk):
                     "something to write); \"Download checked\" installs anything missing "
                     "and saves in one go. Restart the ARK server afterwards.",
         })
+
+        # Only while the toggle is on: with it off there is nothing that should be on
+        # disk, and a row about a feature the user hasn't turned on is noise. Advisory
+        # (yellow "i"), never a red X - the server runs perfectly well with vanilla stacks.
+        if self.stacks_enabled_var.get():
+            root = self.get("SERVER_ROOT")
+            stack_items, _bad = self._stack_items_from_fields()
+            ok, detail = check_stack_settings_applied(
+                _gameusersettings_path(root) if root else "",
+                self._game_ini_path(),
+                self.stacks_mult_var.get().strip(),
+                stack_items)
+            items.append({
+                "label": "Increase stacks matches the server's config files",
+                "state": "ok" if ok else "info",
+                "detail": detail,
+                "hint": "" if ok else
+                        ("The \"Increase stacks\" section on the Configuration tab shows "
+                         "what WILL be written; these two files are what the server "
+                         "actually reads, and they only agree after \"Apply to server "
+                         "config\". Worth knowing: ARK rewrites GameUserSettings.ini when "
+                         "it shuts down, so a multiplier applied while the server was up "
+                         "is gone again by the next start. Fix: stop the ARK server, "
+                         "press \"Apply to server config\", restart it."),
+                "goto_keys": [] if ok else ["#" + STACKS_GROUP_COLLAPSE_ID],
+            })
+
+        # Only once the mod is actually on disk - with it not installed there is nothing
+        # for the key to be wrong about. A red X rather than an advisory, unlike the
+        # stacks row above: this one genuinely breaks Archipelago (the mod's engram
+        # unlocker grants engrams the plugin never handed out, and the grant script then
+        # can't tell what it owns), and it breaks silently, mid-run.
+        if is_mod_installed(self.get("SERVER_ROOT"), EXCALIBUR_MOD_ID):
+            ok, detail = check_excalibur_unlocker(
+                _gameusersettings_path(self.get("SERVER_ROOT")))
+            items.append({
+                "label": "%s: %s=true" % (EXCALIBUR_MOD_NAME, EU_BUFFS_UNLOCKER_KEY),
+                "state": "ok" if ok else "fail",
+                "detail": detail,
+                "hint": "" if ok else
+                        ("%s is installed, and its engram unlocker has to be off. With it "
+                         "on, the mod grants engrams the ArkAP plugin never gave you, the "
+                         "plugin's engram-grant script can no longer tell which engrams "
+                         "are its own, and item checks stop working - with no error "
+                         "anywhere. This is not a preference, which is why the launcher "
+                         "never offers it as a toggle. Fix: stop the ARK server, then "
+                         "Configuration tab -> \"Increase stacks\" -> \"Install %s\", "
+                         "which rewrites the [%s] block, and restart the server. (Or set "
+                         "%s=true under [%s] in GameUserSettings.ini by hand.)"
+                         % (EXCALIBUR_MOD_NAME, EXCALIBUR_MOD_NAME, EU_BUFFS_SECTION,
+                            EU_BUFFS_UNLOCKER_KEY, EU_BUFFS_SECTION)),
+                "goto_keys": [] if ok else ["#" + STACKS_GROUP_COLLAPSE_ID],
+            })
 
         ok, detail = check_scripts_sourced(self._scripts_dir)
         items.append({
@@ -7810,7 +10196,16 @@ class ArkAPLauncher(tk.Tk):
                     "from the file, so Quick Launch refuses to start the server rather "
                     "than running against stale paths. Fix: Configuration tab -> Save (its "
                     "Save button is highlighted whenever there's something to write).",
+            "goto_keys": missing + [key for key, _fname in unsaved],
         })
+
+        # Deliberately NO row comparing the launcher's ADMINPASS/SERVERPASS against
+        # GameUserSettings.ini's ServerAdminPassword/ServerPassword. The two disagree in
+        # every normal working setup (the launcher passes its values as ARK launch
+        # options, which override the ini, and nothing writes the ini's copy back), so a
+        # row about it would be lit on healthy installs and read as a problem that isn't
+        # one. Explained on the ADMINPASS/SERVERPASS tooltips instead, where it's read at
+        # the moment it's relevant. See those tooltips for the blank-SERVERPASS caveat.
 
         # Reads the FILE, not the Connector fields. The in-game integrated connector is
         # the primary way to connect - connector.ini only matters for the optional
@@ -7832,6 +10227,7 @@ class ArkAPLauncher(tk.Tk):
                      "at your ArkConnector's connector.ini, then fill in server/slot on the "
                      "Archipelago Setup tab and ipc_dir in the Configuration tab's "
                      "\"Plugin files & DeathLink\" group, and Save."),
+            "goto_keys": [] if state == "ok" else ["connector_ini", "ipc_dir"],
         })
 
         # Component/launcher version rows (yellow "i" when newer, green check for the
@@ -7866,13 +10262,27 @@ class ArkAPLauncher(tk.Tk):
                 ttk.Label(textcol, text=str(item["detail"]),
                           foreground=self.theme["status_detail_fg"],
                           wraplength=560, justify="left").pack(anchor="w")
+            goto_keys = item.get("goto_keys")
             if item["state"] == "fail" and item.get("hint"):
-                ttk.Label(textcol, text="→ %s" % item["hint"],
-                          foreground=self.theme["note_fg"],
-                          wraplength=560, justify="left").pack(anchor="w")
+                hint_text = "→ %s" % item["hint"]
+                if goto_keys:
+                    hint_text += "  (click to open on the Configuration tab)"
+                hint = ttk.Label(textcol, text=hint_text, foreground=self.theme["note_fg"],
+                                  wraplength=560, justify="left",
+                                  cursor="hand2" if goto_keys else "")
+                hint.pack(anchor="w")
+                if goto_keys:
+                    hint.bind("<Button-1>", lambda _e, k=goto_keys: self._goto_config_field(k))
             elif item["state"] == "info" and item.get("hint"):
-                ttk.Label(textcol, text=item["hint"], foreground=self.theme["note_fg"],
-                          wraplength=560, justify="left").pack(anchor="w")
+                hint_text = item["hint"]
+                if goto_keys:
+                    hint_text += "  (click to open on the Configuration tab)"
+                hint = ttk.Label(textcol, text=hint_text, foreground=self.theme["note_fg"],
+                                  wraplength=560, justify="left",
+                                  cursor="hand2" if goto_keys else "")
+                hint.pack(anchor="w")
+                if goto_keys:
+                    hint.bind("<Button-1>", lambda _e, k=goto_keys: self._goto_config_field(k))
             # Clickable release link for the component-version advisories.
             if item.get("link"):
                 link = ttk.Label(textcol, text=item["link"],
@@ -7941,9 +10351,14 @@ class ArkAPLauncher(tk.Tk):
             current = self.notebook.select()
         except tk.TclError:
             return
-        if current == str(self.tab_status):
+        if current == str(self.tab_config):
+            # SERVER_ROOT may have moved, a config may have been uploaded, or ARK may have
+            # rewritten GameUserSettings.ini since this halo was last worked out. Cheaper
+            # here than re-reading both ini files on every keystroke in every field.
+            self._update_stacks_dirty()
+        elif current == str(self.tab_status):
             self._refresh_setup_status()
-        elif current == str(self.tab_profiles):
+        elif current == str(self.tab_settings):
             self._update_profile_status()
         elif current == str(self.tab_mods):
             self._refresh_mods_tab()
@@ -7955,6 +10370,16 @@ class ArkAPLauncher(tk.Tk):
             # Re-stat on entry: Archipelago may have been installed, moved or
             # uninstalled since the tab was last looked at.
             self._refresh_archipelago_buttons()
+
+        # Recorded on every switch, whether or not "reopen on last-used tab" is on - so
+        # turning the setting on later reopens where they actually were, rather than
+        # needing one more tab switch first. Stored as the tab's label (see
+        # LAST_TAB_KEY): an index would break the moment the tab order changes.
+        try:
+            self._write_config_key(LAST_TAB_KEY, self.notebook.tab(current, "text"),
+                                   "last tab")
+        except tk.TclError:
+            pass
 
     # ----------------------------------------------------- Diagnostics export #
     def _redacted_config_json(self):
@@ -8043,6 +10468,10 @@ class ArkAPLauncher(tk.Tk):
             entries.append(("steamcmd/" + name,
                             read_for_diagnostics(os.path.join(steamcmd_dir(), "logs", name))))
 
+        # ArkApi's per-launch logs - the file that says how far the boot got. See
+        # collect_arkapi_log_entries.
+        entries.extend(collect_arkapi_log_entries(server_root))
+
         for path in yamls:
             entries.append(("players_yaml/" + os.path.basename(path),
                             read_for_diagnostics(path)))
@@ -8055,7 +10484,7 @@ class ArkAPLauncher(tk.Tk):
         component versions, the redacted config, Mods state + log, the user's Archipelago
         yaml, paths.cmd, Game.ini / GameUserSettings.ini, ArkAP.config.json, the debug,
         launcher, crash, ShooterGame and SteamCMD logs - every log the Debug Log tab can
-        show - the contents of ipc\\ (including the per-player mailbox
+        show - ArkApi's own per-launch logs - the contents of ipc\\ (including the per-player mailbox
         subfolders), and listings of ipc\\ and Content\\Mods - into one zip the user can drag
         straight into Discord.
 
@@ -8085,16 +10514,18 @@ class ArkAPLauncher(tk.Tk):
             return
 
         size_kb = max(1, os.path.getsize(dest) // 1024)
-        messagebox.showinfo(
-            "Export diagnostics",
+        self._info_once(
+            PROMPT_DIAGNOSTICS_SAVED, "Export diagnostics",
             "Diagnostics saved to:\n\n%s\n\n%d files, %d KB. It contains your Setup "
             "Status, component versions, config, Archipelago yaml, server config files, "
-            "logs, the contents of the ipc folder and folder listings. Every password in "
+            "logs (including ArkApi's own log for the last %d server launches, which is "
+            "what shows how far a failing startup got), the contents of the ipc folder "
+            "and folder listings. Every password in "
             "every file is replaced with %s; long logs are cut to their last %d lines and "
             "the ipc files to their last %d.\n\nDrag this file into "
             "Discord or attach it to a GitHub issue when asking for help."
-            % (dest, len(entries), size_kb, REDACT_MARKER, DIAG_MAX_LINES,
-               DIAG_IPC_MAX_LINES))
+            % (dest, len(entries), size_kb, DIAG_ARKAPI_LOGS, REDACT_MARKER,
+               DIAG_MAX_LINES, DIAG_IPC_MAX_LINES))
         try:
             os.startfile(os.path.dirname(dest))  # noqa: S606 - open the folder in Explorer
         except OSError:
@@ -8107,7 +10538,7 @@ class ArkAPLauncher(tk.Tk):
         A dropdown rather than a second row of sub-tabs: the tab already has a
         control row (Search / Jump to latest / Refresh) with room in it, a nested
         ttk.Notebook inside the main one reads as two tab bars stacked, and the
-        Profiles tab already picks from a list this exact way. The search box,
+        The Profiles section already picks from a list this exact way. The search box,
         "Jump to latest" and "Refresh" all act on the selected log - there is only
         ever one text widget (self.debug_log_text), so the in-app search and the
         theme switcher keep working unchanged."""
@@ -8162,19 +10593,327 @@ class ArkAPLauncher(tk.Tk):
         dbg_vsb.pack(side="right", fill="y")
 
     # -------------------------------------------------------------- Profiles #
-    def _build_profiles_tab(self, parent):
-        wrap = ttk.Frame(parent, padding=(10, 8))
-        wrap.pack(fill="both", expand=True)
+    def _build_settings_tab(self, parent):
+        """Launcher-level settings, then Profiles as one section within them.
 
+        Everything here is a preference for the LAUNCHER, not for the server: none of it
+        belongs to a profile, and none of it waits for the Configuration tab's Save -
+        each control writes its own config key the moment it changes (like the theme
+        toggle always has). That's why there's no Save button on this tab."""
+        # Scrollable container - same Canvas + Scrollbar pattern as Setup Status /
+        # Install Server/Api/Plugin / Archipelago Setup, since Settings plus the full
+        # Profiles list and its buttons grow past shorter windows.
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        wrap = ttk.Frame(canvas, padding=(10, 8))
+        inner_id = canvas.create_window((0, 0), window=wrap, anchor="nw")
+        wrap.bind("<Configure>",
+                  lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+
+        ttk.Label(wrap, text="Launcher settings",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(wrap, foreground=self.theme["subtle_fg"], wraplength=640,
+                  justify="left",
+                  text="These apply to the launcher itself and take effect immediately - "
+                       "there's nothing to save here. They're stored separately from your "
+                       "profiles, so switching profiles never changes them."
+                  ).pack(anchor="w", pady=(4, 8))
+
+        gen = ttk.LabelFrame(wrap, text="General", padding=(8, 6))
+        gen.pack(fill="x", pady=(0, 8))
+
+        # --- Appearance. The header keeps its own toggle button as well; both drive the
+        # same _toggle_theme, and _sync_theme_setting keeps this checkbox in step when
+        # the change came from up there.
+        self.dark_mode_var = tk.BooleanVar(value=(self.theme_name == "dark"))
+        dark_chk = ttk.Checkbutton(gen, text="Dark mode",
+                                   variable=self.dark_mode_var,
+                                   command=self._on_dark_mode_setting)
+        dark_chk.pack(anchor="w")
+        Tooltip(dark_chk, "Switch the whole launcher between the light and dark colour "
+                          "schemes. The same toggle is in the header, next to \"Check "
+                          "for Updates\".")
+
+        upd_chk = ttk.Checkbutton(
+            gen, text="Check for updates on startup", variable=self.update_check_var,
+            command=lambda: self._write_config_key(
+                UPDATE_CHECK_KEY, self.update_check_var.get(),
+                "update-check preference"))
+        upd_chk.pack(anchor="w", pady=(4, 0))
+        Tooltip(upd_chk,
+                "When on, the launcher quietly asks GitHub once at startup whether a "
+                "newer launcher, plugin, .apworld or tracker pack exists, and lights up "
+                "the \"!\" badge if so. Nothing is ever downloaded without you clicking "
+                "through the update dialog. Turn it off to stop the launcher contacting "
+                "the network on its own - \"Check for Updates\" still works on demand.",
+                wraplength=420)
+
+        tab_chk = ttk.Checkbutton(
+            gen, text="Reopen on the last-used tab", variable=self.reopen_last_tab_var,
+            command=lambda: self._write_config_key(
+                REOPEN_LAST_TAB_KEY, self.reopen_last_tab_var.get(),
+                "reopen-last-tab preference"))
+        tab_chk.pack(anchor="w", pady=(4, 0))
+        Tooltip(tab_chk,
+                "When on, the launcher opens on whichever tab you were last looking at. "
+                "When off (the default) it always opens on Configuration. Either way, a "
+                "brand-new install still opens on Instructions the first time.",
+                wraplength=420)
+
+        # --- Scan intensity. The SAME StringVar the Configuration tab's combobox uses,
+        # so the two are one setting shown twice rather than two that need syncing.
+        scanrow = ttk.Frame(gen)
+        scanrow.pack(fill="x", pady=(8, 0))
+        ttk.Label(scanrow, text="Default scan intensity:").pack(side="left", padx=(0, 6))
+        settings_scan_combo = ttk.Combobox(
+            scanrow, textvariable=self.scan_level_var, values=list(SCAN_LEVELS),
+            state="readonly", width=11)
+        settings_scan_combo.pack(side="left")
+        Tooltip(settings_scan_combo,
+                "How hard every scan button looks - \"Scan for paths\" on the "
+                "Configuration tab, \"Scan for Archipelago\", and \"Scan for "
+                "PopTracker\". This is the same setting as the dropdown next to \"Scan "
+                "for paths\"; changing it in either place changes both, and it's "
+                "remembered between sessions.\n\n"
+                "  Quick - %s\n  Thorough - %s\n  Exhaustive - %s"
+                % (SCAN_LEVEL_HELP[SCAN_QUICK], SCAN_LEVEL_HELP[SCAN_THOROUGH],
+                   SCAN_LEVEL_HELP[SCAN_EXHAUSTIVE]),
+                wraplength=520)
+
+        # --- Backup retention. One shared limit for every timestamped backup the
+        # launcher makes (Game.ini/GameUserSettings.ini patches, config uploads, the
+        # .apworld update, PopTracker pack/app backups, and reset save snapshots) -
+        # see prune_backups.
+        retrow = ttk.Frame(gen)
+        retrow.pack(fill="x", pady=(8, 0))
+        ttk.Label(retrow, text="Backups to keep:").pack(side="left", padx=(0, 6))
+        retain_spin = ttk.Spinbox(
+            retrow, from_=1, to=999, width=5, textvariable=self.backup_retention_var)
+        retain_spin.pack(side="left")
+        Tooltip(retain_spin,
+                "How many timestamped backups the launcher keeps for each file or "
+                "folder it backs up on its own (Game.ini / GameUserSettings.ini "
+                "patches, config uploads, the .apworld update, PopTracker pack and "
+                "app-install backups, and reset save snapshots). Once a new backup "
+                "would push a given item's count past this number, the oldest one is "
+                "deleted. Minimum 1.", wraplength=420)
+
+        # --- Launcher-log retention. Next to "Backups to keep" because it's the same
+        # question asked about a different file: how much history is worth its disk.
+        # See trim_launcher_log for what actually gets dropped.
+        logrow = ttk.Frame(gen)
+        logrow.pack(fill="x", pady=(8, 0))
+        ttk.Label(logrow, text="Days of log history to keep:").pack(side="left", padx=(0, 6))
+        log_days_spin = ttk.Spinbox(
+            logrow, from_=1, to=365, width=5, textvariable=self.launcher_log_days_var)
+        log_days_spin.pack(side="left")
+        Tooltip(log_days_spin,
+                "How far back the launcher's own activity log (%s, the \"Launcher log\" "
+                "entry on the Debug Log tab) is kept. Older runs are dropped a whole "
+                "session at a time when the launcher starts, so the log never begins "
+                "part-way through a run. The same happens if the file passes %d MB, "
+                "oldest run first. Your most recent session is always kept, however old "
+                "or large it is. Default %d days, minimum 1 - lower it only if disk is "
+                "tight, since a bug report often arrives a day or two after the run it's "
+                "about."
+                % (LAUNCHER_LOG_FILENAME, LAUNCHER_LOG_MAX_BYTES // (1024 * 1024),
+                   LAUNCHER_LOG_RETENTION_DAYS_DEFAULT), wraplength=420)
+
+        # --- Hidden prompts.
+        restore_row = ttk.Frame(gen)
+        restore_row.pack(fill="x", pady=(8, 0))
+        restore_btn = ttk.Button(restore_row, text="Restore all hidden prompts",
+                                 command=self._restore_hidden_prompts)
+        restore_btn.pack(side="left")
+        Tooltip(restore_btn,
+                "Brings back every informational popup you ticked \"Don't show this "
+                "again\" on, plus the install reminder banner on the Configuration tab. "
+                "Error and warning messages are never hidden in the first place, so "
+                "there's nothing of theirs to restore.", wraplength=420)
+
+        # --- Autosave. Sits directly above the Profiles section because the slot it
+        # writes into is one of the profiles in that list.
+        auto = ttk.LabelFrame(wrap, text="Autosave", padding=(8, 6))
+        auto.pack(fill="x", pady=(0, 8))
+        auto_chk = ttk.Checkbutton(
+            auto, text="Keep an \"%s\" profile up to date automatically"
+                       % AUTOSAVE_PROFILE_NAME,
+            variable=self.autosave_enabled_var, command=self._on_autosave_setting)
+        auto_chk.pack(anchor="w")
+        Tooltip(auto_chk,
+                "The safety net: the launcher snapshots your whole setup - both field "
+                "tabs, the Increase stacks settings and the Mods tab - into a reserved "
+                "\"%s\" profile on a timer, so a crash or a bad edit can't cost "
+                "more than the last few minutes. Turning this off stops the timer and "
+                "leaves any existing snapshot in the list to load from."
+                % AUTOSAVE_PROFILE_NAME, wraplength=420)
+
+        introw = ttk.Frame(auto)
+        introw.pack(fill="x", pady=(4, 0))
+        ttk.Label(introw, text="Snapshot every:").pack(side="left", padx=(0, 6))
+        self.autosave_combo = ttk.Combobox(
+            introw, textvariable=self.autosave_minutes_var,
+            values=[str(m) for m in AUTOSAVE_MINUTE_CHOICES],
+            state="readonly", width=5)
+        self.autosave_combo.pack(side="left")
+        ttk.Label(introw, text="minutes").pack(side="left", padx=(4, 0))
+        self.autosave_minutes_var.trace_add("write",
+                                            lambda *_a: self._on_autosave_setting())
+        self._sync_autosave_controls()
+
+        self._build_troubleshooting_section(wrap)
+
+        ttk.Separator(wrap, orient="horizontal").pack(fill="x", pady=(0, 8))
+        self._build_profiles_section(wrap)
+
+    def _build_troubleshooting_section(self, wrap):
+        """The two teardown buttons, on Settings rather than Quick launch.
+
+        They're here for the reason the section header says out loud: they are not part
+        of playing, they only apply to a server that won't start, and they're
+        destructive. Quick launch is the everyday row - putting a third and fourth
+        "reset" beside "Reset AP data" and "Full reset for new seed" both cluttered it
+        and invited the wrong click. Unlike everything else on this tab these aren't
+        preferences, so they get their own frame with the warning colour, not a row in
+        General."""
+        box = ttk.LabelFrame(wrap, text="Troubleshooting - server won't start",
+                             padding=(8, 6))
+        box.pack(fill="x", pady=(0, 8))
+        ttk.Label(box, wraplength=640, justify="left", foreground=self.theme["note_fg"],
+                  text="Only for a server that exits by itself during startup. bassically "
+                       "deletes ark api and plugin to revert the server startup to its "
+                       "vanilla state. make sure the server is stopped").pack(anchor="w")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(6, 0))
+        for text, cmd, tip in (
+                ("Reset server config (troubleshooting)", self.reset_server_config,
+                 "Step 1. Backs up and DELETES the server's Game.ini and "
+                 "GameUserSettings.ini so ARK rebuilds them from its own defaults, then "
+                 "unticks every mod and turns off Increase stacks to match. Nothing else "
+                 "is touched - not your world save, not ArkApi, not the plugin, not any "
+                 "launcher setting. Stop the ARK server first."),
+                ("Remove ArkApi + plugin (troubleshooting)", self.remove_arkapi_and_plugin,
+                 "Step 2, if step 1 didn't help. Backs up and removes ArkApi and the "
+                 "ArkAP plugin from Win64 entirely, so you can test whether bare ARK "
+                 "starts. The server has NO Archipelago functionality until you reinstall "
+                 "both from the Install tab (a download). Steam's own files are never "
+                 "touched. Stop the ARK server first.")):
+            btn = ttk.Button(row, text=text, command=cmd)
+            btn.pack(side="left", padx=(0, 6))
+            Tooltip(btn, tip, wraplength=520)
+
+    def _on_dark_mode_setting(self):
+        """The Settings-tab checkbox. Routed through the same _toggle_theme the header
+        button uses so there's exactly one path that switches the theme; the checkbox
+        only ever asks for a state it isn't already in."""
+        want_dark = self.dark_mode_var.get()
+        if (self.theme_name == "dark") != want_dark:
+            self._toggle_theme()
+
+    def _sync_theme_setting(self):
+        """Keep the Settings checkbox in step when the theme was changed from the header
+        button. Guarded with getattr because _toggle_theme can fire before the Settings
+        tab exists (the header button is built first)."""
+        var = getattr(self, "dark_mode_var", None)
+        if var is not None and var.get() != (self.theme_name == "dark"):
+            var.set(self.theme_name == "dark")
+
+    def _sync_autosave_controls(self):
+        """Grey the interval dropdown out while autosave is off - a live interval box
+        under a disabled feature reads as if it still does something."""
+        combo = getattr(self, "autosave_combo", None)
+        if combo is not None:
+            try:
+                combo.configure(state="readonly" if self.autosave_enabled_var.get()
+                                else "disabled")
+            except tk.TclError:
+                pass
+
+    def _on_autosave_setting(self):
+        """Persist the autosave toggle/interval and restart the timer on the new one."""
+        enabled = self.autosave_enabled_var.get()
+        try:
+            minutes = int(self.autosave_minutes_var.get())
+        except (TypeError, ValueError):
+            minutes = AUTOSAVE_MINUTES_DEFAULT
+        if minutes not in AUTOSAVE_MINUTE_CHOICES:
+            minutes = AUTOSAVE_MINUTES_DEFAULT
+        self._autosave_minutes = minutes
+        self._write_config_key(AUTOSAVE_ENABLED_KEY, enabled, "autosave preference")
+        self._write_config_key(AUTOSAVE_MINUTES_KEY, minutes, "autosave interval")
+        self._sync_autosave_controls()
+        self._restart_autosave()
+
+    def _backup_retention_count(self):
+        """The configured "Backups to keep", clamped to a minimum of 1 (a blank,
+        zero, negative or non-numeric box falls back to the default rather than
+        pruning everything)."""
+        try:
+            n = int(self.backup_retention_var.get())
+        except (TypeError, ValueError):
+            n = BACKUP_RETENTION_DEFAULT
+        return max(1, n)
+
+    def _on_backup_retention_setting(self):
+        """Persist "Backups to keep" the moment it changes. Anything below 1 snaps
+        back up to 1 in the box itself, not just internally - 0 would mean "keep no
+        backups", a different and more destructive control than this one."""
+        n = self._backup_retention_count()
+        if self.backup_retention_var.get() != str(n):
+            self.backup_retention_var.set(str(n))  # re-fires this trace with the clamped value
+            return
+        self._write_config_key(BACKUP_RETENTION_KEY, n, "backup retention count")
+
+    def _launcher_log_retention_days(self):
+        """The configured "Days of log history to keep", clamped to a minimum of 1 (a
+        blank, zero, negative or non-numeric box falls back to the default rather than
+        trimming to nothing)."""
+        try:
+            n = int(self.launcher_log_days_var.get())
+        except (TypeError, ValueError):
+            n = LAUNCHER_LOG_RETENTION_DAYS_DEFAULT
+        return max(1, n)
+
+    def _on_launcher_log_retention_setting(self):
+        """Persist "Days of log history to keep" the moment it changes. Takes effect on the
+        next launch, since the log is trimmed once at startup - see trim_launcher_log."""
+        n = self._launcher_log_retention_days()
+        if self.launcher_log_days_var.get() != str(n):
+            self.launcher_log_days_var.set(str(n))  # re-fires this trace, clamped
+            return
+        self._write_config_key(LAUNCHER_LOG_RETENTION_DAYS_KEY, n,
+                               "launcher log retention days")
+
+    def _build_profiles_section(self, wrap):
         ttk.Label(wrap, text="Profiles", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         ttk.Label(wrap, foreground=self.theme["subtle_fg"], wraplength=640, justify="left",
-                  text="Save the entire Configuration tab (Paths / Network / Cluster / "
-                       "Connector fields) under a name, e.g. \"Solo Test\" or \"Friend "
-                       "Group Run\", so you can switch setups without re-typing "
-                       "everything. Loading a profile only fills in the Configuration "
-                       "fields here in the app - it never writes to your .bat/.ini files "
-                       "by itself. You still need to go to the Configuration tab and "
-                       "press Save afterward."
+                  text="Save your whole setup under a name, e.g. \"Solo Test\" or "
+                       "\"Friend Group Run\", so you can switch between them without "
+                       "re-typing or re-ticking anything. A profile covers every "
+                       "Configuration tab field (Paths, Plugin files & DeathLink, "
+                       "Network, Cluster, Locations and the Increase stacks settings), "
+                       "every Archipelago Setup field (Archipelago directory, PopTracker "
+                       "directory and the Connector settings), the whole Mods tab (which "
+                       "mods are ticked, their load order, and any mods you added or "
+                       "renamed yourself), and the notes box below.\n\n"
+                       "Loading a profile only fills all of that in here in the app - it "
+                       "never writes to your .bat/.ini files, and never activates mods on "
+                       "the server, by itself. Whatever still needs applying lights up: "
+                       "Save on the Configuration and Archipelago Setup tabs, Save on the "
+                       "Mods tab, and \"Apply to server config\" for the stack settings."
                   ).pack(anchor="w", pady=(4, 8))
 
         selrow = ttk.Frame(wrap)
@@ -8191,24 +10930,30 @@ class ArkAPLauncher(tk.Tk):
         load_btn = ttk.Button(btnrow1, text="Load selected profile",
                                command=self._on_load_profile)
         load_btn.pack(side="left", padx=(0, 4))
-        Tooltip(load_btn, "Fills every Configuration field and the notes box below from "
-                "the selected profile. Does NOT save/apply anything by itself - you'll "
-                "be reminded to press Save on the Configuration tab.")
+        Tooltip(load_btn, "Fills the Configuration and Archipelago Setup fields, the "
+                "Increase stacks settings, the Mods tab and the notes box below from the "
+                "selected profile. Does NOT save or apply anything by itself - the Save "
+                "buttons that still have something to write light up, and mods stay as "
+                "ticks until you press Save on the Mods tab. A mod in the profile that "
+                "isn't installed on this PC is listed unticked rather than dropped.")
         save_new_btn = ttk.Button(btnrow1, text="Save as new profile",
                                    command=self._on_save_new_profile)
         save_new_btn.pack(side="left", padx=4)
-        Tooltip(save_new_btn, "Snapshot every current Configuration field plus the notes "
-                "box below into a brand-new named profile.")
+        Tooltip(save_new_btn, "Snapshot your whole current setup - every Configuration "
+                "and Archipelago Setup field, the Increase stacks settings, the Mods tab "
+                "(ticks, order, mods you added and their names) and the notes box below - "
+                "into a brand-new named profile.")
         update_btn = ttk.Button(btnrow1, text="Update selected profile",
                                  command=self._on_update_profile)
         update_btn.pack(side="left", padx=4)
-        Tooltip(update_btn, "Overwrite the selected profile's saved fields and notes with "
-                "the current Configuration fields and the notes box below.")
+        Tooltip(update_btn, "Overwrite everything the selected profile has saved - "
+                "fields, Increase stacks settings, Mods tab and notes - with your "
+                "current setup.")
 
         default_note = ttk.Label(
             wrap, foreground=self.theme["note_fg"], wraplength=640, justify="left",
             text="On first run the launcher creates a profile named \"%s\" from "
-                 "whatever your Configuration tab starts with, and loads it, so your "
+                 "whatever your setup starts with, and loads it, so your "
                  "settings always belong to a profile from the start. It's an ordinary "
                  "profile - rename, update or delete it however you like."
                  % DEFAULT_PROFILE_NAME)
@@ -8224,8 +10969,9 @@ class ArkAPLauncher(tk.Tk):
         autosave_note.pack(anchor="w", pady=(6, 0))
         Tooltip(autosave_note,
                 "Autosave exists so a crash, a bad edit, or an update can't cost you "
-                "more than the last few minutes of Configuration changes. Load it, "
-                "check the values, then \"Save as new profile\" to keep them.")
+                "more than the last few minutes of work - fields, stack settings and "
+                "your Mods tab alike. Load it, check it over, then \"Save as new "
+                "profile\" to keep it.")
 
         btnrow2 = ttk.Frame(wrap)
         btnrow2.pack(fill="x", pady=(4, 0))
@@ -8255,8 +11001,9 @@ class ArkAPLauncher(tk.Tk):
         Tooltip(self.profile_notes_text,
                 "Free-text notes tied to whichever profile is loaded/selected above - e.g. "
                 "\"used for the Discord group run, remember RCON port differs from solo "
-                "test\". Saved along with the rest of that profile's data via \"Save as "
-                "new profile\" or \"Update selected profile\".")
+                "test\". Saved along with the rest of that profile's data - fields, "
+                "Increase stacks settings and Mods tab - via \"Save as new profile\" or "
+                "\"Update selected profile\".")
 
     def _build_instructions_tab(self, parent):
         """One tab, two guides. Quick Guide (default) and Full Guide are each built as
@@ -8503,8 +11250,9 @@ class ArkAPLauncher(tk.Tk):
             ("h1", "What each tab does"),
             ("bullet", "Listed in tab order, left to right."),
             ("bullet", "Configuration - every Locations / Paths / Network / Plugin files & "
-                       "DeathLink / Cluster field, the Quick Launch buttons, and Save / "
-                       "Reload from files. The Paths group also holds \"Scan intensity\" + "
+                       "DeathLink field, the Quick Launch buttons, and Save / "
+                       "Reload from files. The Paths group also holds \"Scan intensity\" (shared "
+                       "with the Settings tab, and used by every scan button) + "
                        "\"Scan for paths\" (all path detection in one button) and \"Create "
                        "ServerCluster folders\". Note: server / slot / password are no "
                        "longer here - they're on the Archipelago Setup tab."),
@@ -8641,22 +11389,86 @@ class ArkAPLauncher(tk.Tk):
                        "a newer component version), a red X = at least one hard failure. "
                        "It updates whenever the checks re-run. A yellow \"i\" is advisory "
                        "only, and is typically nothing to worry about."),
-            ("bullet", "Profiles - save/load named snapshots of every Configuration field "
-                       "plus the Archipelago Setup room fields (e.g. \"Solo Test\" vs "
-                       "\"Friend Group Run\") plus a free-text notes box, stored separately "
-                       "from your live config. Loading a profile only fills the fields in - "
-                       "it never saves/applies by itself, so press Save on the "
-                       "Configuration tab afterward."),
+            ("bullet", "Settings - the launcher's own preferences, none of which belong to "
+                       "a profile and none of which need saving: they apply the moment you "
+                       "change them. Dark mode (the same toggle as the header button), "
+                       "whether to check for updates on startup, whether to reopen on the "
+                       "last-used tab, the default scan intensity every scan button uses, "
+                       "how often the Autosave profile is written, \"Backups to keep\", "
+                       "\"Days of log history to keep\", and "
+                       "\"Restore all hidden prompts\"."),
+            ("bullet", "   \"Backups to keep\" caps how many timestamped backups pile up "
+                       "for any one file or folder the launcher backs up on its own - "
+                       "Game.ini / GameUserSettings.ini patches, config uploads, the "
+                       ".apworld update, PopTracker pack and app-install backups, and reset "
+                       "save snapshots. Once a fresh backup pushes a given item's count "
+                       "past this number, the oldest one for THAT item is deleted - "
+                       "backups of different files/folders are never counted against each "
+                       "other. Default 3, minimum 1 (there's no \"keep none\" option here on "
+                       "purpose)."),
+            ("bullet", "   \"Days of log history to keep\" is how far back the launcher's "
+                       "own activity log (%s, on the Debug Log tab) goes - about two "
+                       "weeks by default. Anything older is dropped when the launcher "
+                       "starts, a whole session at a time so the file never begins "
+                       "part-way through a run, and the same happens oldest-run-first if "
+                       "it passes %d MB. Your latest session is never dropped. Default "
+                       "%d days, minimum 1; two weeks is deliberate, since bug reports "
+                       "usually turn up a day or two after the run they're about."
+                       % (LAUNCHER_LOG_FILENAME,
+                          LAUNCHER_LOG_MAX_BYTES // (1024 * 1024),
+                          LAUNCHER_LOG_RETENTION_DAYS_DEFAULT)),
+            ("bullet", "   \"Restore all hidden prompts\" brings back every informational "
+                       "popup you ticked \"Don't show this again\" on, plus the install "
+                       "reminder banner on the Configuration tab, and tells you how many "
+                       "came back. Only informational notices can be hidden that way - "
+                       "errors, warnings and anything asking you to confirm a reset or an "
+                       "uninstall always appear."),
+            ("bullet", "   Profiles live on this tab too - save/load named snapshots of "
+                       "your whole setup (e.g. \"Solo Test\" vs \"Friend Group Run\"), "
+                       "stored separately from your live config."),
+            ("bullet", "   A profile covers: every Configuration tab field (Paths, "
+                       "Plugin files & DeathLink, Network, Cluster, Locations) plus the "
+                       "Increase stacks settings - the tick, the global multiplier and "
+                       "every per-item override; every Archipelago Setup field - the "
+                       "Archipelago directory, the PopTracker directory and the "
+                       "Connector settings (server / slot / password); the whole Mods "
+                       "tab - which mods are ticked, their load order, and any mods you "
+                       "added yourself along with the names you gave them; and the "
+                       "free-text notes box."),
+            ("bullet", "   Loading a profile only fills all of that in - it never saves "
+                       "or applies anything by itself, and it never activates mods on "
+                       "the server. Mod ticks are intent until you press Save on the "
+                       "Mods tab, exactly as if you'd ticked them by hand. Whatever "
+                       "still has something to write lights up: Save on Configuration "
+                       "and on Archipelago Setup, Save on Mods, and \"Apply to server "
+                       "config\" for the stack settings (ARK server stopped)."),
+            ("bullet", "   A mod a profile carries that isn't installed on this PC is "
+                       "listed unticked rather than dropped, so you keep the entry (and "
+                       "its name) and can just click \"Download checked\" after ticking "
+                       "it. Mods already in your list that the profile doesn't mention "
+                       "are kept too, unticked at the bottom - loading an older profile "
+                       "never deletes a mod you added."),
+            ("bullet", "   Older profiles saved before all this was captured still load "
+                       "fine. A profile only overwrites the parts it actually carries; "
+                       "anything it has no entry for is left exactly as it is rather "
+                       "than being blanked."),
             ("bullet", "   On first run a profile named \"%s\" is created from your "
-                       "starting Configuration values and loaded straight away, so your "
-                       "settings are backed by a real profile from the very beginning "
-                       "instead of only the live config. It's a normal profile - rename, "
-                       "update or delete it as you like." % DEFAULT_PROFILE_NAME),
+                       "starting setup and loaded straight away, so your settings are "
+                       "backed by a real profile from the very beginning instead of only "
+                       "the live config. It's a normal profile - rename, update or "
+                       "delete it as you like." % DEFAULT_PROFILE_NAME),
+            ("bullet", "   Save on the Configuration tab also writes into whichever "
+                       "profile is active, so the profile and your live settings can't "
+                       "drift apart. The status line under the buttons tells you when "
+                       "your fields, mods or notes have changed since the profile was "
+                       "loaded."),
             ("bullet", "   The list also contains an \"Autosave\" profile the launcher "
-                       "writes by itself every 10 minutes while the app is open. It "
-                       "always holds only the newest snapshot, never touches the "
-                       "profiles you save yourself, and can't be renamed or updated by "
-                       "hand - load it if you ever need to get recent settings back."),
+                       "writes by itself every 10 minutes while the app is open (you can "
+                       "change the interval, or switch it off, in the Autosave box higher "
+                       "up this tab). It snapshots everything the list above covers, "
+                       "always holds only the newest one, never touches the profiles you "
+                       "save yourself, and can't be renamed or updated by hand - load it "
+                       "if you ever need to get recent settings back."),
             ("bullet", "Debug Log - a viewer for every log that matters, with a search "
                        "box, \"Jump to latest\", and \"Refresh\". Pick which log with the "
                        "\"Log:\" dropdown at the top; the search box and both buttons act "
@@ -8672,9 +11484,20 @@ class ArkAPLauncher(tk.Tk):
                        "saves and what changed, ServerCluster folder creation, resets and "
                        "their verification, mod downloads and ActiveMods writes, Game.ini "
                        "patches and uploads, and every error the app showed you. It sits "
-                       "next to arkap_launcher_config.json, is appended to rather than "
-                       "overwritten, and is capped in size so it can't grow forever."
+                       "next to arkap_launcher_config.json and is appended to rather than "
+                       "overwritten."
                        % LAUNCHER_LOG_FILENAME),
+            ("bullet", "   It keeps roughly the last two weeks - change that with \"Days "
+                       "of log history to keep\" on the Settings tab (default %d). Old "
+                       "runs are dropped one whole run at a time when the launcher "
+                       "starts, so the log never begins part-way through a session and "
+                       "loses the version banner and paths at the top of it. The same "
+                       "happens, oldest run first, if the file ever passes %d MB. Your "
+                       "most recent session is always kept, however old or large - so a "
+                       "launcher you haven't opened in a month still has that last run in "
+                       "it when you finally report something."
+                       % (LAUNCHER_LOG_RETENTION_DAYS_DEFAULT,
+                          LAUNCHER_LOG_MAX_BYTES // (1024 * 1024))),
             ("bullet", "   Launcher crash log (%s) - the full traceback from any "
                        "unexpected launcher error. Missing until something goes wrong, "
                        "which is exactly as it should be." % CRASH_LOG_FILENAME),
@@ -8847,6 +11670,85 @@ class ArkAPLauncher(tk.Tk):
                        "happen, and you should run tools\\diagnose_reset.bat before "
                        "starting the server. Only a run with no problems AND at least one "
                        "save actually wiped reports success."),
+            ("bullet", "Two further resets exist for a server that won't start, and they "
+                       "are deliberately NOT on this row - they're on the Settings tab "
+                       "under \"Troubleshooting - server won't start\". See below."),
+
+            ("h1", "The four resets - which one you want"),
+            ("bullet", "They have similar names and very different jobs. In order of how "
+                       "much they remove:"),
+            ("bullet", "Reset AP data (keep world save) - Archipelago tracking only. Your "
+                       "world, your character, your config and your install all stay. Use "
+                       "it to re-do a seed's checks without starting the world over."),
+            ("bullet", "Full reset for new seed - the above PLUS backs up and wipes the "
+                       "world save, the per-map saves and the cluster tribute data, and "
+                       "removes the randomized-creatures block from Game.ini. Your config "
+                       "and your install stay. Use it when joining a new seed. This is the "
+                       "only one that touches your world."),
+            ("bullet", "Reset server config (troubleshooting) - touches NEITHER of the "
+                       "above. It backs up and deletes the server's Game.ini and "
+                       "GameUserSettings.ini so ARK builds fresh ones on its next start, "
+                       "and unticks your mods and Increase stacks so the launcher doesn't "
+                       "write those values straight back. Your world save, your "
+                       "Archipelago progress, ArkApi and the plugin are all untouched. "
+                       "Only use it when the server exits during startup."),
+            ("bullet", "Remove ArkApi + plugin (troubleshooting) - removes ArkApi and the "
+                       "ArkAP plugin from Win64 completely. No world data, no config, no "
+                       "Archipelago tracking is touched, but the server has no "
+                       "Archipelago functionality at all until you reinstall both, which "
+                       "takes a download. Only use it when the server still won't start "
+                       "after the config reset."),
+            ("bullet", "Short version: the first two are about your SEED, the last two are "
+                       "about a server that WON'T START. Nothing on this list touches your "
+                       "ARK install, your paths, your profiles or any launcher setting."),
+            ("bullet", "Where they live: the first two are under Quick launch at the "
+                       "bottom of the Configuration tab, because they're part of normal "
+                       "play. The two troubleshooting ones are on the Settings tab, under "
+                       "\"Troubleshooting - server won't start\" - off the everyday screen, "
+                       "so the wrong one doesn't get clicked."),
+
+            ("h1", "The server exits during startup (troubleshooting resets)"),
+            ("bullet", "Symptom: you start the server, it closes on its own after a few "
+                       "seconds, and ShooterGame.log just shows RequestExit(1) with no "
+                       "error. The two buttons on the Settings tab, under "
+                       "\"Troubleshooting - server won't start\", exist for exactly this. "
+                       "Use them in order, and stop the ARK server first - both refuse to "
+                       "run while it's up."),
+            ("bullet", "First, look at the ArkApi log (it's in the diagnostics zip under "
+                       "arkapi_logs\\, and lives in Win64\\logs\\). It says how far the "
+                       "boot actually got. If it stops right after \"API was successfully "
+                       "loaded\" and never reaches \"UGameEngine::Init was called\", the "
+                       "server died during engine init - which is exactly the case these "
+                       "buttons are for."),
+            ("bullet", "1. Settings tab -> Reset server config (troubleshooting). It backs up both config "
+                       "files with a timestamp, then deletes them - ARK writes fresh ones "
+                       "on its next start, so \"absent\" is the real default and no value "
+                       "this launcher wrote can survive. It also unticks every mod and "
+                       "turns off Increase stacks, because otherwise your next Save would "
+                       "put ActiveMods and the stack settings straight back."),
+            ("bullet", "   Start the server once so ARK rebuilds the files. If it starts, "
+                       "re-apply your settings ONE AT A TIME - mods, then stacks, then "
+                       "anything you set by hand - starting the server after each. The one "
+                       "that breaks it is your answer. The backup paths are printed in the "
+                       "log and in the completion message; restoring one is a rename."),
+            ("bullet", "2. Still won't start: Remove ArkApi + plugin (troubleshooting), "
+                       "the button beside it. "
+                       "This takes version.dll, the whole ArkApi\\ folder (plugin, "
+                       "Permissions, its config and its logs) and the rest of what the "
+                       "ArkApi installer wrote back out of Win64, leaving it as if neither "
+                       "had ever been installed. The whole ArkApi\\ folder is backed up "
+                       "first (timestamped), so your ArkAP.config.json is recoverable."),
+            ("bullet", "   It only ever removes files this launcher's own installers put "
+                       "there - it knows what the ArkApi download contained because it "
+                       "records that at install time. ShooterGameServer.exe and everything "
+                       "else Steam installed is never touched, and anything it isn't sure "
+                       "about is left alone and named in the log rather than deleted."),
+            ("bullet", "   Then start the server on that bare install. If it still won't "
+                       "start, the problem isn't ArkApi, the plugin or this launcher. If "
+                       "it does start, put things back one at a time - \"Install "
+                       "ArkServerApi\", then \"Install Plugin\", then your config - "
+                       "starting the server after each. Setup Status updates to show both "
+                       "as not installed as soon as the removal finishes."),
 
             ("h1", "Uploading your own Game.ini / GameUserSettings.ini"),
             ("bullet", "Configuration tab -> \"Upload server config files\" (below the "
@@ -8862,6 +11764,75 @@ class ArkAPLauncher(tk.Tk):
                        "anything uploaded while it's running is likely to be lost - "
                        "you'll get a warning if the server is up. Restart the server "
                        "afterwards for the new settings to apply."),
+
+            ("h1", "Increase stacks (Configuration tab)"),
+            ("bullet", "Raises how much fits in one inventory slot, so a prime meat run "
+                       "stops hitting the slot cap and dropping the rest on the floor. "
+                       "Tick \"Enable increased stack sizes\", set the numbers, then "
+                       "press \"Apply to server config\"."),
+            ("bullet", "It is deliberately NOT a stack mod. A stack mod ships replacement "
+                       "item blueprints, and the ArkAP plugin's engram-grant script "
+                       "matches on blueprint data - a stack mod breaks item grants. These "
+                       "are plain server settings and touch no blueprints."),
+            ("bullet", "Global stack size multiplier - written to GameUserSettings.ini's "
+                       "[ServerSettings] as ItemStackSizeMultiplier. It multiplies the "
+                       "max stack of every item that ALREADY stacks (at 10.00 a 100-stack "
+                       "of metal becomes 1000)."),
+            ("bullet", "   It does nothing for items whose vanilla stack is 1, because "
+                       "1 x 10 is still 1. That is the whole reason the per-item boxes "
+                       "exist - the two pair up, they don't replace each other."),
+            ("bullet", "Per-item stack sizes - one box each for Raw Prime Meat, Raw Prime "
+                       "Fish Meat, Raw Mutton, Giant Bee Honey, Fertilizer (all stack 1 "
+                       "in vanilla) and Organic Polymer (stacks 20). Each becomes one "
+                       "ConfigOverrideItemMaxQuantity line in Game.ini, written with "
+                       "bIgnoreMultiplier=true so the number you type is exactly what the "
+                       "server uses. Leave a box empty to leave that item alone."),
+            ("bullet", "Stop the ARK server before applying. ARK rewrites "
+                       "GameUserSettings.ini when it shuts down, so a multiplier written "
+                       "while the server is up is thrown away on stop - the launcher "
+                       "refuses to write while it's running rather than let that happen. "
+                       "Restart the server afterwards for the change to apply."),
+            ("bullet", "Both files are backed up with a timestamp before anything is "
+                       "written, and both writes are targeted: the Game.ini block sits "
+                       "inside the launcher's own marker comments and is merged into the "
+                       "existing [/script/shootergame.shootergamemode] section rather "
+                       "than adding a second one, and the multiplier is a single-key "
+                       "update. Your own settings in either file are never touched."),
+            ("bullet", "Turning the tick off and pressing \"Apply to server config\" "
+                       "again removes exactly those two things - the marker-wrapped block "
+                       "and the ItemStackSizeMultiplier line - and leaves everything else "
+                       "in both files alone."),
+            ("bullet", "   The marker block in Game.ini is what the launcher treats as "
+                       "proof it applied these settings. If that block isn't there, an "
+                       "ItemStackSizeMultiplier in GameUserSettings.ini is one you set "
+                       "yourself, and turning the tick off will not touch it - the "
+                       "launcher only ever takes back what it put there. (Turning the "
+                       "tick ON does overwrite it, and the backup taken first has your "
+                       "original value.)"),
+            ("bullet", "Setup Status shows a row for this while the tick is on. A yellow "
+                       "\"i\" there means the files on disk no longer match what the "
+                       "Configuration tab shows (most often because ARK rewrote "
+                       "GameUserSettings.ini on shutdown) - stop the server, apply again, "
+                       "restart."),
+            ("bullet", "Excalibur Buffs, at the bottom of the same section, is the other "
+                       "half of the same job: stacks decide how much fits in a slot, that "
+                       "mod decides what it weighs. \"Install Excalibur Buffs\" (ARK "
+                       "server stopped) downloads Workshop mod " + EXCALIBUR_MOD_ID
+                       + " through the Mods tab's own installer, adds it there ticked, and "
+                       "appends a marker-wrapped [EU_Buffs] block to GameUserSettings.ini "
+                       "holding DisableWeightReduction=false (the line that reduces "
+                       "weight) and DisableEngramUnlocker=true. The file is backed up "
+                       "first, nothing else in it is touched, and the server needs a "
+                       "restart afterwards. DisableEngramUnlocker=true is not a setting "
+                       "you get to change: the mod's engram unlocker breaks the plugin's "
+                       "engram grants and would silently break your run, so Setup Status "
+                       "shows a red X if it is ever missing or false. The mod's other "
+                       "options (DisableFogRemover, DisableClearWater, DisableDinoCounter, "
+                       "DisablePreventSteal, DisableRiderProtection) are undocumented and "
+                       "unrelated to weight - the launcher leaves them out and the mod "
+                       "uses its own defaults; add them by hand in the block if you want "
+                       "them. The apworld ships no engram data for this mod, so it is "
+                       "excluded from \"Copy IDs for YAML\"."),
 
             ("h1", "What the path fields feed"),
             ("bullet", "SERVER_ROOT / SAVESROOT / CLUSTERDIR / BACKUPROOT / CLUSTERID / "
@@ -8915,7 +11886,7 @@ class ArkAPLauncher(tk.Tk):
                        "ArkAP_debug.log; the launcher's own activity log "
                        "(arkipelago_launcher.log - usually the most useful single file, since "
                        "it's a timestamped record of everything the app did); ARK's own "
-                       "ShooterGame.log; the crash log if "
+                       "ShooterGame.log; ArkApi's own logs (see below); the crash log if "
                        "there is one; SteamCMD's own console / workshop / content logs "
                        "under steamcmd\\ (what it recorded while downloading, which is "
                        "more than it printed on screen); your Mods tab state and output "
@@ -8930,6 +11901,19 @@ class ArkAPLauncher(tk.Tk):
                        "there is no other way to spot it - which is why the listing stays "
                        "even though the files themselves are now included)."
                        % TRACKER_PACK_LABEL),
+            ("bullet", "ArkApi's own log, under arkapi_logs\\ in the zip. ArkApi writes "
+                       "one of these per server launch, into "
+                       "ShooterGame\\Binaries\\Win64\\logs\\, named "
+                       "ArkApi_<pid>_<date>_<time>.log. For a server that dies during "
+                       "startup this is the single most useful file there is, because it "
+                       "shows how far the boot got: a server that fails during engine "
+                       "init stops right after \"API was successfully loaded\" and never "
+                       "reaches \"UGameEngine::Init was called\". Neither of the other "
+                       "logs shows that - ShooterGame.log only records an immediate "
+                       "RequestExit(1), and the launcher's log only knows it started the "
+                       "server. The last %d launches go in, newest first and numbered, "
+                       "because people usually retry a few times and the run that failed "
+                       "often isn't the newest one." % DIAG_ARKAPI_LOGS),
             ("bullet", "Passwords are removed from every file in the zip, not just the "
                        "config - ADMINPASS and SERVERPASS in paths.cmd, "
                        "ServerAdminPassword / ServerPassword / SpectatorPassword in "
@@ -9061,9 +12045,7 @@ class ArkAPLauncher(tk.Tk):
                        "instead. Your old copy of the pack is moved aside."
                        % TRACKER_PACK_LABEL),
             ("bullet", "   Click \"Open PopTracker\" to open it on the ARK map."),
-            ("bullet", "   PopTracker can't be opened already connected (that needs "
-                       "PopTracker %s, which isn't out yet). Your room address is copied to "
-                       "your clipboard instead."
+            ("bullet", "   PopTracker opens already connected (needs PopTracker %s or newer)"
                        % POPTRACKER_AP_ARGS_MIN_VERSION),
             ("bullet", "   In PopTracker, click the grey \"AP\", paste the address with "
                        "Ctrl+V, then type your slot and password. It remembers them for "
@@ -9112,14 +12094,38 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Mods - download and turn on Steam Workshop mods."),
             ("bullet", "Setup Status - a checklist of your setup. Click Re-check after you "
                        "fix something."),
-            ("bullet", "Profiles - save and load named copies of your settings. Click Save "
-                       "on the Configuration tab after you load one."),
+            ("bullet", "Settings - the launcher's own options: dark mode, update checks on "
+                       "startup, which tab it opens on, how hard the scan buttons look, "
+                       "how often your settings are auto-snapshotted, and how many "
+                       "timestamped backups (Game.ini, config uploads, PopTracker, reset "
+                       "snapshots, ...) it keeps before deleting the oldest (\"Backups to "
+                       "keep\", default 3). Nothing here needs saving. If you've ticked "
+                       "\"Don't show this again\" on a popup and want it back, \"Restore "
+                       "all hidden prompts\" is here."),
+            ("bullet", "   Profiles are on that tab as well - save and load named copies "
+                       "of your whole setup."),
+            ("bullet", "   A profile holds every Configuration field, the Increase "
+                       "stacks settings, every Archipelago Setup field, your Mods tab "
+                       "(what is ticked, the order, and mods you added or renamed), and "
+                       "a notes box."),
+            ("bullet", "   Loading one only fills it all in. Nothing is written to your "
+                       "server until you press the Save buttons - the ones that still "
+                       "have something to do glow yellow."),
+            ("bullet", "   After loading, press Save on the Configuration tab, Save on "
+                       "the Mods tab, and \"Apply to server config\" if you use the "
+                       "stack settings."),
+            ("bullet", "   A mod in the profile that you have not installed shows up "
+                       "unticked. Tick it and click \"Download checked\" to get it."),
             ("bullet", "Debug Log - a viewer for your logs. The \"Log:\" dropdown at the "
                        "top picks which one: the ArkAP plugin's log, the launcher's own "
                        "log of what it did, the launcher crash log, ARK's ShooterGame.log "
                        "(where server crashes land), or SteamCMD's download logs. Search, "
                        "\"Jump to latest\" and \"Refresh\" work on whichever is showing, "
                        "and a log that doesn't exist yet says so."),
+            ("bullet", "   The launcher's own log keeps roughly the last two weeks, "
+                       "dropping older runs one whole run at a time when the app starts "
+                       "(your most recent session is always kept). Change how long with "
+                       "\"Days of log history to keep\" on the Settings tab."),
             ("bullet", "Instructions - this tab. Use the button in the top right to switch "
                        "to the Full Guide."),
 
@@ -9175,6 +12181,62 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Full reset for new seed - clears your Archipelago progress and "
                        "wipes your world save. Use it when you join a new seed. Stop the "
                        "server first. Your old save is backed up."),
+            ("bullet", "There are two more resets, for a server that won't start. They "
+                       "are on the Settings tab, not here - see below."),
+
+            ("h1", "Troubleshooting (Settings tab)"),
+            ("bullet", "Settings tab, near the bottom, under \"Troubleshooting - server "
+                       "won't start\". Only use these two if your server closes on its "
+                       "own during startup. Stop the server first."),
+            ("bullet", "Reset server config (troubleshooting) - deletes the server's "
+                       "Game.ini and GameUserSettings.ini so ARK makes fresh ones, and "
+                       "unticks your mods and Increase stacks. Your world and your "
+                       "progress are not touched. Both files are backed up first."),
+            ("bullet", "Remove ArkApi + plugin (troubleshooting) - removes ArkApi and the "
+                       "plugin from Win64 so you can test plain ARK. You have to "
+                       "reinstall both from the Install tab afterwards, which is a "
+                       "download. ArkApi is backed up first."),
+
+            ("h1", "The four resets - which one you want"),
+            ("bullet", "Reset AP data - clears your Archipelago progress. Keeps "
+                       "everything else."),
+            ("bullet", "Full reset for new seed - clears your Archipelago progress AND "
+                       "your world save. For joining a new seed."),
+            ("bullet", "Reset server config (troubleshooting) - clears neither of those. "
+                       "It only deletes the server's two config files so ARK rebuilds "
+                       "them. For a server that won't start."),
+            ("bullet", "Remove ArkApi + plugin (troubleshooting) - removes ArkApi and the "
+                       "plugin themselves. Also for a server that won't start, and only "
+                       "after the config reset didn't help."),
+            ("bullet", "The first two are about your seed. The last two are about a "
+                       "server that will not start. None of them touch your ARK install "
+                       "or your launcher settings."),
+            ("bullet", "The first two are under Quick launch on the Configuration tab. "
+                       "The two troubleshooting ones are on the Settings tab, so they are "
+                       "not sitting next to the buttons you use every day."),
+
+            ("h1", "The server closes on its own during startup"),
+            ("bullet", "Stop the ARK server first. Both buttons below are on the Settings "
+                       "tab, under \"Troubleshooting - server won't start\", and both "
+                       "refuse to run while the server is up."),
+            ("bullet", "Click \"Export diagnostics\" and open arkapi_logs\\ in the zip. If "
+                       "the newest log stops after \"API was successfully loaded\" and "
+                       "never says \"UGameEngine::Init was called\", the server died "
+                       "during startup and these buttons are what you want."),
+            ("bullet", "1. Click \"Reset server config (troubleshooting)\". Start the "
+                       "server once so ARK rebuilds its config files."),
+            ("bullet", "   If it starts, turn your settings back on one at a time - mods, "
+                       "then stacks - and start the server after each. The one that "
+                       "breaks it is the cause."),
+            ("bullet", "   Your old config files are backed up. The completion message and "
+                       "the log show where. Renaming one puts it back."),
+            ("bullet", "2. If it still won't start, click \"Remove ArkApi + plugin "
+                       "(troubleshooting)\" and start the server again."),
+            ("bullet", "   If plain ARK still won't start, the problem is not ArkApi, the "
+                       "plugin or this launcher."),
+            ("bullet", "   If it does start, reinstall from the Install tab - \"Install "
+                       "ArkServerApi\" first, then \"Install Plugin\" - starting the "
+                       "server after each."),
 
             ("h1", "Uploading your own Game.ini / GameUserSettings.ini"),
             ("bullet", "Stop the ARK server first."),
@@ -9182,6 +12244,36 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Pick your file. Click \"Upload to server\"."),
             ("bullet", "The file it replaces is backed up first."),
             ("bullet", "Restart the server."),
+
+            ("h1", "Increase stacks (Configuration tab)"),
+            ("bullet", "Use this so prime meat and organic polymer stop filling your "
+                       "inventory and falling on the floor."),
+            ("bullet", "Stop the ARK server first."),
+            ("bullet", "Open the Configuration tab. Find \"Increase stacks\". Tick "
+                       "\"Enable increased stack sizes\"."),
+            ("bullet", "The top box multiplies every item that already stacks. 10.00 is a "
+                       "good starting point."),
+            ("bullet", "The boxes under it set one item each. Those items do not stack at "
+                       "all in vanilla, so the top box cannot help them - that is why "
+                       "they have their own boxes. 500 is a good starting point."),
+            ("bullet", "Click \"Apply to server config\". Both files are backed up first."),
+            ("bullet", "Restart the server."),
+            ("bullet", "This is not a stack mod. Do not install one - it would break the "
+                       "plugin's engram grants."),
+            ("bullet", "To undo it, untick the box and click \"Apply to server config\" "
+                       "again. Nothing else in your config is changed, and if you had a "
+                       "stack multiplier of your own before you ever turned this on, "
+                       "unticking will not touch it."),
+            ("bullet", "At the bottom of the same section there is \"Install Excalibur "
+                       "Buffs\". Stack sizes decide how much fits in a slot; that mod "
+                       "makes items weigh less. Stop the server, click the button, say "
+                       "yes, then restart the server. It downloads the mod, ticks it on "
+                       "the Mods tab and writes the two settings it needs into "
+                       "GameUserSettings.ini for you - your config is backed up first and "
+                       "nothing else in it changes. One of those two settings turns off "
+                       "the mod's engram unlocker, which has to stay off or your item "
+                       "checks stop working, so the launcher does not let you change it. "
+                       "Do not add this mod's ID to your yaml."),
 
             ("h1", "What the path fields feed"),
             ("bullet", "The path fields write into the launcher's .bat and .ini files for "
@@ -9203,7 +12295,7 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "The zip holds your Setup Status, your version numbers, your "
                        "config, your Archipelago .yaml, paths.cmd, Game.ini and "
                        "GameUserSettings.ini, the plugin's ArkAP.config.json, the debug, "
-                       "crash and ShooterGame logs, everything in your ipc folder "
+                       "crash, ShooterGame and ArkApi logs, everything in your ipc folder "
                        "(including each player's mailbox folder), and a list of your ipc "
                        "and Mods folders. That is everything anyone would ask you for."),
             ("bullet", "Every password in every one of those files is replaced with "
@@ -9223,7 +12315,9 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "The server install stopped with exit code 8. Click \"Install ARK "
                        "Server\" again."),
             ("bullet", "\"Scan for paths\" missed a path. Pick a higher \"Scan intensity\" "
-                       "next to the button and scan again."),
+                       "next to the button (or on the Settings tab - it's the same "
+                       "setting) and scan again. That setting also controls how hard "
+                       "\"Scan for Archipelago\" and \"Scan for PopTracker\" look."),
             ("bullet", "Your cluster folders are missing. Click \"Create ServerCluster "
                        "folders\" in the Paths group on the Configuration tab."),
             ("bullet", "The connection command fails in-game. The order is /connect server "
@@ -9231,7 +12325,9 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Checks or items are not coming through. Open the Debug Log tab "
                        "(it opens on the ArkAP plugin log)."),
             ("bullet", "The server closed by itself. Debug Log tab, switch the \"Log:\" "
-                       "dropdown to \"ARK server log\" and search for LowLevelFatalError."),
+                       "dropdown to \"ARK server log\" and search for LowLevelFatalError. "
+                       "If there's nothing there, it closed during startup - see \"The "
+                       "server closes on its own during startup\" above."),
             ("bullet", "Something the launcher did went wrong. Debug Log tab, \"Log:\" "
                        "dropdown, \"Launcher log\" - it lists what the app did, with times."),
             ("bullet", "The server will not start and it says something is unsaved. Open "
@@ -9435,14 +12531,131 @@ class ArkAPLauncher(tk.Tk):
                     txt.tag_add("example", pos, end)
                     idx = end
 
-    # -------------------------------------------------------- reminder ----- #
-    def _read_hide_reminder_flag(self):
+    # ------------------------------------------------------------ settings --- #
+    def _read_settings(self):
+        """The config JSON as a dict, or {} if it's missing/unreadable/not an object.
+
+        The one reader for every launcher-level preference (hidden prompts, scan
+        intensity, the Settings tab's checkboxes). Each of those is written the moment
+        it changes via _write_config_key rather than waiting for the Configuration tab's
+        Save, so they're read straight off disk here instead of going through the
+        collect_values()/on_save() flow that owns the .bat/.ini fields."""
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            return False
-        return bool(data.get(REMINDER_HIDE_KEY, False))
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    # ------------------------------------------- suppressible prompts ------ #
+    def _read_hidden_prompts(self):
+        """The set of prompt IDs the user has ticked "Don't show this again" on.
+
+        Read from disk on every call rather than cached: these are written straight to
+        the config JSON the moment the box is ticked (like the theme), and a cache would
+        be one more thing to keep in sync with "Restore all hidden prompts"."""
+        data = self._read_settings()
+        stored = data.get(HIDDEN_PROMPTS_KEY)
+        hidden = {p for p in stored if isinstance(p, str)} if isinstance(stored, list) else set()
+        # Legacy single-purpose flag from before this list existed - honoured on read so
+        # an existing config doesn't re-show the banner someone already dismissed. Never
+        # written back; ticking the box now writes into the list instead.
+        if data.get(REMINDER_HIDE_KEY):
+            hidden.add(PROMPT_INSTALL_REMINDER)
+        return hidden
+
+    def _is_prompt_hidden(self, msg_id):
+        return msg_id in self._read_hidden_prompts()
+
+    def _hide_prompt(self, msg_id):
+        hidden = self._read_hidden_prompts()
+        hidden.add(msg_id)
+        self._write_config_key(HIDDEN_PROMPTS_KEY, sorted(hidden), "hidden prompts")
+
+    def _restore_hidden_prompts(self):
+        """Settings tab: clear every "don't show again" flag at once, including the
+        legacy install-reminder key, and report how many came back. Counted BEFORE the
+        delete so the number is what the user actually had suppressed."""
+        count = len(self._read_hidden_prompts())
+        self._write_config_key(HIDDEN_PROMPTS_KEY, [], "hidden prompts")
+        # The legacy key would otherwise be re-honoured by the next _read_hidden_prompts
+        # and silently un-restore the banner.
+        self._write_config_key(REMINDER_HIDE_KEY, False, "install reminder flag")
+        self._hide_install_reminder = False
+        self._show_reminder_banner()
+        self._log("Restored %d hidden prompt(s)." % count)
+        messagebox.showinfo(
+            "Settings",
+            "Restored %d hidden prompt(s).\n\nThey'll appear again the next time each "
+            "one is triggered." % count if count else
+            "No prompts were hidden - there's nothing to restore.")
+
+    def _themed_toplevel(self, title, resizable=False):
+        """A Toplevel that actually obeys the theme.
+
+        A Toplevel's own background is a widget option, not a ttk style, so it stays at
+        the system default unless set - which left a light frame around the padded
+        content of every custom dialog in dark mode. Every dialog wants the same four
+        lines, so they live here instead of being repeated (and forgotten) per dialog."""
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.resizable(resizable, resizable)
+        win.configure(background=self.theme["bg"])
+        return win
+
+    def _info_once(self, msg_id, title, message, width=460):
+        """Show an informational notice with a "Don't show this again" checkbox, or
+        nothing at all if this `msg_id` was already suppressed.
+
+        A plain Toplevel rather than messagebox.showinfo because messagebox has no room
+        for a checkbox. Not modal (no grab_set): every caller is a "here's what just
+        happened, now go do X" notice, and none of them gate anything the user might
+        want to get on with. Keyed on `msg_id`, never on `message` - the wording of
+        these changes and the user's choice has to survive that."""
+        if self._is_prompt_hidden(msg_id):
+            self._log("%s: %s" % (title, message.replace("\n", " ")))
+            return
+        win = self._themed_toplevel(title)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, wraplength=width, justify="left", text=message).pack(anchor="w")
+
+        dont_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Don't show this again",
+                        variable=dont_show).pack(anchor="w", pady=(10, 0))
+
+        def _close():
+            if dont_show.get():
+                self._hide_prompt(msg_id)
+                self._log("Hidden this prompt (%s) - restore it from the Settings tab."
+                          % msg_id)
+            win.destroy()
+
+        ttk.Button(frm, text="OK", command=_close).pack(anchor="e", pady=(8, 0))
+        # The window-manager X must run the same path, or ticking the box and closing
+        # via the title bar would silently discard the choice.
+        win.protocol("WM_DELETE_WINDOW", _close)
+        return win
+
+    # -------------------------------------------------------- reminder ----- #
+    def _show_reminder_banner(self):
+        """(Re-)pack the install banner at the TOP of the Configuration tab.
+
+        pack_forget() only unmaps it - the banner is still its parent's first child - so
+        a plain pack() would put it back at the BOTTOM, under every field group. Packing
+        it before the first other child restores its original position."""
+        if self.reminder_banner.winfo_ismapped():
+            return
+        others = [w for w in self.reminder_banner.master.winfo_children()
+                  if w is not self.reminder_banner]
+        try:
+            if others:
+                self.reminder_banner.pack(fill="x", pady=(0, 8), before=others[0])
+            else:
+                self.reminder_banner.pack(fill="x", pady=(0, 8))
+        except tk.TclError:
+            pass
 
     def _goto_install_tab(self):
         self.notebook.select(self.tab_install)
@@ -9453,17 +12666,7 @@ class ArkAPLauncher(tk.Tk):
     def _dismiss_reminder_forever(self):
         self._hide_install_reminder = True
         self.reminder_banner.pack_forget()
-        try:
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, ValueError):
-                data = {}
-            data[REMINDER_HIDE_KEY] = True
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except OSError as exc:
-            self._log("! Could not save reminder preference: %s" % exc)
+        self._hide_prompt(PROMPT_INSTALL_REMINDER)
 
     # -------------------------------------------------------------- theme --- #
     def _read_theme_pref(self):
@@ -9548,22 +12751,64 @@ class ArkAPLauncher(tk.Tk):
         # colors actually take effect (confirmed trade-off - see the plan).
         style.theme_use("clam" if name == "dark" else "vista")
 
-        style.configure(".", background=t["bg"], foreground=t["fg"])
+        style.configure(".", background=t["bg"], foreground=t["fg"],
+                        # clam draws borders/troughs from these root options, and leaves
+                        # them at its own pale defaults otherwise - which is what put a
+                        # bright outline on every LabelFrame and Entry in dark mode.
+                        bordercolor=t["border"], darkcolor=t["bg"], lightcolor=t["bg"],
+                        troughcolor=t["trough"], arrowcolor=t["fg"],
+                        fieldbackground=t["text_bg"], insertcolor=t["fg"])
         style.configure("TFrame", background=t["bg"])
-        style.configure("TLabelframe", background=t["bg"])
+        style.configure("TLabelframe", background=t["bg"], bordercolor=t["border"])
         style.configure("TLabelframe.Label", background=t["bg"], foreground=t["fg"])
         style.configure("TLabel", background=t["bg"], foreground=t["fg"])
         style.configure("TCheckbutton", background=t["bg"], foreground=t["fg"])
+        style.configure("TRadiobutton", background=t["bg"], foreground=t["fg"])
         style.configure("TButton", background=t["bg"], foreground=t["fg"])
-        style.configure("TEntry", fieldbackground=t["text_bg"], foreground=t["fg"])
-        style.configure("TNotebook", background=t["bg"])
+        style.configure("TEntry", fieldbackground=t["text_bg"], foreground=t["fg"],
+                        bordercolor=t["border"], insertcolor=t["fg"])
+        style.configure("TNotebook", background=t["bg"], bordercolor=t["border"])
         style.configure("TNotebook.Tab", background=t["bg"], foreground=t["fg"])
         style.map("TNotebook.Tab",
                   background=[("selected", t["tab_active_bg"])],
                   foreground=[("selected", t["fg"])])
-        style.configure("TScrollbar", background=t["bg"])
+        # A scrollbar is background (the thumb) AND troughcolor (the channel behind it).
+        # Setting only the former left a pale channel down the side of all eleven
+        # scrolled panes in dark mode.
+        style.configure("TScrollbar", background=t["scroll_thumb"],
+                        troughcolor=t["trough"], bordercolor=t["border"],
+                        arrowcolor=t["fg"])
+        style.map("TScrollbar",
+                  background=[("active", t["scroll_thumb_active"])])
         style.configure("Horizontal.TProgressbar", background=t["status_ok"],
-                        troughcolor=t["bg"])
+                        troughcolor=t["trough"], bordercolor=t["border"])
+        # TCombobox had no style at all: under clam both the closed field and the
+        # drop-down stayed light. The field is styled here; the drop-down is a plain Tk
+        # listbox that ttk styles cannot reach, so it goes through the option database
+        # in _apply_combobox_popdown_colors below.
+        style.configure("TCombobox", fieldbackground=t["text_bg"], background=t["bg"],
+                        foreground=t["fg"], arrowcolor=t["fg"], bordercolor=t["border"])
+        # Every combobox in this app is state="readonly", which is a SEPARATE state map
+        # from the base configure above - without this they all render in clam's default
+        # light grey no matter what the theme says.
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", t["text_bg"]),
+                                   ("disabled", t["bg"])],
+                  foreground=[("readonly", t["fg"]),
+                              ("disabled", t["subtle_fg"])],
+                  selectbackground=[("readonly", t["text_bg"])],
+                  selectforeground=[("readonly", t["fg"])])
+        style.map("TEntry",
+                  fieldbackground=[("disabled", t["bg"]), ("readonly", t["bg"])],
+                  foreground=[("disabled", t["subtle_fg"])])
+        style.map("TButton",
+                  background=[("active", t["tab_active_bg"]),
+                              ("disabled", t["bg"])],
+                  foreground=[("disabled", t["subtle_fg"])])
+        style.map("TCheckbutton",
+                  background=[("active", t["bg"])],
+                  indicatorcolor=[("selected", t["fg"]), ("!selected", t["text_bg"])])
+        self._apply_combobox_popdown_colors(t)
 
         try:
             self.configure(background=t["bg"])
@@ -9580,6 +12825,9 @@ class ArkAPLauncher(tk.Tk):
         # reminder next to the title instead of blending into it.
         style.configure("SaveHint.TLabel", background=t["warn_bg"],
                         foreground=t["warn_fg"])
+        # The wash behind the whole chip (text + the Save button inside it). Configured
+        # here with everything else so the light/dark toggle repaints it for free.
+        style.configure("SaveHint.TFrame", background=t["warn_bg"])
 
         self._default_fg = style.lookup("TEntry", "foreground") or t["fg"]
         # Placeholder text is italic as well as grey, so the two states are told apart
@@ -9594,18 +12842,66 @@ class ArkAPLauncher(tk.Tk):
         # these need re-registering every time theme_use() changes.
         self._setup_search_styles()
 
+    def _apply_combobox_popdown_colors(self, t):
+        """Colour the list that drops out of a ttk.Combobox.
+
+        That list is a plain Tk listbox created by Tk itself, inside the combobox's
+        popdown toplevel - it is not part of the ttk style system, so style.configure()
+        cannot touch it and it stayed white in dark mode. The option database is the
+        only supported handle on it, and it is read when the popdown is created, so
+        setting this before the popdown first opens is enough for it to take effect."""
+        for option, value in (("*TCombobox*Listbox.background", t["text_bg"]),
+                              ("*TCombobox*Listbox.foreground", t["fg"]),
+                              ("*TCombobox*Listbox.selectBackground", t["select_bg"]),
+                              ("*TCombobox*Listbox.selectForeground", t["select_fg"])):
+            try:
+                self.option_add(option, value)
+            except tk.TclError:
+                pass
+
     def _retheme_widgets(self):
         """Re-color already-built plain-tk widgets and anything else
         _apply_theme() can't reach via ttk styles alone. Only meaningful when
         toggling after startup - at startup these widgets are constructed
         reading self.theme directly, so there's nothing stale to fix up."""
         t = self.theme
-        for widget in (self.log, self.install_log, self.debug_log_text,
+        # self.mods_log was missing from this list, so the Mods tab's output pane kept
+        # the previous theme's colours - a white slab in dark mode.
+        for widget in (self.log, self.install_log, self.mods_log, self.debug_log_text,
                        self.instructions_text_quick, self.instructions_text_full,
                        self.profile_notes_text):
             try:
                 widget.configure(background=t["text_bg"], foreground=t["text_fg"],
                                   insertbackground=t["text_fg"])
+            except tk.TclError:
+                pass
+
+        # Every scrolled tab is a tk.Canvas holding a frame, and a Canvas takes its
+        # background as a widget option that no ttk style reaches - so none of the six
+        # were ever repainted on toggle, and the Configuration tab's was never given a
+        # background at all (it defaulted to white). Walked rather than tracked in a
+        # list: they're all built in different methods, and one missed registration is
+        # exactly the bug this replaces.
+        for widget in self._iter_widgets(self):
+            if isinstance(widget, tk.Canvas):
+                try:
+                    widget.configure(background=t["bg"])
+                except tk.TclError:
+                    pass
+
+        # An already-opened combobox drop-down keeps the colours it was created with
+        # (see _apply_combobox_popdown_colors - the option database only applies at
+        # creation), so existing popdowns are repainted directly here.
+        self._apply_combobox_popdown_colors(t)
+        for widget in self._iter_widgets(self):
+            if not isinstance(widget, ttk.Combobox):
+                continue
+            try:
+                popdown = widget.tk.call("ttk::combobox::PopdownWindow", widget)
+                widget.tk.call("%s.f.l" % popdown, "configure",
+                               "-background", t["text_bg"], "-foreground", t["fg"],
+                               "-selectbackground", t["select_bg"],
+                               "-selectforeground", t["select_fg"])
             except tk.TclError:
                 pass
 
@@ -9631,6 +12927,7 @@ class ArkAPLauncher(tk.Tk):
         try:
             self._update_save_highlights()
             self._set_halo(self.mods_save_btn_halo, self._mods_dirty_flag)
+            self._set_halo(self.stack_apply_halo, self._stacks_dirty_flag)
         except tk.TclError:
             pass
 
@@ -9641,17 +12938,30 @@ class ArkAPLauncher(tk.Tk):
         except tk.TclError:
             pass
 
-        try:
-            self.reminder_banner.configure(background=t["warn_bg"],
-                                            highlightbackground=t["warn_border"])
-            self._retheme_warn_subtree(self.reminder_banner, t)
-        except tk.TclError:
-            pass
+        # Both warn banners, not just the Configuration one - the Mods tab's gate banner
+        # is built the same way and was being left on the old theme's yellow.
+        for banner in (getattr(self, "reminder_banner", None),
+                       getattr(self, "mods_gate_banner", None)):
+            if banner is None:
+                continue
+            try:
+                banner.configure(background=t["warn_bg"],
+                                 highlightbackground=t["warn_border"])
+                self._retheme_warn_subtree(banner, t)
+            except tk.TclError:
+                pass
 
         # Setup Status rows are rebuilt from scratch each refresh and already
         # read colors from self.theme at build time, so re-running it is the
         # simplest correct fix rather than hunting down each child widget.
         self._refresh_setup_status()
+        # Mod rows are plain tk.Frame/tk.Label built from self.theme in _build_mod_row,
+        # so they need the same treatment for the same reason - without this the whole
+        # mod list keeps the old row backgrounds.
+        try:
+            self._rebuild_mods_rows()
+        except (tk.TclError, AttributeError):
+            pass
 
     def _retheme_warn_subtree(self, widget, t):
         """Recolor the reminder banner's nested tk.Frame/tk.Label children -
@@ -9674,6 +12984,8 @@ class ArkAPLauncher(tk.Tk):
         self._retheme_widgets()
         self._write_theme_pref(self.theme_name)
         self.theme_toggle_btn.configure(text=self._theme_toggle_label())
+        # The header button and the Settings-tab checkbox are two views of one state.
+        self._sync_theme_setting()
         if self._last_search_query:
             self._run_search(self._last_search_query)
 
@@ -10068,7 +13380,9 @@ class ArkAPLauncher(tk.Tk):
         #
         # The bug the 5-level walk was originally justified by - "Save silently dropped
         # every Connector value" when no ini was found - is fixed on its own merits in
-        # _apply_ini(), which now logs loudly and says how to set the path.
+        # _apply_ini(), which logs loudly and says how to set the path, and whose warning
+        # on_save now also puts in the completion dialog (the log widget lives on the
+        # Configuration tab, so it was invisible to anyone saving from Archipelago Setup).
         ini = saved.get("connector_ini", "")
         if not ini or not os.path.isfile(ini):
             roots = [b, cwd]
@@ -10170,6 +13484,10 @@ class ArkAPLauncher(tk.Tk):
 
     def collect_values(self):
         values = {key: self.get(key) for key in self.vars}
+        # Kept in step with the live flag so a Save can't resurrect a banner the user
+        # dismissed - or, after "Restore all hidden prompts", re-hide one they restored.
+        # The authoritative copy is PROMPT_INSTALL_REMINDER in HIDDEN_PROMPTS_KEY; this
+        # legacy key is written only so downgrading to an older build still behaves.
         values[REMINDER_HIDE_KEY] = self._hide_install_reminder
         return values
 
@@ -10241,7 +13559,7 @@ class ArkAPLauncher(tk.Tk):
         Packed/unpacked rather than recoloured - it's a sentence, and a greyed-out one
         still reads as a nag. Nothing sits to its right in title_row (the header buttons
         are packed side="right" on the row above), so it can't shift anything."""
-        want = self._fields_dirty or self._mods_dirty_flag
+        want = self._fields_dirty or self._mods_dirty_flag or self._stacks_dirty_flag
         if want == self._save_hint_shown:
             return
         if want:
@@ -10249,6 +13567,24 @@ class ArkAPLauncher(tk.Tk):
         else:
             self.save_hint_label.pack_forget()
         self._save_hint_shown = want
+
+    def _on_save_hint_click(self):
+        """The header hint's own Save: writes every section that is currently unsaved,
+        so the shortcut works even when more than one is. Reuses the exact per-section
+        verdicts the hint is drawn from (_update_save_hint) rather than re-deriving
+        them - on_save covers the Configuration AND Archipelago Setup fields (one
+        config JSON, one write), which leaves the Mods list and the stack settings as the
+        separate ones. Each one clears its own halo, so the hint disappears on its own.
+
+        Increase stacks goes last because it's the only one that can put a dialog up (a
+        confirm, or the refusal if the ARK server is running) - the silent writes are all
+        done by then."""
+        if self._fields_dirty:
+            self.on_save()
+        if self._mods_dirty_flag:
+            self.on_mods_save()
+        if self._stacks_dirty_flag:
+            self.apply_stack_settings()
 
     def _on_field_changed(self):
         self._update_profile_status()
@@ -10302,7 +13638,13 @@ class ArkAPLauncher(tk.Tk):
             self._mark_saved_baseline()
 
         self._log("Done.")
-        messagebox.showinfo("ARKIpelago Launcher", "Save complete. See the log for details.")
+        # No dialog when connector.ini wasn't written. That warning dated from when the
+        # standalone Python connector was how you connected; connection now happens
+        # in-game, connector.ini is a fallback almost nobody has, and the popup fired on
+        # every ordinary Save - reading like a failure when nothing was wrong. The Setup
+        # Status row (advisory, see _gather_setup_status) is where that file is reported.
+        self._info_once(PROMPT_SAVE_COMPLETE, "ARKIpelago Launcher",
+                        "Save complete. See the log for details.")
 
     def _apply_bat(self, scripts, batname, field_map, values):
         path = os.path.join(scripts, batname)
@@ -10345,17 +13687,16 @@ class ArkAPLauncher(tk.Tk):
             self._log("   (vars not present, skipped: %s)" % ", ".join(missing))
 
     def _apply_ini(self, values):
+        """Write the CONNECTOR_KEYS into connector.ini, if the user has one.
+
+        No file is the normal case now - you connect from in-game, and connector.ini only
+        feeds the optional standalone Python connector - so this is a plain note in the
+        log, not a warning and not a dialog. Writing is unchanged when a file IS set."""
         path = self.get("connector_ini")
         if not path or not os.path.isfile(path):
-            # Loud, not "skipped": everything the user typed into the Archipelago Setup
-            # tab's room fields and the Configuration tab's plugin-file fields goes
-            # nowhere in this case, and the old one-liner read like a harmless note
-            # about an optional file.
-            self._log("! connector.ini: %s - your Connector values (server / slot / "
-                      "ipc_dir / ...) were NOT written anywhere the connector reads."
-                      % ("no file set" if not path else "not found at %s" % path))
-            self._log("  Fix: set \"connector.ini file\" in the Locations group to the "
-                      "connector.ini in your ArkConnector folder, then Save again.")
+            self._log("connector.ini: %s - skipped (only needed for the optional "
+                      "standalone connector; connecting from in-game doesn't use it)."
+                      % ("none set" if not path else "not found at %s" % path))
             return
         text, enc = read_text(path)
         original = text
@@ -10378,11 +13719,60 @@ class ArkAPLauncher(tk.Tk):
 
     # ------------------------------------------------------------ Profiles - #
     def _current_profile_snapshot(self):
-        """Every Configuration-tab field, keyed the same as self.vars - i.e. the
-        Locations/Paths/Network/Connector/Cluster groups (paths, network, cluster,
-        connector settings). Deliberately does NOT include REMINDER_HIDE_KEY - that's a
-        launcher preference, not part of a server config."""
+        """Every field registered in self.vars - which is BOTH field tabs: the
+        Configuration tab's Paths / Plugin files & DeathLink / Network / Cluster /
+        Locations groups, and the Archipelago Setup tab's Archipelago directory,
+        PopTracker directory and Connector settings (they're rendered by the same
+        _render_field_groups loop, so they land in self.vars too). Deliberately does
+        NOT include REMINDER_HIDE_KEY - that's a launcher preference, not part of a
+        server config.
+
+        The two parts of a setup that are not self.vars fields - Increase stacks and
+        the Mods tab - come from _current_profile_extras."""
         return {key: self.get(key) for key in self.vars}
+
+    def _current_profile_extras(self):
+        """The rest of the user's setup, i.e. the state held outside self.vars:
+
+          stacks - the Increase stacks tick, the global multiplier, and every per-item
+                   override box (_stacks_settings, the same shape the config JSON gets)
+          mods   - the whole Mods tab list IN ORDER: which are ticked, mods the user
+                   added themselves, and the names they renamed them to
+
+        Kept as one method so _profile_record (what gets written) and
+        _update_profile_status (what counts as changed) can never disagree about what a
+        profile covers.
+
+        Mod entries are copied, not referenced: self._mods is mutated in place by every
+        toggle/reorder/add, and a stored profile sharing those dicts would quietly
+        rewrite itself afterwards."""
+        return {"stacks": self._stacks_settings(),
+                "mods": [dict(mod) for mod in self._mods]}
+
+    def _profile_record(self, notes=None):
+        """One profile exactly as it is stored. Every write path goes through this, so a
+        section added here is captured by all of them - Save, "Save as new profile",
+        "Update selected profile", the first-run profile and the autosave slot - instead
+        of by whichever ones got remembered. `notes` overrides the notes box (the
+        autosave slot writes its own explanatory text)."""
+        record = {"values": self._current_profile_snapshot(),
+                  "notes": self._current_profile_notes() if notes is None else notes}
+        record.update(self._current_profile_extras())
+        return record
+
+    def _mark_profile_loaded(self, name, notes):
+        """Make `name` the loaded/active profile and record what "unchanged since
+        loading" means for it.
+
+        The baseline is read LIVE rather than copied out of the stored profile, which is
+        what makes the missing-key tolerance work end to end: a profile that predates a
+        section carries no key for it, so the section keeps whatever it already had -
+        and this records that, instead of the status line immediately claiming the user
+        changed something they never touched."""
+        self._set_active_profile(name)
+        self._loaded_profile_values = self._current_profile_snapshot()
+        self._loaded_profile_notes = notes
+        self._loaded_profile_extras = self._current_profile_extras()
 
     def _current_profile_notes(self):
         if not hasattr(self, "profile_notes_text"):
@@ -10424,55 +13814,80 @@ class ArkAPLauncher(tk.Tk):
         return {n: p for n, p in self._profiles.items() if not is_autosave_profile(n)}
 
     def _start_autosave(self):
-        """Arm the 10-minute autosave timer. Writes an initial snapshot immediately so
-        a crash in the first ten minutes still leaves something to recover."""
-        self._autosave_tick(initial=True)
+        """Arm the autosave timer at the configured interval. Writes an initial snapshot
+        immediately so a crash in the first interval still leaves something to recover.
+        Does nothing when autosave is switched off on the Settings tab."""
+        if not self.autosave_enabled_var.get():
+            return
+        self._autosave_tick()
 
-    def _autosave_tick(self, initial=False):
+    def _restart_autosave(self):
+        """Re-arm after the Settings tab changed the toggle or the interval. Cancels the
+        pending tick first, or turning autosave off (or lengthening the interval) would
+        leave the old timer running until it next fired."""
+        after_id = getattr(self, "_autosave_after_id", None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._autosave_after_id = None
+        if self.autosave_enabled_var.get():
+            # No initial snapshot here: re-arming isn't a new session, and one was
+            # already taken when the app started.
+            self._autosave_after_id = self.after(self._autosave_interval_ms(),
+                                                 self._autosave_tick)
+
+    def _autosave_interval_ms(self):
+        return self._autosave_minutes * 60 * 1000
+
+    def _autosave_tick(self):
+        # Guards the case where autosave was switched off between this tick being
+        # scheduled and it firing.
+        if not self.autosave_enabled_var.get():
+            self._autosave_after_id = None
+            return
         try:
-            self._write_autosave_profile(initial=initial)
+            self._write_autosave_profile()
         except Exception as exc:
-            # Swallowed on purpose: this runs unattended every 10 minutes, and an
-            # exception escaping a Tk callback surfaces as a traceback/error box the
-            # user never asked for. A note in the log is the right amount of noise.
+            # Swallowed on purpose: this runs unattended on a timer, and an exception
+            # escaping a Tk callback surfaces as a traceback/error box the user never
+            # asked for. A note in the log is the right amount of noise.
             self._log("! Autosave failed: %s" % exc)
         finally:
             # Rescheduled in a finally so a transient failure (locked file, full disk)
             # can never silently kill autosaving for the rest of the session.
-            self._autosave_after_id = self.after(AUTOSAVE_INTERVAL_MS, self._autosave_tick)
+            self._autosave_after_id = self.after(self._autosave_interval_ms(),
+                                                 self._autosave_tick)
 
-    def _write_autosave_profile(self, initial=False):
-        """Replace the autosave slot with the current Configuration values.
+    def _write_autosave_profile(self):
+        """Replace the autosave slot with the user's current setup - fields, Increase
+        stacks and the Mods tab alike, since a recovery that came back missing half of
+        them wouldn't be much of a safety net.
 
-        Skips the write entirely when nothing has changed since the last autosave, so
-        an app left open (or minimized) all day does no repeated disk I/O. Only ever
-        touches self._profiles[AUTOSAVE_PROFILE_NAME] - user profiles are untouched,
-        and the currently loaded-profile state is left alone so the Profiles tab's
-        "changed since loading" indicator doesn't lie."""
-        values = self._current_profile_snapshot()
-        existing = self._profiles.get(AUTOSAVE_PROFILE_NAME)
-        if (not initial and self._autosave_last_values == values
-                and existing is not None):
+        Skips the write entirely when nothing has changed, so an app left open (or
+        minimized) all day does no repeated disk I/O. The comparison is against the slot
+        itself - the record the last successful write left behind, which also survives
+        the app being closed and reopened - rather than a separate remembered copy that
+        would have to be taught about every new section. Only ever touches
+        self._profiles[AUTOSAVE_PROFILE_NAME]: user profiles are untouched, and the
+        loaded-profile baseline is left alone so the Profiles section's "changed since
+        loading" indicator doesn't lie."""
+        record = self._profile_record(
+            notes=autosave_profile_notes(self._autosave_minutes))
+        previous = self._profiles.get(AUTOSAVE_PROFILE_NAME)
+        if previous is not None and all(previous.get(key) == record.get(key)
+                                        for key in PROFILE_STATE_KEYS):
             return False
-        if initial and existing is not None and existing.get("values") == values:
-            # Nothing changed since the last run of the app either.
-            self._autosave_last_values = dict(values)
-            return False
-
-        previous = existing
+        record["autosaved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         # Assignment, not append: the slot holds the latest snapshot only.
-        self._profiles[AUTOSAVE_PROFILE_NAME] = {
-            "values": values,
-            "notes": AUTOSAVE_PROFILE_NOTES,
-            "autosaved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        self._profiles[AUTOSAVE_PROFILE_NAME] = record
         if not self._save_profiles(quiet=True):
             if previous is None:
                 self._profiles.pop(AUTOSAVE_PROFILE_NAME, None)
             else:
                 self._profiles[AUTOSAVE_PROFILE_NAME] = previous
             return False
-        self._autosave_last_values = dict(values)
         self._refresh_profile_list()
         self._update_profile_status()
         return True
@@ -10486,32 +13901,29 @@ class ArkAPLauncher(tk.Tk):
         session with nothing behind the Configuration tab but the bare config JSON -
         anything typed before that Save had no profile to fall back to. Creating it up
         front means every value the user enters belongs to a real profile from the
-        start, and the Profiles tab has something selected instead of being empty.
+        start, and the Profiles section has something selected instead of being empty.
 
         It is a completely ordinary profile - the user can rename, update or delete it
         like any other. The reserved autosave slot is excluded from the "has profiles"
         test on purpose: it always exists, and counting it would stop this from ever
         being created.
 
-        Setting it as loaded is what makes the Profiles tab's "changed since loading"
+        Setting it as loaded is what makes the Profiles section's "changed since loading"
         indicator meaningful from the first edit onwards. A write failure leaves the
         app profile-less rather than pretending a profile is loaded that isn't on
         disk; the next launch simply tries again."""
         if self._user_profiles():
             return
-        values = self._current_profile_snapshot()
-        self._profiles[DEFAULT_PROFILE_NAME] = {"values": values, "notes": ""}
+        record = self._profile_record()
+        self._profiles[DEFAULT_PROFILE_NAME] = record
         if not self._save_profiles(quiet=True):
             self._profiles.pop(DEFAULT_PROFILE_NAME, None)
             return
-        self._set_active_profile(DEFAULT_PROFILE_NAME)
-        self._loaded_profile_values = dict(values)
-        self._loaded_profile_notes = ""
+        self._mark_profile_loaded(DEFAULT_PROFILE_NAME, record["notes"])
         self._refresh_profile_list(select_name=DEFAULT_PROFILE_NAME)
         self._log("No profiles existed yet, so \"%s\" was created from your current "
-                   "Configuration values and loaded (see the Profiles tab). It's a "
-                   "normal profile - rename, update or delete it however you like."
-                   % DEFAULT_PROFILE_NAME)
+                   "settings and loaded (see the Settings tab). It's a normal profile - "
+                   "rename, update or delete it however you like." % DEFAULT_PROFILE_NAME)
 
     def _refresh_profile_list(self, select_name=None):
         names = sorted(self._profiles.keys(), key=str.lower)
@@ -10523,22 +13935,25 @@ class ArkAPLauncher(tk.Tk):
             self.profile_select_var.set("")
 
     def _update_profile_status(self, *_args):
-        """Refreshes the Profiles-tab status label: which profile (if any) is
-        loaded, and whether the live Configuration fields / notes have since
-        diverged from what was loaded - never applied silently, so this is the
-        only signal the user gets that there's something to (re)save."""
+        """Refreshes the Profiles section's status label: which profile (if any) is
+        loaded, and whether anything the profile covers - fields, Increase stacks, the
+        Mods tab or the notes - has since diverged from what was loaded. Never applied
+        silently, so this is the only signal the user gets that there's something to
+        (re)save."""
         if not hasattr(self, "profile_status_var"):
             return
         if not self._loaded_profile_name:
             self.profile_status_var.set("No profile loaded.")
             return
         dirty = (self._current_profile_snapshot() != self._loaded_profile_values
-                  or self._current_profile_notes() != self._loaded_profile_notes)
+                  or self._current_profile_notes() != self._loaded_profile_notes
+                  or self._current_profile_extras() != self._loaded_profile_extras)
         if dirty:
             self.profile_status_var.set(
-                "Loaded profile: \"%s\" - fields or notes have changed since loading. "
-                "Use \"Update selected profile\" to save these changes into it, or "
-                "\"Save as new profile\" to keep both." % self._loaded_profile_name)
+                "Loaded profile: \"%s\" - your settings, mods or notes have changed "
+                "since loading. Use \"Update selected profile\" to save these changes "
+                "into it, or \"Save as new profile\" to keep both."
+                % self._loaded_profile_name)
         else:
             self.profile_status_var.set(
                 "Loaded profile: \"%s\" (matches the saved profile)." % self._loaded_profile_name)
@@ -10571,25 +13986,31 @@ class ArkAPLauncher(tk.Tk):
         self._write_config_key(ACTIVE_PROFILE_KEY, name or "", "active profile")
 
     def _save_active_profile(self):
-        """Write the current Configuration fields + notes into the active profile.
-        Called from on_save only - loading a profile still changes nothing on disk
-        beyond which profile is active."""
+        """Write the user's current setup into the active profile. Called from on_save
+        only - loading a profile still changes nothing on disk beyond which profile is
+        active (and the config JSON's own copy of the mods list / stack settings, which
+        those two sections persist on every change regardless)."""
         name = self._active_profile_name()
-        self._profiles[name] = {"values": self._current_profile_snapshot(),
-                                "notes": self._current_profile_notes()}
+        record = self._profile_record()
+        self._profiles[name] = record
         if not self._save_profiles(quiet=True):
             return
-        self._set_active_profile(name)
-        self._loaded_profile_values = dict(self._profiles[name]["values"])
-        self._loaded_profile_notes = self._profiles[name]["notes"]
+        self._mark_profile_loaded(name, record["notes"])
         self._refresh_profile_list(select_name=name)
         self._update_profile_status()
         self._log("Saved into profile \"%s\" (the active profile)." % name)
 
-    def _apply_profile(self, name):
-        """Populate the Configuration fields + notes from a profile and make it the
-        active one. Shared by the Load button and the startup restore, so a profile
-        restored on launch lands in exactly the same state as one loaded by hand."""
+    def _apply_profile(self, name, include_extras=True):
+        """Populate everything a profile covers - the self.vars fields on both tabs, the
+        Increase stacks boxes, the Mods tab and the notes - and make it the active one.
+        Shared by the Load button and the startup restore.
+
+        include_extras=False is the startup restore (see _restore_active_profile).
+        self.vars fields only reach disk on Save, so the profile and the config JSON
+        agree about them at launch; the stack boxes and the mods list instead persist
+        themselves on every single change, so they can legitimately be AHEAD of the
+        profile (anything edited since the last Save). Re-applying them at launch would
+        silently roll those edits back."""
         profile = self._profiles[name]
         values = profile.get("values", {})
         for key in self.vars:
@@ -10600,14 +14021,97 @@ class ArkAPLauncher(tk.Tk):
             # never persisted at all. Applies to every field added from here on.
             if key in values:
                 self.set(key, values[key])
+        if include_extras:
+            # The same rule one level up, for the same reason: a profile written before
+            # these sections were captured carries no key for them, so its Increase
+            # stacks / Mods state is left exactly as it is rather than being wiped.
+            if isinstance(profile.get("stacks"), dict):
+                self._apply_profile_stacks(profile["stacks"])
+            if isinstance(profile.get("mods"), list):
+                self._apply_profile_mods(profile["mods"])
         notes = profile.get("notes", "")
         self.profile_notes_text.delete("1.0", "end")
         self.profile_notes_text.insert("1.0", notes)
         self.profile_notes_text.edit_modified(False)
-        self._set_active_profile(name)
-        self._loaded_profile_values = self._current_profile_snapshot()
-        self._loaded_profile_notes = notes
+        self._mark_profile_loaded(name, notes)
         self._update_profile_status()
+
+    def _apply_profile_stacks(self, stacks):
+        """Fill the Increase stacks section from a profile. Key by key rather than
+        wholesale, for the same reason the self.vars loop above is: a profile written
+        before an item joined STACK_ITEMS carries no box for it, and that box keeps
+        whatever it had instead of being blanked.
+
+        Nothing reaches Game.ini / GameUserSettings.ini here. These are the very vars
+        the boxes are bound to, so this leaves exactly the state typing the numbers in
+        by hand would - including "Apply to server config" lighting up, because each
+        var's trace runs _save_stacks_config, which re-checks the files."""
+        if "enabled" in stacks:
+            self.stacks_enabled_var.set(bool(stacks["enabled"]))
+        if "multiplier" in stacks:
+            self.stacks_mult_var.set(str(stacks["multiplier"]))
+        items = stacks.get("items")
+        if isinstance(items, dict):
+            for cls, var in self.stacks_item_vars.items():
+                if cls in items:
+                    var.set(str(items[cls]))
+
+    def _apply_profile_mods(self, saved):
+        """Load a profile's Mods tab state: which mods are in the list, in what order,
+        which are ticked, and the names the user gave the ones they added themselves.
+
+        GUI intent only, exactly like ticking the boxes by hand: ActiveMods in
+        GameUserSettings.ini is untouched until the Mods tab's own Save, and the
+        _rebuild_mods_rows below re-runs the dirty check against disk, which is what
+        leaves that Save button lit. The list itself IS written to the config JSON right
+        away, because that is already how every other mod-list change behaves.
+
+        A mod the profile carries but this machine hasn't installed is kept in the list
+        UNTICKED rather than dropped: dropping it would lose the entry (and its custom
+        name) the moment a profile from another setup was loaded, while ticking it would
+        promise an activation Save can't deliver. Its row shows the usual red
+        not-installed icon, so "Download checked" is one tick away.
+
+        Anything already in the list that the profile doesn't mention is kept too,
+        unticked, at the end - a profile older than a mod the user added must not
+        delete that mod."""
+        gate_ok, server_root = self._mods_gate_state()
+        # Apworld support and the canonical names are facts about THIS launcher build,
+        # not about the saved setup, so they're re-derived rather than restored - a
+        # renamed supported mod would otherwise carry a stale name across an update.
+        known = {mod["id"]: mod["name"] for mod in SUPPORTED_MODS}
+        mods, seen = [], set()
+        for entry in saved:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            mod_id = str(entry["id"])
+            if mod_id in seen:
+                continue
+            seen.add(mod_id)
+            enabled = bool(entry.get("enabled"))
+            if enabled and gate_ok:
+                # Can't activate what isn't on disk. Left alone while gated (no
+                # SERVER_ROOT, or no server installed there): nothing is installed to
+                # find yet and Save is disabled anyway, so unticking there would throw
+                # the profile's intent away for no reason.
+                enabled = check_mod_installed(server_root, mod_id)[0]
+            mods.append({
+                "id": mod_id,
+                "name": known.get(mod_id) or str(entry.get("name")
+                                                 or "Workshop Mod %s" % mod_id),
+                "enabled": enabled,
+                "supported": mod_id in known,
+            })
+        for mod in self._mods:
+            if mod["id"] not in seen:
+                mods.append(dict(mod, enabled=False))
+        self._mods = mods
+        self._mods_selected_id = None   # the old selection may not be in the list now
+        self._save_mods_config()
+        # Not _refresh_mods_list: that one syncs `enabled` back from ActiveMods on disk,
+        # which would immediately discard the ticks just loaded. Same reason Check all /
+        # Uncheck all use this path.
+        self._rebuild_mods_rows()
 
     def _restore_active_profile(self, saved):
         """Re-load whichever profile was active when the app last closed, instead of
@@ -10616,12 +14120,14 @@ class ArkAPLauncher(tk.Tk):
         No Save is required afterwards: unlike the Load button (a new, pending choice
         the user has to confirm with Save), this is the state already persisted on
         disk - the .bat files and config JSON were written from these very values last
-        session. Nothing is written back here either, so the Profiles tab still shows
-        "matches the saved profile" until something is actually edited."""
+        session. Nothing is written back here either, so the Profiles section still shows
+        "matches the saved profile" until something is actually edited. The Increase
+        stacks and Mods sections are deliberately not re-applied here - see
+        _apply_profile's include_extras."""
         name = (saved or {}).get(ACTIVE_PROFILE_KEY) or ""
         if not name or is_autosave_profile(name) or name not in self._profiles:
             return
-        self._apply_profile(name)
+        self._apply_profile(name, include_extras=False)
         self._refresh_profile_list(select_name=name)
         self._log("Loaded the profile that was active last session: \"%s\"." % name)
 
@@ -10631,12 +14137,21 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showwarning("ARKIpelago Launcher", "Select a profile to load first.")
             return
         self._apply_profile(name)
-        self._log("Loaded profile \"%s\" into the Configuration fields." % name)
+        self._log("Loaded profile \"%s\" into the fields, the Increase stacks settings "
+                   "and the Mods tab." % name)
         messagebox.showinfo(
             "ARKIpelago Launcher",
-            "Profile \"%s\" has been loaded into the Configuration fields and notes.\n\n"
-            "Nothing has been written to disk yet - go to the Configuration tab and "
-            "press Save to apply these values." % name)
+            "Profile \"%s\" has been loaded into the Configuration and Archipelago "
+            "Setup fields, the Increase stacks settings, the Mods tab and the notes."
+            "\n\nNothing has been written to your server yet:\n"
+            "  - press Save on the Configuration tab (and on Archipelago Setup) to "
+            "write the fields to your .bat/.ini files\n"
+            "  - press Save on the Mods tab to write the ticked mods to the server\n"
+            "  - press \"Apply to server config\" for the stack settings, with the ARK "
+            "server stopped\n\n"
+            "Whichever of those still has something to do is highlighted for you. A mod "
+            "in this profile that isn't installed on this PC is listed unticked - use "
+            "\"Download checked\" on the Mods tab to install it first." % name)
 
     def _on_save_new_profile(self):
         name = simpledialog.askstring("Save as new profile", "Profile name:", parent=self)
@@ -10656,15 +14171,11 @@ class ArkAPLauncher(tk.Tk):
                 "ARKIpelago Launcher",
                 "A profile named \"%s\" already exists. Overwrite it?" % name):
             return
-        self._profiles[name] = {
-            "values": self._current_profile_snapshot(),
-            "notes": self._current_profile_notes(),
-        }
+        record = self._profile_record()
+        self._profiles[name] = record
         if not self._save_profiles():
             return
-        self._set_active_profile(name)
-        self._loaded_profile_values = dict(self._profiles[name]["values"])
-        self._loaded_profile_notes = self._profiles[name]["notes"]
+        self._mark_profile_loaded(name, record["notes"])
         self._refresh_profile_list(select_name=name)
         self._update_profile_status()
         self._log("Saved profile \"%s\"." % name)
@@ -10678,24 +14189,21 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showwarning(
                 "ARKIpelago Launcher",
                 "\"%s\" is maintained by the launcher - it's rewritten with your "
-                "current Configuration values every 10 minutes anyway, and the next "
-                "autosave would replace anything you put there.\n\nUse \"Save as new "
-                "profile\" to keep these values." % AUTOSAVE_PROFILE_NAME)
+                "current setup every 10 minutes anyway, and the next autosave would "
+                "replace anything you put there.\n\nUse \"Save as new profile\" to keep "
+                "these values." % AUTOSAVE_PROFILE_NAME)
             return
         if not messagebox.askyesno(
                 "ARKIpelago Launcher",
-                "Overwrite profile \"%s\" with the current Configuration fields and "
-                "notes?" % name):
+                "Overwrite profile \"%s\" with your current settings - the Configuration "
+                "and Archipelago Setup fields, the Increase stacks settings, the Mods "
+                "tab and the notes?" % name):
             return
-        self._profiles[name] = {
-            "values": self._current_profile_snapshot(),
-            "notes": self._current_profile_notes(),
-        }
+        record = self._profile_record()
+        self._profiles[name] = record
         if not self._save_profiles():
             return
-        self._set_active_profile(name)
-        self._loaded_profile_values = dict(self._profiles[name]["values"])
-        self._loaded_profile_notes = self._profiles[name]["notes"]
+        self._mark_profile_loaded(name, record["notes"])
         self._update_profile_status()
         self._log("Updated profile \"%s\"." % name)
 
@@ -10750,8 +14258,8 @@ class ArkAPLauncher(tk.Tk):
             # Deletable, but pointless - said plainly rather than silently re-creating it.
             if not messagebox.askyesno(
                     "ARKIpelago Launcher",
-                    "\"%s\" is the launcher's automatic snapshot of your Configuration "
-                    "tab, rewritten every 10 minutes while the app is open.\n\nYou can "
+                    "\"%s\" is the launcher's automatic snapshot of your whole setup, "
+                    "rewritten every 10 minutes while the app is open.\n\nYou can "
                     "delete it, but the next autosave will recreate it - and until then "
                     "you'd have no automatic backup to fall back on.\n\nDelete it "
                     "anyway?" % AUTOSAVE_PROFILE_NAME):
@@ -10764,14 +14272,13 @@ class ArkAPLauncher(tk.Tk):
         if not self._save_profiles():
             self._profiles[name] = removed  # roll back
             return
-        if is_autosave_profile(name):
-            # Forget what was last autosaved, so the next tick writes a fresh snapshot
-            # instead of deciding "nothing changed" and leaving the slot gone.
-            self._autosave_last_values = None
+        # Deleting the autosave slot needs no extra bookkeeping: the next tick compares
+        # against the slot itself, which is now gone, so it writes a fresh snapshot.
         if self._loaded_profile_name == name:
             self._set_active_profile(None)
             self._loaded_profile_values = None
             self._loaded_profile_notes = None
+            self._loaded_profile_extras = None
         self._refresh_profile_list()
         self._update_profile_status()
         self._log("Deleted profile \"%s\"." % name)
@@ -10867,7 +14374,10 @@ class ArkAPLauncher(tk.Tk):
             self._log("Auto-detect found SERVER_ROOT: %s" % found)
             self.set("SERVER_ROOT", found)
             self._set_scan_status("Found: %s - scanning for the rest..." % found)
-            self._scoped_scan(level=level or SCAN_QUICK)
+            # level is set ONLY by the "Scan for paths" button (see above), so it doubles
+            # as "the user asked for this" - the first-launch auto-kick leaves it None and
+            # so counts as automatic.
+            self._scoped_scan(level=level or SCAN_QUICK, manual=level is not None)
             if (level or SCAN_QUICK) == SCAN_QUICK:
                 # Quick runs to completion synchronously inside _scoped_scan above, so
                 # the busy state _start_auto_detect turned on needs clearing here.
@@ -10883,7 +14393,12 @@ class ArkAPLauncher(tk.Tk):
     # ------------------------------ SERVER_ROOT-scoped scan ("Scan for paths") - #
     def _on_server_root_focus_out(self, _event=None):
         root = self.get("SERVER_ROOT")
-        if not root or root == self._last_scoped_scan_root:
+        # Normalized both sides: _scoped_scan stores the normpath'd root, so comparing
+        # the raw field text against it let a value that merely LOOKS different
+        # ("E:\ARK\Server\", forward slashes) re-run the scan on every focus change.
+        # Clicking a notebook tab moves focus out of this Entry, which is how an
+        # automatic scan ended up firing on tab switches.
+        if not root or os.path.normpath(root) == self._last_scoped_scan_root:
             return
         # Leaving the field always runs Quick, whatever intensity is selected: a
         # focus change must never silently kick off a minute-long walk. The
@@ -10902,10 +14417,10 @@ class ArkAPLauncher(tk.Tk):
                                      and self._detect_thread.is_alive()):
             self._log("Scan for paths: a scan is already running.")
             return
-        level = self.scan_level_var.get()
+        level = self._current_scan_level()
         root = self.get("SERVER_ROOT")
         if root and os.path.isfile(os.path.join(os.path.normpath(root), ARK_EXE_RELPATH)):
-            self._scoped_scan(level=level, force=True)
+            self._scoped_scan(level=level, manual=True)
             return
         self._log("Scan for paths: SERVER_ROOT isn't set (or doesn't look right yet) - "
                   "looking for the ARK server install first...")
@@ -10915,15 +14430,22 @@ class ArkAPLauncher(tk.Tk):
     def _scan_running(self):
         return self._scan_thread is not None and self._scan_thread.is_alive()
 
-    def _scoped_scan(self, level=None, force=False):
+    def _scoped_scan(self, level=None, manual=False):
         """Given SERVER_ROOT, fill in PLUGINS_DIR / ipc_dir / game_ini and suggest the
         cluster folders, at the requested intensity (see SCAN_LEVELS).
+
+        `manual` = the user clicked "Scan for paths" (as opposed to this running off a
+        focus-out or a finished install). Carried on the instance rather than passed
+        down because the Thorough/Exhaustive path reaches _on_scan_done via a worker
+        thread and a queue poll, so there's no call chain to thread it through. It only
+        decides how the popup treats already-filled fields - see _suggest_paths.
 
         Quick only stats fixed sub-paths plus one single-level listing, so it runs
         inline on the UI thread as before. Thorough/Exhaustive add a bounded recursive
         walk and always run on a worker thread with the spinner showing, so the GUI
         never blocks - results are applied back on the UI thread in _on_scan_done."""
         level = level or SCAN_LEVEL_DEFAULT
+        self._scan_manual = manual
         if self._scan_running():
             self._log("Scan for paths: a scan is already running.")
             return
@@ -11041,6 +14563,9 @@ class ArkAPLauncher(tk.Tk):
                 continue
             self.set(key, value)
             filled.append(key)
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._reveal_group_for_widget(entry)
 
         if filled:
             self._log("Scan for paths: filled in %s from SERVER_ROOT." % ", ".join(filled))
@@ -11070,10 +14595,12 @@ class ArkAPLauncher(tk.Tk):
                       % (stopped, result.get("visited", 0)))
 
         # Cluster folders are name-matched guesses wherever they were found, so they're
-        # always offered rather than applied - regardless of whether the field already
-        # has a value, so re-scanning can surface a better/different candidate instead
-        # of silently assuming the existing value is fine (_suggest_paths itself drops
-        # a field whose only candidate already matches what's set).
+        # always offered rather than applied. On a scan the user asked for that's true
+        # regardless of whether the field already has a value, so re-scanning can surface
+        # a better/different candidate instead of silently assuming the existing value is
+        # fine (_suggest_paths itself drops a field whose only candidate already matches
+        # what's set). On an automatic scan only empty fields are offered - see
+        # _suggest_paths' only_empty.
         suggestions.update((k, v) for k, v in (result.get("suggestions") or {}).items() if v)
         summary_bits = []
         if filled:
@@ -11085,7 +14612,7 @@ class ArkAPLauncher(tk.Tk):
             " - nothing new found"))
 
         if suggestions:
-            self._suggest_paths(suggestions)
+            self._suggest_paths(suggestions, only_empty=not self._scan_manual)
         elif level != SCAN_QUICK:
             self._log("Scan for paths (%s): visited %d folders."
                       % (level, result.get("visited", 0)))
@@ -11098,10 +14625,11 @@ class ArkAPLauncher(tk.Tk):
         ServerCluster-style parent CLUSTERDIR itself is a sibling of) for SAVESROOT
         (a sibling matching 'saves') and BACKUPROOT (a sibling matching 'backups').
         Folder-name matching is a guess here too, so these are always surfaced as
-        suggestions to confirm - never silently filled in, and offered even if the
-        field already has a value (_suggest_paths drops a field whose only candidate
-        already matches what's set, so this only prompts on an actual conflict).
-        BACKUPROOT especially may not exist yet (some setups only create it on the
+        suggestions to confirm - never silently filled in. Nothing here is ever
+        user-initiated (it runs off CLUSTERDIR changing, not off a button), so it only
+        offers fields that are still EMPTY - a SAVESROOT/BACKUPROOT the user already set
+        is a decision, and second-guessing it on every focus change is what made this
+        popup fire unprompted. BACKUPROOT especially may not exist yet (some setups only create it on the
         first backup), so when no matching sibling is found we still offer the
         expected sibling path as an unconfirmed placeholder rather than treating that
         as an error - and when NEITHER exists, the popup says so and points at the
@@ -11167,7 +14695,7 @@ class ArkAPLauncher(tk.Tk):
             self._log("CLUSTERDIR: no Saves/Backups sibling folders next to %s - use "
                       "\"Create %s folders\" to create them."
                       % (cluster_dir, CLUSTER_ROOT_DIRNAME))
-        self._suggest_paths(suggestions, note=note)
+        self._suggest_paths(suggestions, note=note, only_empty=True)
 
     # Every field the scan can suggest a folder for. Fixed order so the popup is
     # consistent regardless of which caller (SERVER_ROOT scan vs. CLUSTERDIR focus-out)
@@ -11175,26 +14703,29 @@ class ArkAPLauncher(tk.Tk):
     _SUGGESTABLE_KEYS = ("PLUGINS_DIR", "ipc_dir", "game_ini",
                          "CLUSTERDIR", "SAVESROOT", "BACKUPROOT")
 
-    def _suggest_paths(self, suggestions, note=None):
+    def _suggest_paths(self, suggestions, note=None, only_empty=False):
         """One dialog offering every name-matched folder the scan turned up, grouped by
         the field it would fill. Suggestions are never applied without a click, since
         folder-name matching is a guess. A path that doesn't exist yet is offered as a
         greyed-out example (it's a suggested location, not a found folder).
 
-        Shown regardless of whether a field already has a value - re-scanning is often
-        deliberate, to review or correct an earlier choice - but a field is skipped if
-        every candidate found for it is just the value it already has, since there's
-        nothing to compare there. When the field's current value isn't among the
-        candidates, it's still shown (tagged "(set)") so the user can compare it
-        against the alternatives rather than only seeing the alternatives."""
-        sections = suggestion_sections(self._SUGGESTABLE_KEYS, suggestions, self.get)
+        For a scan the user asked for (only_empty=False), shown regardless of whether a
+        field already has a value - re-scanning is often deliberate, to review or
+        correct an earlier choice - but a field is skipped if every candidate found for
+        it is just the value it already has, since there's nothing to compare there.
+        When the field's current value isn't among the candidates, it's still shown
+        (tagged "(set)") so the user can compare it against the alternatives rather than
+        only seeing the alternatives.
+
+        For a scan the user did NOT ask for (only_empty=True - focus-out, post-install),
+        only empty fields are offered, so an automatic scan can never interrupt with
+        alternatives to a value that's already been chosen."""
+        sections = suggestion_sections(self._SUGGESTABLE_KEYS, suggestions, self.get,
+                                       only_empty=only_empty)
         if not sections:
             return
 
-        win = tk.Toplevel(self)
-        win.title("Folder suggestions")
-        win.resizable(False, False)
-        win.transient(self)
+        win = self._themed_toplevel("Folder suggestions")
         ttk.Label(win, padding=10, wraplength=520, justify="left",
                   text="The scan found folder(s) that look like they could go in these "
                        "fields. Pick one to use it, or close this to leave a field as it "
@@ -11271,6 +14802,12 @@ class ArkAPLauncher(tk.Tk):
 
     def _pick_suggested_path(self, key, path, button):
         self.set(key, path)
+        # getattr, not self._entries directly: this runs against the real app, but
+        # also (see test_suggestion_popup_scroll.py) against a minimal stand-in host
+        # that only implements get/set/_log - it has no _entries to reveal a group in.
+        entry = getattr(self, "_entries", {}).get(key)
+        if entry is not None:
+            self._reveal_group_for_widget(entry)
         self._log("%s set from suggestion: %s" % (key, path))
         # Once picked it's a real configured value, not an example - undim it.
         button.configure(text="%s  (set)" % path, state="disabled", style="TButton")
@@ -11531,7 +15068,8 @@ class ArkAPLauncher(tk.Tk):
                 self.set("SERVER_ROOT", server_root)
                 self._ensure_cluster_dirs(server_root)
                 self._scoped_scan(level=SCAN_QUICK)
-            messagebox.showinfo("ARKIpelago Launcher", "ARK server install/update complete.")
+            self._info_once(PROMPT_SERVER_INSTALL_DONE, "ARKIpelago Launcher",
+                            "ARK server install/update complete.")
         elif not self._install_cancelled:
             messagebox.showerror("ARKIpelago Launcher",
                                   "ARK server install failed. See the log for details.")
@@ -11578,8 +15116,8 @@ class ArkAPLauncher(tk.Tk):
                 "write to (Browse next to each field), then try again."
                 % "\n".join("%s -> %s" % f for f in failed))
             return
-        messagebox.showinfo(
-            "ARKIpelago Launcher",
+        self._info_once(
+            PROMPT_CLUSTER_FOLDERS, "ARKIpelago Launcher",
             "Cluster folders ready:\n\n%s\n\nThe Configuration fields now point at "
             "them - press Save so the .bat scripts pick them up."
             % "\n".join(created + existing))
@@ -11619,6 +15157,9 @@ class ArkAPLauncher(tk.Tk):
             if self.get(key) != path:
                 self.set(key, path)
                 filled.append(key)
+                entry = self._entries.get(key)
+                if entry is not None:
+                    self._reveal_group_for_widget(entry)
         self._refresh_setup_status()
         return created, existing, failed, filled
 
@@ -11723,11 +15264,20 @@ class ArkAPLauncher(tk.Tk):
         return downloaded
 
     def _extract_zip_to(self, zip_path, dest_dir, q):
-        os.makedirs(dest_dir, exist_ok=True)
+        """Extract into dest_dir and return the zip's entry names - the only record of
+        what an install actually wrote there (see ARKAPI_INSTALLED_FILES_KEY).
+
+        The one extract path for ArkServerApi, the ArkAP plugin, PopTracker and the
+        tracker pack, so ext_path here covers all four: a pack's own asset tree is nested
+        several levels deep and the destinations are user-chosen folders of any length.
+        zipfile builds each member's path by joining onto this one, so the prefix carries
+        down to every entry."""
+        os.makedirs(ext_path(dest_dir), exist_ok=True)
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
             q.put(("line", "Extracting %d entries into %s..." % (len(names), dest_dir)))
-            zf.extractall(dest_dir)
+            zf.extractall(ext_path(dest_dir))
+        return names
 
     def _arkapi_worker(self, win64):
         q = self._arkapi_queue
@@ -11751,7 +15301,7 @@ class ArkAPLauncher(tk.Tk):
             return
 
         try:
-            self._extract_zip_to(zip_path, win64, q)
+            extracted = self._extract_zip_to(zip_path, win64, q)
         except (OSError, zipfile.BadZipFile) as exc:
             q.put(("line", "! Extraction failed: %s" % exc))
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -11765,8 +15315,11 @@ class ArkAPLauncher(tk.Tk):
         if success:
             q.put(("line",
                    "ArkServerApi installed - found version.dll and ArkApi\\ in Win64\\."))
-            # Record what we just installed so Setup Status can later flag a newer release.
+            # Record what we just installed so Setup Status can later flag a newer release,
+            # and WHAT it put in Win64 so the troubleshooting teardown can remove exactly
+            # that (and nothing of Steam's) - see arkapi_teardown_targets.
             q.put(("version", tag))
+            q.put(("files", sorted(set(_manifest_top_names(extracted)))))
         else:
             q.put(("line", "! Extraction finished but version.dll / ArkApi\\ were not found "
                             "in:\n%s" % win64))
@@ -11825,6 +15378,9 @@ class ArkAPLauncher(tk.Tk):
                 elif kind == "version":
                     self._write_config_key(ARKAPI_INSTALLED_VERSION_KEY, payload,
                                            "installed ArkApi version")
+                elif kind == "files":
+                    self._write_config_key(ARKAPI_INSTALLED_FILES_KEY, payload,
+                                           "installed ArkApi file list")
                 elif kind == "progress":
                     try:
                         self.install_progress["value"] = payload
@@ -11845,8 +15401,8 @@ class ArkAPLauncher(tk.Tk):
         self.install_progress.stop()
         if success:
             self.install_status_var.set("Done")
-            messagebox.showinfo(
-                "ARKIpelago Launcher",
+            self._info_once(
+                PROMPT_ARKAPI_INSTALL_DONE, "ARKIpelago Launcher",
                 "ArkServerApi installed - version.dll and ArkApi\\ found in Win64\\.")
         else:
             self.install_status_var.set("Failed")
@@ -11964,7 +15520,7 @@ class ArkAPLauncher(tk.Tk):
         try:
             best, version_str = _pick_best_release(self._fetch_release_list(), APP_VERSION)
         except (OSError, ValueError) as exc:
-            errors.append(str(exc))
+            errors.append(update_error_text(exc))
         else:
             out["launcher"] = {
                 "label": UPDATE_COMPONENT_LABELS["launcher"],
@@ -11995,7 +15551,7 @@ class ArkAPLauncher(tk.Tk):
             releases = _fetch_arkap_release_list()
         except (OSError, ValueError) as exc:
             releases = []
-            errors.append(str(exc))
+            errors.append(update_error_text(exc))
         # Needs the release list: both detections identify the installed file by matching it
         # against the published assets (see apworld_version_from_disk).
         detected = self._detect_component_versions(cfg, releases) if releases else {}
@@ -12023,7 +15579,7 @@ class ArkAPLauncher(tk.Tk):
             rel = _fetch_newest_release(TRACKER_PACK_RELEASES_API)
         except (OSError, ValueError) as exc:
             rel = None
-            errors.append(str(exc))
+            errors.append(update_error_text(exc))
         if rel:
             packs = poptracker_packs_dir(cfg.get(POPTRACKER_DIR_KEY))
             pack_path, detected_version = installed_tracker_pack(packs) if packs else ("", "")
@@ -12261,10 +15817,7 @@ class ArkAPLauncher(tk.Tk):
         determined - "not detected" / "not installed" said out loud beats a component
         silently missing from the list, since a missing row is indistinguishable from "this
         launcher has no such feature" and leaves the user nothing to act on."""
-        win = tk.Toplevel(self)
-        win.title("Update available")
-        win.resizable(False, False)
-        win.transient(self)
+        win = self._themed_toplevel("Update available")
         win.grab_set()
 
         frame = ttk.Frame(win, padding=14)
@@ -12375,10 +15928,7 @@ class ArkAPLauncher(tk.Tk):
         self._start_update_download(data, asset, tag)
 
     def _start_update_download(self, data, asset, tag):
-        win = tk.Toplevel(self)
-        win.title("Updating...")
-        win.resizable(False, False)
-        win.transient(self)
+        win = self._themed_toplevel("Updating...")
         win.protocol("WM_DELETE_WINDOW", lambda: None)
         win.grab_set()
         self._update_progress_win = win
@@ -12641,8 +16191,12 @@ class ArkAPLauncher(tk.Tk):
         tag = lines[1].strip() if len(lines) > 1 else ""
         detail = lines[2].strip() if len(lines) > 2 else ""
         if status == "OK":
-            messagebox.showinfo("ARKIpelago Launcher",
-                                 "Update to %s complete." % (tag or "the latest version"))
+            # detail is empty for an ordinary update; it carries the "the exe was renamed,
+            # remake your shortcut" note when the helper changed the filename.
+            messagebox.showinfo(
+                "ARKIpelago Launcher",
+                "Update to %s complete.%s" % (tag or "the latest version",
+                                              ("\n\n" + detail) if detail else ""))
         elif status == "FAIL":
             messagebox.showerror(
                 "ARKIpelago Launcher",
@@ -12662,9 +16216,19 @@ class ArkAPLauncher(tk.Tk):
         longer creates them, so they stop accumulating on their own.)"""
         b = base_dir()
         self._rmtree_quiet(os.path.join(b, UPDATE_STAGING_DIRNAME))
-        self._rmtree_quiet(os.path.join(b, UPDATE_INTERNAL_DIRNAME + ".old"))
-        for name in (UPDATE_ZIP_TMPNAME, UPDATE_HELPER_SCRIPT,
-                     os.path.basename(sys.executable) + ".old"):
+        # .old, .old2, .old3... - the helper now picks whichever is free rather than one
+        # fixed name (see _PS_UPDATE_TEMPLATE), so this can't look for one fixed name
+        # either. A backup that was undeletable at update time is usually free by now.
+        # Any *.exe.old*, not just this exe's name: an update that RENAMES the exe leaves
+        # its backup under the OLD name, which the running process no longer knows.
+        for pattern in (glob.escape(os.path.join(b, UPDATE_INTERNAL_DIRNAME)) + ".old*",
+                        os.path.join(glob.escape(b), "*.exe.old*")):
+            for path in glob.glob(pattern):
+                if os.path.isdir(path):
+                    self._rmtree_quiet(path)
+                else:
+                    self._cleanup_failed_download(path)
+        for name in (UPDATE_ZIP_TMPNAME, UPDATE_HELPER_SCRIPT):
             self._cleanup_failed_download(os.path.join(b, name))
 
     # -------------------------------------------- ArkAP plugin install ----- #
@@ -12801,8 +16365,8 @@ class ArkAPLauncher(tk.Tk):
                 "file(s) to:\n%s"
                 % (payload["errors"], payload["copied"], payload["dst_arkap"]))
         else:
-            messagebox.showinfo(
-                "Install Plugin",
+            self._info_once(
+                PROMPT_PLUGIN_INSTALLED, "Install Plugin",
                 "ArkAP plugin installed (%d file(s)) to:\n\n%s\n\nRestart (or start) the "
                 "ARK dedicated server, then run the connector."
                 % (payload["copied"], payload["dst_arkap"]))
@@ -12812,14 +16376,21 @@ class ArkAPLauncher(tk.Tk):
         never deletes ipc/tracking files already there). Preserves an existing
         ArkAP.config.json at the destination root. Returns (copied, skipped, errors)."""
         copied, skipped, errors = [], [], []
-        keep_config = os.path.isfile(os.path.join(dst_arkap, PLUGIN_PRESERVE_ON_UPGRADE))
-        for dirpath, _dirnames, filenames in os.walk(src_arkap):
-            rel = os.path.relpath(dirpath, src_arkap)
-            dst_dir = dst_arkap if rel == "." else os.path.join(dst_arkap, rel)
+        # Both ends prefixed for the same reason as the mod copy - the destination is
+        # SERVER_ROOT\ShooterGame\Binaries\Win64\Plugins\ArkAP\, already ~55 characters
+        # past a SERVER_ROOT the user chose, and the source is a temp folder with a
+        # random suffix. Walking the prefixed source carries the prefix into every
+        # dirpath, so relpath/join below stay consistent without prefixing each file.
+        src_x, dst_x = ext_path(src_arkap), ext_path(dst_arkap)
+        keep_config = os.path.isfile(os.path.join(dst_x, PLUGIN_PRESERVE_ON_UPGRADE))
+        for dirpath, _dirnames, filenames in os.walk(src_x):
+            rel = os.path.relpath(dirpath, src_x)
+            dst_dir = dst_x if rel == "." else os.path.join(dst_x, rel)
             try:
                 os.makedirs(dst_dir, exist_ok=True)
             except OSError as exc:
-                errors.append("%s: %s" % (dst_dir, exc))
+                errors.append("%s: %s%s" % (plain_path(dst_dir), exc,
+                                            _long_path_hint(exc, plain_path(dst_dir))))
                 continue
             for fn in filenames:
                 if (keep_config and rel == "."
@@ -12830,9 +16401,10 @@ class ArkAPLauncher(tk.Tk):
                 d = os.path.join(dst_dir, fn)
                 try:
                     shutil.copyfile(s, d)
-                    copied.append(os.path.relpath(d, dst_arkap))
+                    copied.append(os.path.relpath(d, dst_x))
                 except OSError as exc:
-                    errors.append("%s: %s" % (d, exc))
+                    errors.append("%s: %s%s" % (plain_path(d), exc,
+                                                _long_path_hint(exc, plain_path(d))))
         return copied, skipped, errors
 
     def on_install_plugin(self):
@@ -12954,17 +16526,26 @@ class ArkAPLauncher(tk.Tk):
         cfg = self._server_config_dir()
         return os.path.join(cfg, "Game.ini") if cfg else ""
 
-    def _backup_file(self, path, ts):
+    def _backup_file(self, path, ts, keep=None):
         """Copy path to <path>.<ts>.bak (dupe-suffixed on a same-second collision) and
-        return the backup path. Raises OSError on failure. Same timestamped-.bak pattern
-        the config upload uses; shared by the Game.ini patch and the reset's Game.ini
-        cleanup so both back up identically before writing."""
+        return the backup path. Raises OSError on failure. Shared by the config
+        upload, the Game.ini patch, the reset's Game.ini cleanup and the .apworld
+        update, so all back up identically. Prunes older backups of this same file
+        down to `keep` (default: the "Backups to keep" setting) afterward - see
+        prune_backups. `keep` uses no instance state, so it can be passed explicitly
+        to call this unbound with self=None, same as _backup_and_clear_dir."""
         backup = "%s.%s.bak" % (path, ts)
         dupe = 2
         while os.path.exists(backup):
             backup = "%s.%s-%d.bak" % (path, ts, dupe)
             dupe += 1
         shutil.copy2(path, backup)
+        if keep is None:
+            keep = self._backup_retention_count()
+        pattern = re.compile(r"^%s\.%s\.bak$"
+                             % (re.escape(os.path.basename(path)), BACKUP_TS_RE))
+        _removed, failed = prune_backups(os.path.dirname(path) or ".", pattern, keep)
+        _log_prune_failures(failed)
         return backup
 
     def patch_game_ini_for_randomized_dinos(self):
@@ -13125,9 +16706,12 @@ class ArkAPLauncher(tk.Tk):
             self._log("! Patch Game.ini: backup failed (%s) - Game.ini not modified." % exc)
             return
 
-        # 5) Write the patched version.
+        # 5) Write the patched version. remove_unmarked replaces a hand-pasted wall with
+        #    our own, which can legitimately be a lot smaller, so the size guard is off
+        #    for that case only.
         try:
-            write_text(game_ini, new_text, encoding=enc)
+            write_ini_guarded(game_ini, new_text, encoding=enc,
+                              expect_shrink=remove_unmarked)
         except OSError as exc:
             messagebox.showerror(
                 "ARKIpelago Launcher",
@@ -13142,8 +16726,8 @@ class ArkAPLauncher(tk.Tk):
                   % (game_ini, n, GAME_INI_FRAGMENT_KEY,
                      "merged into existing section" if merged
                      else "added in a new section at the top", cleaned_note))
-        messagebox.showinfo(
-            "ARKIpelago Launcher",
+        self._info_once(
+            PROMPT_GAME_INI_PATCHED, "ARKIpelago Launcher",
             "Patched Game.ini with %d %s= line(s) (%s).%s\n\nBackup of the previous "
             "version:\n%s\n\nRestart the ARK server for the randomized creatures to take "
             "effect." % (n, GAME_INI_FRAGMENT_KEY, where, cleaned_note, backup))
@@ -13251,13 +16835,17 @@ class ArkAPLauncher(tk.Tk):
             widget.tag_add("debug_log_hl", pos, end)
             idx = end
 
-    def _reset_preflight(self, action_label):
-        """Shared safety gate for both reset buttons. Returns True if safe to proceed.
+    def _reset_preflight(self, action_label, connector_matters=True):
+        """Shared safety gate for every reset button. Returns True if safe to proceed.
 
-        Refuses outright while ShooterGameServer.exe runs (ARK rewrites its save on
-        shutdown and would undo the reset). Warns - but allows proceeding after an
-        explicit confirm - if the connector runs, since it holds the ipc files open and
-        rewrites session.json on its next poll."""
+        Refuses outright while ShooterGameServer.exe runs (ARK rewrites its save AND its
+        config files on shutdown, so it would undo the reset). Warns - but allows
+        proceeding after an explicit confirm - if the connector runs, since it holds the
+        ipc files open and rewrites session.json on its next poll.
+
+        connector_matters=False skips that second half for the resets that don't touch
+        ipc at all (server config, ArkApi teardown) - the warning's reasoning is about
+        session.json, and showing it where it doesn't apply is just noise."""
         if is_process_running(ARK_SERVER_PROCESS):
             messagebox.showerror(
                 "ARKIpelago Launcher",
@@ -13266,7 +16854,7 @@ class ArkAPLauncher(tk.Tk):
                 "(%s aborted.)" % (ARK_SERVER_PROCESS, action_label))
             self._log("%s: aborted - %s is running." % (action_label, ARK_SERVER_PROCESS))
             return False
-        if is_process_running(CONNECTOR_PROCESS):
+        if connector_matters and is_process_running(CONNECTOR_PROCESS):
             if not messagebox.askyesno(
                     "ARKIpelago Launcher",
                     "%s (the ArkConnector) appears to be running.\n\nIt holds the ipc "
@@ -13318,25 +16906,40 @@ class ArkAPLauncher(tk.Tk):
 
         # VERIFY, the same way the world-save half verifies itself: re-scan the folder
         # and fail loudly on anything that isn't installed payload. Both reset buttons
-        # route through here, so both get the check. A hit is either AP state whose
-        # filename nobody added above (the ap_connections.json class of bug - it must be
-        # added to AP_RESET_PLUGIN_FILES / AP_RESET_IPC_FILES), or a file the user put
-        # there themselves; either way the reset is not clean and must not claim it is.
+        # route through here, so both get the check. A hit is one of three things and the
+        # message has to name all of them, because the answer is NOT always "add it to a
+        # delete list": it can be AP state nobody listed (the ap_connections.json class of
+        # bug), a data file a newer plugin release now SHIPS (explore_areas.json/maps.json
+        # arrived this way - deleting those breaks the plugin), or a file the user put
+        # there. Flagging rather than deleting is deliberate for exactly that reason: an
+        # unknown file is more likely to be new payload than new state, and a wrong guess
+        # here is unrecoverable. Either way the reset is not clean and must not claim it is.
         for path in find_ap_leftovers(plugin_dir):
-            errors.append("%s: still present after reset - not installed plugin payload, "
-                          "so it is leftover AP state (add it to AP_RESET_PLUGIN_FILES / "
-                          "AP_RESET_IPC_FILES)" % path)
+            errors.append("%s: still present after reset - not installed plugin payload. "
+                          "If the plugin WRITES it, add it to AP_RESET_PLUGIN_FILES / "
+                          "AP_RESET_IPC_FILES; if the plugin SHIPS it, add it to "
+                          "AP_PLUGIN_PAYLOAD_FILES instead" % path)
         return deleted, missing, errors
 
-    def _backup_and_clear_dir(self, path, ts):
+    def _backup_and_clear_dir(self, path, ts, keep=None, preserve=()):
         """Move path to <path>_backup_<ts> and recreate it empty (mirrors
         reset_ark_test.bat: the save is MOVED to a timestamped backup, not deleted),
         then VERIFY: count what was inside before the move and re-count inside the
-        backup after it.
+        backup after it. Also prunes older backups of this same source down to `keep`
+        (default: the "Backups to keep" setting) - see prune_backups. `keep` uses no
+        instance state, so - like the rest of this method - it can be passed
+        explicitly to call this unbound with self=None.
 
         A folder that holds NO files is left in place and NO backup folder is created -
         an empty timestamped backup next to a "backed up!" line is worse than saying
         nothing was there, and the folder is already free of save data anyway.
+
+        `preserve` is other configured paths that must survive. Any of them living
+        INSIDE path switches this to a selective backup: the backup folder is created
+        and path's contents are moved into it one top-level entry at a time, skipping
+        the entries that hold a preserved path. Without that, backing up a CLUSTERDIR
+        that is the parent of SAVESROOT/BACKUPROOT moved all three aside at once and the
+        user had to recreate their cluster folders (see path_is_within).
 
         Returns a dict:
           kind   - 'moved' (files arrived), 'empty' (folder existed but held NO
@@ -13349,7 +16952,24 @@ class ArkAPLauncher(tk.Tk):
           detail - human-readable extra for 'error'"""
         path = os.path.normpath(path)
         if os.path.isdir(path):
-            files_before, _bytes_before, _saves_before = count_dir_files(path)
+            # Top-level entries holding something the caller must keep. Note it's the
+            # ENTRY that stays, not just the preserved path: SAVESROOT may be several
+            # levels down, and moving its grandparent moves it too.
+            try:
+                entries = list(os.scandir(path))
+            except OSError as exc:
+                return {"kind": "error", "path": path, "backup": None,
+                        "files": 0, "bytes": 0, "saves": 0, "detail": str(exc)}
+            stay = [e.path for e in entries
+                    if any(path_is_within(p, e.path) for p in preserve)]
+            if stay:
+                # Selective mode only. A snapshot an earlier target in this same reset
+                # left here (a nested SAVESROOT leaves Saves_backup_<ts> inside
+                # CLUSTERDIR) is already moved aside - burying it inside this backup
+                # would hide it from its own retention pruning.
+                stay += [e.path for e in entries
+                         if re.search(r"_backup_\d", e.name) and e.path not in stay]
+            files_before, _bytes_before, _saves_before = count_dir_files(path, skip=stay)
             # Nothing to back up: don't move it (that would create an empty _backup_
             # folder). The folder is already save-free, so leave it exactly where it is.
             if files_before == 0:
@@ -13365,10 +16985,30 @@ class ArkAPLauncher(tk.Tk):
                 backup = "%s_backup_%s-%d" % (path, ts, n)
                 n += 1
             try:
-                shutil.move(path, backup)
+                if stay:
+                    os.makedirs(backup)
+                    for entry in entries:
+                        if entry.path in stay:
+                            continue
+                        shutil.move(entry.path, os.path.join(backup, entry.name))
+                else:
+                    shutil.move(path, backup)
             except OSError as exc:
-                return {"kind": "error", "path": path, "backup": None,
+                # The whole-folder move is atomic - nothing moved, so there is no backup
+                # to point at. The selective one is not: name the half-filled backup so
+                # the user can find whatever DID move.
+                return {"kind": "error", "path": path,
+                        "backup": backup if os.path.isdir(backup) else None,
                         "files": 0, "bytes": 0, "saves": 0, "detail": str(exc)}
+            # Prune older backups of this same source down to "Backups to keep" - the
+            # backup dir now exists on disk regardless of the verification below, so
+            # this happens unconditionally rather than only on a clean "moved" result.
+            if keep is None:
+                keep = self._backup_retention_count()
+            pattern = re.compile(r"^%s_backup_%s$"
+                                 % (re.escape(os.path.basename(path)), BACKUP_TS_RE))
+            _removed, failed = prune_backups(os.path.dirname(path) or ".", pattern, keep)
+            _log_prune_failures(failed)
             files_after, bytes_after, saves_after = count_dir_files(backup)
             try:
                 os.makedirs(path, exist_ok=True)
@@ -13448,6 +17088,19 @@ class ArkAPLauncher(tk.Tk):
         if cluster and os.path.isdir(os.path.normpath(cluster)):
             save_targets.append(("Cluster tribute data", os.path.normpath(cluster)))
 
+        # Every configured cluster path, whether or not this reset backs it up: they are
+        # three independent settings and users really do nest them (CLUSTERDIR as the
+        # parent of SAVESROOT and BACKUPROOT), so each backup below has to know which of
+        # the others sit inside its target and leave those alone.
+        # A field still holding the shipped example is template residue, not a location:
+        # creating it would put folders at C:\ARKServer, nowhere near the real server
+        # (see is_unconfigured_example_path / create_cluster_folders).
+        cluster_paths = [(key, os.path.normpath(self.get(key)))
+                         for key, _sub in CLUSTER_PATH_SUBDIRS
+                         if self.get(key)
+                         and not is_unconfigured_example_path(key, self.get(key))]
+        preserve = [p for _key, p in cluster_paths]
+
         if not self._reset_preflight("Full reset for new seed"):
             return
 
@@ -13484,9 +17137,12 @@ class ArkAPLauncher(tk.Tk):
         ts = time.strftime("%Y%m%d-%H%M%S")
         save_lines = []
         moved_saves = 0
+        backed_up_any = False  # did ANY target actually hold files to move?
 
         def _record(label, r):
+            nonlocal backed_up_any
             if r["kind"] == "moved":
+                backed_up_any = True
                 save_lines.append(
                     "%s: backed up %d file(s), %s (%d world/character file(s)) -> %s"
                     % (label, r["files"], fmt_bytes(r["bytes"]), r["saves"], r["backup"]))
@@ -13504,7 +17160,8 @@ class ArkAPLauncher(tk.Tk):
             return 0
 
         for label, path in save_targets:
-            moved_saves += _record(label, self._backup_and_clear_dir(path, ts))
+            moved_saves += _record(label, self._backup_and_clear_dir(
+                path, ts, preserve=preserve))
 
         # 3) Every ShooterGame\Saved\Cluster-<Map> entry, handled EXPLICITLY rather than
         #    trusting the SAVESROOT move above to have reached it - a character surviving a
@@ -13542,21 +17199,45 @@ class ArkAPLauncher(tk.Tk):
                         "(%s). ARK cannot save through it." % (name, target, exc))
                     errors.append("%s: dangling junction (%s)" % (jpath, exc))
 
+        # 3b) The layout has to be intact when the reset finishes, whatever shape it is:
+        # all three cluster folders present and every junction resolving. The moves above
+        # can disturb folders they never targeted (a nested SAVESROOT/BACKUPROOT), and
+        # step 3 only ever recreated per-map junction targets - so a missing BACKUPROOT
+        # went unnoticed until the server wouldn't start. Missing => an error, not a note.
+        repair_lines, repair_errors = repair_cluster_layout(cluster_paths, saved_root)
+        save_lines += repair_lines
+        errors += repair_errors
+
         # 4) The actual point of the reset: no world/character file may survive at
         # any live location. saved_root covers SavedArks AND every Cluster-<Map>
         # junction exactly as ARK will read them; the save_targets cover the real
-        # per-map folders even where a junction is missing.
-        leftovers = find_save_files([saved_root] + [p for _lbl, p in save_targets])
+        # per-map folders even where a junction is missing. BACKUPROOT is skipped: old
+        # saves living there is the point of a backup folder, not a failed reset (it's
+        # only in range at all when nested inside CLUSTERDIR).
+        leftovers = find_save_files([saved_root] + [p for _lbl, p in save_targets],
+                                    skip=[p for k, p in cluster_paths
+                                          if k == "BACKUPROOT"])
         for path in leftovers:
             save_lines.append("! STILL PRESENT after reset: %s" % path)
             errors.append("%s: still present after reset" % path)
 
+        # "Nothing to back up" is a NORMAL outcome (a world that was already reset), not a
+        # problem: no backup folder gets created because there was nothing to put in one.
+        # Only the case where files DID exist but none of them were world/character files
+        # is worth a warning - that's a reset that ran against the wrong location.
+        # (A backup that was created but arrived empty is a separate, real failure - see
+        # _backup_and_clear_dir, which returns 'error' for it.)
         if not errors and moved_saves == 0:
-            save_lines.append(
-                "! No world save or character file was found in ANY location this "
-                "reset covers - there was nothing to reset. If you expected a "
-                "character to be wiped, it lives somewhere else: run "
-                "tools\\diagnose_reset.bat before starting the server.")
+            if backed_up_any:
+                save_lines.append(
+                    "! No world save or character file was found in ANY location this "
+                    "reset covers - there was nothing to reset. If you expected a "
+                    "character to be wiped, it lives somewhere else: run "
+                    "tools\\diagnose_reset.bat before starting the server.")
+            else:
+                save_lines.append(
+                    "Nothing to back up: every save location this reset covers was "
+                    "already empty, so no backup folders were created.")
 
         # 5) Randomized-creatures block in Game.ini: a fresh seed shouldn't inherit the
         #    previous seed's dino randomization, so strip the app's marker block if one is
@@ -13578,7 +17259,9 @@ class ArkAPLauncher(tk.Tk):
                 else:
                     try:
                         gi_backup = self._backup_file(game_ini, ts)
-                        write_text(game_ini, cleaned, encoding=gi_enc)
+                        # Stripping a randomization wall is meant to shrink the file.
+                        write_ini_guarded(game_ini, cleaned, encoding=gi_enc,
+                                          expect_shrink=True)
                         save_lines.append(
                             "Game.ini: randomized-creatures fragment removed (backup: %s)"
                             % os.path.basename(gi_backup))
@@ -13592,7 +17275,7 @@ class ArkAPLauncher(tk.Tk):
         self._report_reset("Full reset for new seed",
                            plugin_dir or "(plugin not installed)",
                            deleted, missing, errors, extra_lines=save_lines,
-                           nothing_found=(moved_saves == 0))
+                           nothing_found=(moved_saves == 0 and backed_up_any))
 
     def _report_reset(self, label, plugin_dir, deleted, missing, errors,
                       extra_lines=None, nothing_found=False):
@@ -13600,9 +17283,11 @@ class ArkAPLauncher(tk.Tk):
         as already-clear, not failures - only real OSErrors count as problems.
 
         "<label> complete" is only ever shown when there are no errors AND (for the
-        full reset, which passes nothing_found) at least one world/character file was
-        actually moved. A reset that found nothing to reset gets a warning popup
-        instead: from the user's point of view that is a reset that didn't happen."""
+        full reset, which passes nothing_found) the save locations were not left in a
+        suspicious state. nothing_found means files WERE backed up but not one of them
+        was a world/character file - a reset pointed at the wrong location. Backups
+        skipped for holding no files at all are NOT that: they're the normal result on
+        an already-reset world, so they report success with a plain note."""
         self._log("%s - target: %s" % (label, plugin_dir))
         for line in (extra_lines or []):
             self._log("  %s" % line)
@@ -13622,7 +17307,10 @@ class ArkAPLauncher(tk.Tk):
         summary = "Deleted %d tracking item(s); %d already absent." % (
             len(deleted), len(missing))
         if extra_lines:
-            summary += "\n\nWorld save:\n" + "\n".join(extra_lines)
+            # Each line already carries its own label ("World save: ...", "Game.ini: ...",
+            # "junction ...") - a "World save:" header here read as "World save: World
+            # save: ..." and mislabelled the Game.ini and junction lines too.
+            summary += "\n\nSave reset:\n" + "\n".join(extra_lines)
         if errors:
             messagebox.showwarning(
                 "ARKIpelago Launcher",
@@ -13640,6 +17328,259 @@ class ArkAPLauncher(tk.Tk):
         else:
             messagebox.showinfo("ARKIpelago Launcher",
                                  "%s complete.\n\n%s" % (label, summary))
+
+    # ----------------------------------------- troubleshooting resets ------ #
+    # Two buttons with a deliberately narrow job, for ONE symptom: a server that exits
+    # during startup. They undo what the LAUNCHER put on the server, in two steps, so
+    # the user can bisect - config first (cheap, instantly reversible), then ArkApi +
+    # the plugin (destructive, needs a download to undo). Neither touches the ARK
+    # install, save data, cluster folders, AP tracking, paths.cmd, or any launcher
+    # setting/path/profile. They are separate buttons rather than one button with a
+    # checkbox precisely so testing config can't cost you your ArkApi install.
+
+    def reset_server_config(self):
+        """Back up and DELETE the server's Game.ini + GameUserSettings.ini, then untick
+        every mod and turn the Increase stacks toggle off.
+
+        Deleting rather than editing is the point: ARK regenerates both files on its next
+        boot, so absent IS the genuine default, and it guarantees no launcher-written
+        value survives (the stack overrides in Game.ini, ItemStackSizeMultiplier and
+        ActiveMods in GameUserSettings.ini - which is the entire set of things this app
+        writes into a server's config). Editing them line by line can only remove what we
+        thought to look for.
+
+        The launcher-side state is cleared in the same breath so the app matches the now
+        empty config; otherwise the next Save writes the very values just deleted
+        straight back in."""
+        config_dir = self._server_config_dir()
+        if not config_dir:
+            messagebox.showwarning(
+                "Reset server config",
+                "SERVER_ROOT is not set - it's what says where the server's config "
+                "folder is. Set it on the Configuration tab first.")
+            return
+        if not self._reset_preflight("Reset server config", connector_matters=False):
+            return
+
+        paths = [os.path.join(config_dir, name) for name in UPLOADABLE_CONFIGS]
+        lines = ["TROUBLESHOOTING ONLY. This removes these two files:", ""]
+        for path in paths:
+            lines.append("  - %s%s" % (path, "" if os.path.isfile(path)
+                                       else "   (not there - nothing to remove)"))
+        lines += [
+            "",
+            "ARK RECREATES BOTH FILES with its own defaults the next time the server "
+            "starts, so this is how you test against a config ARK generated itself "
+            "rather than one this launcher wrote into.",
+            "",
+            "Both are backed up with a timestamp first - restoring one is a rename.",
+            "",
+            "It also unticks every mod on the Mods tab and turns off \"Increase stacks\", "
+            "so the launcher matches the empty config and doesn't write those values "
+            "back on your next Save.",
+            "",
+            "Your world save, ArkApi, the plugin, Archipelago tracking, the cluster "
+            "folders and every launcher setting are NOT touched.",
+            "", "Proceed?"]
+        if not messagebox.askyesno("Reset server config (troubleshooting)",
+                                   "\n".join(lines)):
+            self._log("Reset server config: cancelled.")
+            return
+
+        self._clear_log()
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        report, errors = [], []
+        for path in paths:
+            if not os.path.isfile(path):
+                report.append("%s: not there - nothing to remove."
+                              % os.path.basename(path))
+                continue
+            # Back up BEFORE deleting, and don't delete if the backup failed - the whole
+            # safety story of this button is that restoring is a rename away.
+            try:
+                backup = self._backup_file(path, ts)
+            except OSError as exc:
+                report.append("! %s: NOT removed - could not back it up (%s)"
+                              % (os.path.basename(path), exc))
+                errors.append("%s: %s" % (path, exc))
+                continue
+            try:
+                os.remove(path)
+            except OSError as exc:
+                report.append("! %s: backed up but could NOT be removed (%s)"
+                              % (os.path.basename(path), exc))
+                errors.append("%s: %s" % (path, exc))
+                continue
+            report.append("%s: removed. Backup: %s" % (os.path.basename(path), backup))
+
+        # Launcher state -> match the empty config. The stacks var is traced to
+        # _save_stacks_config, so setting it persists and refreshes the dirty highlight;
+        # the mods list isn't, hence the explicit save.
+        for mod in self._mods:
+            mod["enabled"] = False
+        self._save_mods_config()
+        if getattr(self, "mods_items_frame", None):
+            self._rebuild_mods_rows()
+        self.stacks_enabled_var.set(False)
+        report.append("Unticked every mod on the Mods tab and turned off Increase stacks.")
+
+        for line in report:
+            self._log("Reset server config: %s" % line)
+        summary = "\n".join(report)
+        if errors:
+            messagebox.showwarning(
+                "Reset server config (troubleshooting)",
+                "Reset server config did NOT fully complete - %d problem(s), see the "
+                "log.\n\n%s" % (len(errors), summary))
+            return
+        messagebox.showinfo(
+            "Reset server config (troubleshooting)",
+            "%s\n\nNext:\n\n1. Start the ARK server once so it rebuilds both files.\n\n"
+            "2. If it starts, re-apply your settings ONE AT A TIME (mods, then stacks, "
+            "then anything you set by hand) and start the server after each - the one "
+            "that breaks it is the culprit.\n\nEvery backup path above is in the log; "
+            "putting a file back is just a rename." % summary)
+
+    def remove_arkapi_and_plugin(self):
+        """Strip ArkApi and the ArkAP plugin out of Win64, leaving it as if neither had
+        ever been installed - the next step after reset_server_config when a server
+        still won't boot, since it isolates "does bare ARK start at all".
+
+        Only files an installer of OURS wrote are candidates (see
+        arkapi_teardown_targets); ShooterGameServer.exe and everything else Steam put
+        there is never considered, and anything ambiguous is left alone and logged.
+        The whole ArkApi\\ folder is backed up first - ArkAP.config.json is
+        user-editable and must not disappear silently."""
+        root = self.get("SERVER_ROOT")
+        if not root:
+            messagebox.showwarning(
+                "Remove ArkApi + plugin",
+                "SERVER_ROOT is not set - it's what says where Win64 is. Set it on the "
+                "Configuration tab first.")
+            return
+        win64 = os.path.join(os.path.normpath(root), ARKAPI_WIN64_RELDIR)
+        if not os.path.isdir(win64):
+            messagebox.showwarning(
+                "Remove ArkApi + plugin",
+                "Win64 folder not found under SERVER_ROOT:\n\n%s" % win64)
+            return
+        if not self._reset_preflight("Remove ArkApi + plugin", connector_matters=False):
+            return
+
+        manifest = self._read_config_dict().get(ARKAPI_INSTALLED_FILES_KEY)
+        targets, notes = arkapi_teardown_targets(
+            win64, manifest if isinstance(manifest, list) else None)
+        if not targets:
+            self._log("Remove ArkApi + plugin: nothing to remove - no ArkApi or plugin "
+                      "files found in %s" % win64)
+            messagebox.showinfo(
+                "Remove ArkApi + plugin (troubleshooting)",
+                "Nothing to remove - there are no ArkApi or ArkAP plugin files in:"
+                "\n\n%s\n\nThat is already a bare install." % win64)
+            return
+
+        lines = ["THIS REMOVES ARKAPI AND THE ARKAP PLUGIN ENTIRELY.", "",
+                 "From %s:" % win64, ""]
+        lines += ["  - %s%s" % (os.path.basename(p), "\\  (whole folder)"
+                                if kind == "dir" else "")
+                  for p, kind in targets]
+        lines += [
+            "",
+            "The server will then start with NO Archipelago functionality at all until "
+            "you reinstall BOTH from the Install Server/Api/Plugin tab, and reinstalling "
+            "means downloading them again.",
+            "",
+            "The whole ArkApi\\ folder is backed up (timestamped) first, so your "
+            "ArkAP.config.json and plugin data are recoverable.",
+            "",
+            "ShooterGameServer.exe and everything else Steam installed is NOT touched.",
+            "", "Proceed?"]
+        if not messagebox.askyesno("Remove ArkApi + plugin (troubleshooting)",
+                                   "\n".join(lines)):
+            self._log("Remove ArkApi + plugin: cancelled.")
+            return
+
+        self._clear_log()
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        report, errors = list(notes), []
+
+        # Back up ArkApi\ before anything is removed. _backup_and_clear_dir MOVES it
+        # aside (and prunes to the retention setting), which both preserves the folder
+        # and removes it in one step - so it is the backup AND the deletion for that one
+        # target, and the loop below skips it.
+        arkapi_dir = os.path.normpath(os.path.join(win64, "ArkApi"))
+        backup_path = None
+        if os.path.isdir(arkapi_dir):
+            result = self._backup_and_clear_dir(arkapi_dir, ts)
+            if result["kind"] == "error":
+                report.append("! ArkApi\\: could NOT be backed up or removed (%s) - "
+                              "nothing else was removed either" % result["detail"])
+                self._log("Remove ArkApi + plugin: %s" % report[-1])
+                messagebox.showerror(
+                    "Remove ArkApi + plugin (troubleshooting)",
+                    "Could not back up %s:\n\n%s\n\nNothing was removed. Make sure the "
+                    "ARK server is stopped and no Explorer window is open in that "
+                    "folder, then try again." % (arkapi_dir, result["detail"]))
+                return
+            backup_path = result["backup"]
+            # "moved" leaves the source recreated empty (that method exists to reset save
+            # folders ARK writes back into); "empty" means it held no files, so nothing
+            # was moved and no backup was made. Either way "as if never installed" means
+            # the folder itself goes.
+            try:
+                if result["kind"] == "moved":
+                    os.rmdir(arkapi_dir)
+                else:
+                    shutil.rmtree(arkapi_dir)
+                report.append(
+                    "ArkApi\\ (plugin, Permissions, config and all): removed. Backup: %s"
+                    % (backup_path or "(it held no files - none needed)"))
+            except OSError as exc:
+                report.append("! %s: emptied, but the folder itself could not be "
+                              "removed (%s)" % (arkapi_dir, exc))
+                errors.append("%s: %s" % (arkapi_dir, exc))
+
+        for path, kind in targets:
+            if os.path.normpath(path) == arkapi_dir:
+                continue
+            try:
+                if kind == "dir":
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                report.append("%s: removed." % path)
+            except OSError as exc:
+                report.append("! %s: could NOT be removed (%s)" % (path, exc))
+                errors.append("%s: %s" % (path, exc))
+
+        # The recorded versions describe an install that no longer exists - leaving them
+        # would have Setup Status offering updates for a missing component.
+        for key, label in ((ARKAPI_INSTALLED_VERSION_KEY, "installed ArkApi version"),
+                           (PLUGIN_INSTALLED_VERSION_KEY, "installed plugin version"),
+                           (ARKAPI_INSTALLED_FILES_KEY, "installed ArkApi file list")):
+            self._write_config_key(key, "", label)
+
+        for line in report:
+            self._log("Remove ArkApi + plugin: %s" % line)
+        self._refresh_setup_status()
+
+        summary = "\n".join(report)
+        if errors:
+            messagebox.showwarning(
+                "Remove ArkApi + plugin (troubleshooting)",
+                "Remove ArkApi + plugin did NOT fully complete - %d problem(s), see the "
+                "log. Do not treat Win64 as clean until they're resolved.\n\n%s"
+                % (len(errors), summary))
+            return
+        messagebox.showinfo(
+            "Remove ArkApi + plugin (troubleshooting)",
+            "%s\n\nSetup Status now shows ArkApi and the plugin as not installed, which "
+            "is correct.\n\nNext:\n\n1. Start the ARK server on this bare install. If it "
+            "still won't start, the problem is not ArkApi, the plugin or this "
+            "launcher.\n\n2. If it does start, add things back one at a time, starting "
+            "the server after each: \"Install ArkServerApi\", then \"Install Plugin\" "
+            "(both on the Install Server/Api/Plugin tab), then your config settings.\n\n"
+            "Your old ArkApi folder is at:\n%s" % (summary, backup_path or "(none)"))
 
     def _preflight_bat(self, batname):
         """(missing, unsaved, absent_files) for everything script_requirements() says
@@ -13707,26 +17648,19 @@ class ArkAPLauncher(tk.Tk):
             self._show_server_patience_popup()
 
     def _show_server_patience_popup(self):
-        """Non-blocking "it's starting, give it a minute" note. A plain Toplevel rather
-        than messagebox.showinfo: no grab, no modal loop, closing it isn't required, and
-        the server is already starting behind it either way."""
-        win = tk.Toplevel(self)
-        win.title("Starting the ARK server")
-        win.transient(self)
-        win.resizable(False, False)
-        frm = ttk.Frame(win, padding=12)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, wraplength=420, justify="left",
-                  text="The server's starting up now. This takes a while - sometimes up "
-                       "to 15 minutes if it's installed on a hard drive rather than an "
-                       "SSD. Be patient, and leave the console window it opened alone.\n\n"
-                       "Once it's running, look for it under LAN in ARK: Survival "
-                       "Evolved.\n\n"
-                       "If it's still unresponsive after 15 minutes, something may have "
-                       "gone wrong and is worth investigating - Setup Status and the "
-                       "ArkAP Debug Log tabs are the places to look."
-                  ).pack(anchor="w")
-        ttk.Button(frm, text="Got it", command=win.destroy).pack(anchor="e", pady=(10, 0))
+        """Non-blocking "it's starting, give it a minute" note. Goes through _info_once:
+        no grab, no modal loop, closing it isn't required, the server is already starting
+        behind it either way - and someone who launches the server daily has read it."""
+        self._info_once(
+            PROMPT_SERVER_PATIENCE, "Starting the ARK server",
+            "The server's starting up now. This takes a while - sometimes up "
+            "to 15 minutes if it's installed on a hard drive rather than an "
+            "SSD. Be patient, and leave the console window it opened alone.\n\n"
+            "Once it's running, look for it under LAN in ARK: Survival "
+            "Evolved. (If your Ark install is not on the pre-Aquatica branch it will not show up in the server list)\n\n"
+            "If it's still unresponsive after 15 minutes, something may have "
+            "gone wrong and is worth investigating - Setup Status and the "
+            "ArkAP Debug Log tabs are the places to look.", width=420)
 
     # ---------------------------------------------------- in-app search ---- #
     # Searches the ENTIRE app - every tab, not just the active one - and
@@ -14033,11 +17967,12 @@ class ArkAPLauncher(tk.Tk):
                     pass
 
     def _update_find_btns(self):
-        """Show Find Prev/Next only while the search box has text in it."""
-        if self.search_var.get().strip():
-            self._find_btns.pack(side="left", before=self._search_status_label)
-        else:
-            self._find_btns.pack_forget()
+        """Enable Find Prev/Next only while the search box has text in it. Greyed out
+        rather than hidden so the search row's width never changes - see where the frame
+        is packed in _build_ui."""
+        state = "normal" if self.search_var.get().strip() else "disabled"
+        self.find_prev_btn.configure(state=state)
+        self.find_next_btn.configure(state=state)
 
     def _find_next(self):
         self._step_match(1)
@@ -14090,6 +18025,12 @@ class ArkAPLauncher(tk.Tk):
             return  # selecting the tab above is the only feedback a tab name can get
 
         widget = match["widget"]
+        # A collapsed Configuration-tab group is exactly this kind of unmapped
+        # ancestor, but unlike a dismissed banner it should be reopened rather than
+        # skipped - a search match hiding under a fold the user forgot about is worse
+        # than the collapse being tidy. No-op for widgets outside any collapsible group.
+        self._reveal_group_for_widget(widget)
+        self.update_idletasks()
         # A dismissed reminder banner (or similar pack_forget'd content) can
         # still be unmapped even on its own tab - nothing sensible to scroll
         # to in that case, so just leave it counted as a match and move on.
