@@ -1,5 +1,7 @@
 This is just a Community made launcher built to make setup as easy as possible
+
 Ghios developed the entire plugin [here](https://github.com/Jbaker16163/Ark-Survival-Archipelago).
+
 Lurch9229 developed the Pop Tracker [here](https://github.com/lurch9229/Arkipelago-Poptracker/releases/latest)
 
 # ARKipelago Launcher : Setup Guide
