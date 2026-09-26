@@ -66,7 +66,14 @@ import ctypes
 import codecs
 import queue
 import shutil
+import select
+import socket
+import ssl
 import struct
+import base64
+import ipaddress
+import http.client
+import difflib
 import hashlib
 import zipfile
 import tempfile
@@ -75,8 +82,12 @@ import threading
 import subprocess
 import collections
 import configparser
+import csv
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
@@ -100,8 +111,8 @@ GROUPS = [
         ("SERVERPASS", "SERVERPASS", "text"),
         ("TRIBUTEEXP", "TRIBUTEEXP", "text"),
         # Used to be its own "Cluster" group - a whole section for one field was more
-        # clutter than the setting warranted, and it's as much a network-identity
-        # setting (which maps share one world) as MAP/SESSION are.
+        # clutter than the setting warranted. Set once (every map sharing a world needs
+        # the same value), so it folds away with the ports - see NETWORK_SET_ONCE_KEYS.
         ("CLUSTERID",  "CLUSTERID",  "text"),
     ]),
     # Paths, Plugin files & DeathLink and Locations are set once during initial setup
@@ -155,16 +166,25 @@ GROUP_COLLAPSE_IDS = {
 STACKS_GROUP_COLLAPSE_ID = "stacks"          # Increase stacks section - see _build_stack_section
 UPLOAD_CONFIG_GROUP_COLLAPSE_ID = "upload_config"  # Upload server config files section
 
-# The three Network fields collapsed into their own inline toggle (_make_inline_collapsible)
-# since they're rarely changed and take up a chunk of the group - see _render_field_groups.
-NETWORK_PORT_KEYS = {"GAMEPORT", "QUERYPORT", "RCONPORT"}
+# The Network fields folded into their own inline toggle (_make_inline_collapsible):
+# set once and then left alone, unlike the rest of Network, which gets changed while
+# playing - see _render_field_groups.
+NETWORK_SET_ONCE_KEYS = {"GAMEPORT", "QUERYPORT", "RCONPORT", "CLUSTERID"}
 NETWORK_PORTS_GROUP_COLLAPSE_ID = "network_ports"
 
+# Default layout, split by how the groups get used: the set-once groups (filled in by
+# Get Started, then forgotten) start collapsed, the ones changed while playing (Network,
+# Increase stacks) start open. Quick Launch is the fixed bar at the bottom and never folds.
+# First run uses these same defaults - it used to open everything, back when filling these
+# fields in WAS the first task.
+CONFIG_DEFAULT_COLLAPSED = {"paths", "plugin_deathlink", "locations",
+                            UPLOAD_CONFIG_GROUP_COLLAPSE_ID, NETWORK_PORTS_GROUP_COLLAPSE_ID,
+                            "friends"}   # SHARE_GROUP_COLLAPSE_ID: opt-in, most never need it
+
 # Config JSON key for every collapse toggle above: {group_id: bool} where True = collapsed.
-# Missing entirely (first run, or an existing config from before this existed) means every
-# id defaults per _make_collapsible_group/_make_inline_collapsible's default_collapsed -
-# expanded for the five field groups, collapsed for the ports. Written the moment a toggle
-# changes, like THEME_KEY/REMINDER_HIDE_KEY above (see _save_group_collapse_state).
+# Only what the USER clicked is stored (see _on_group_toggled); anything missing falls
+# back to CONFIG_DEFAULT_COLLAPSED. Written the moment a toggle changes, like
+# THEME_KEY/REMINDER_HIDE_KEY above.
 GROUP_COLLAPSE_KEY = "config_group_collapsed"
 
 # Rendered onto the Archipelago Setup tab by the same _render_field_groups() loop that
@@ -231,6 +251,8 @@ ARCHIPELAGO_DEFAULT_PORT = 38281
 
 # The installer's own default, and by far the most common location.
 ARCHIPELAGO_DEFAULT_DIR = r"C:\ProgramData\Archipelago"
+# Where a generated seed .zip is uploaded for archipelago.gg to host (Get Started tab).
+ARCHIPELAGO_UPLOAD_URL = "https://archipelago.gg/uploads"
 
 
 def is_archipelago_dir(path):
@@ -543,6 +565,22 @@ DIR_SCAN_TARGETS = {
 }
 
 
+def found_install_dir(configured, key):
+    """`configured` when it's set; otherwise the first of the field's fixed, standard
+    locations (DIR_SCAN_TARGETS - no drive walking) that really holds the install, or "".
+
+    Why it exists: the update check only looked at the configured folder, and nothing
+    fills Archipelago's or PopTracker's in on its own - so an .apworld sitting in the
+    default C:\\ProgramData\\Archipelago was never compared with the latest release and
+    the Check for Updates "!" stayed dark. Verified by the field's own install check, so
+    an example path that doesn't exist is still never taken for an install."""
+    if configured:
+        return configured
+    target = DIR_SCAN_TARGETS[key]
+    return next((os.path.normpath(d) for d in target["candidates"]()
+                 if target["matches"](d)), "")
+
+
 def locate_extracted_poptracker(root):
     """The folder inside an extracted PopTracker download that holds poptracker.exe -
     the zip's own single "poptracker\\" folder in every release checked, but found rather
@@ -670,7 +708,8 @@ FIELD_HELP = {
     ),
     "SERVER_ROOT": (
         "Root folder of your ARK dedicated server install. the folder that directly "
-        "contains 'ShooterGame'.\n "
+        "contains 'ShooterGame'. Before installing, pick an empty folder - Install ARK "
+        "Server downloads the server into it. Never your ARK game's own folder.\n "
         "Example: C:\\ARKServer\n"
         "Tip: ShooterGameServer.exe lives under "
         "ShooterGame\\Binaries\\Win64\\ inside this folder. If your download nested the "
@@ -786,8 +825,9 @@ FIELD_HELP = {
     ),
     "game_ini": (
         "Optional full path to the ARK server's Game.ini. When randomize_dino_spawns "
-        "is on in your yaml, the connector auto-patches the NPCReplacements block "
-        "here (only its own marked block - other settings are left alone).\n"
+        "is on in your yaml, \"Patch Game.ini for randomized creatures\" (Quick Launch) "
+        "writes the NPCReplacements block here (only its own marked block - other "
+        "settings are left alone).\n"
         "Example: C:\\ARKServer\\ShooterGame\\Saved\\Config\\WindowsServer\\Game.ini\n"
         "Tip: leave blank to just get ipc\\game_ini_fragment.txt to paste in yourself. "
         "Restart the ARK server after this file changes."
@@ -1058,7 +1098,8 @@ def is_autosave_profile(name):
 # self.vars fields. Every one of them is OPTIONAL on read: a profile written before a
 # section existed simply has no key for it, and must keep loading rather than blanking
 # that section (see _apply_profile - the ARCHIPELAGO_DIR bug is why that rule exists).
-PROFILE_STATE_KEYS = ("values", "notes", "stacks", "mods")
+# "archipelago_role" is AP_ROLE_KEY (defined further down with the Get Started keys).
+PROFILE_STATE_KEYS = ("values", "notes", "stacks", "mods", "archipelago_role")
 
 
 # --- Pre-created first profile ------------------------------------------------ #
@@ -1138,12 +1179,54 @@ BACKUP_RETENTION_DEFAULT = 3
 # itself is trim_launcher_log(), run once per startup.
 LAUNCHER_LOG_RETENTION_DAYS_KEY = "launcher_log_retention_days"
 
+# Get Started tab (see WIZARD_STEPS). Launcher-level, not per-profile: they describe this
+# PC's setup progress, like the first-run flag below.
+WIZARD_HIDDEN_KEY = "get_started_hidden"      # tab hidden via its own "Hide this tab"
+WIZARD_SKIPPED_KEY = "get_started_skipped"    # optional step keys the user skipped
+WIZARD_CONNECTED_KEY = "get_started_connected"  # the one step nothing on disk can prove
+WIZARD_YAML_SENT_KEY = "get_started_yaml_sent"  # joining + own yaml: "I've sent it"
+# The Get Started questionnaire's answers: {"role": "host"|"join", "yaml_by": "self"|"host"}.
+# Saved the moment they change and carried in profiles as an extra section (like the
+# Mods list and Increase stacks), not as a Save-button field - see _on_role_changed.
+AP_ROLE_KEY = "archipelago_role"
+
 # JSON key set once, at the end of the very first launch (the same launch that
 # auto-creates DEFAULT_PROFILE_NAME). While it is missing the app opens on the
-# Instructions tab instead of Configuration; afterwards it never does again. A key of
+# Get Started tab instead of Configuration; afterwards it never does again. A key of
 # its own rather than leaning on "config file doesn't exist yet" so a config that fails
 # to write, or is shipped blank, can't re-trigger the greeting on every launch.
+# The guide, split in two. The tab is reference material; the pop-out window is the
+# complete original walkthrough, kept as the fallback for anyone Get Started leaves
+# stuck. SETUP_SECTION_TITLE is the heading (identical in both the Quick and Full
+# guides) that only the pop-out shows.
+GUIDE_TAB_LABEL = "Launcher guide"
+LEGACY_GUIDE_LABEL = "Legacy Instructions"
+SETUP_SECTION_TITLE = "Start here - install in this order"
+LEGACY_ONLY_SECTIONS = (SETUP_SECTION_TITLE,)
+# First in both guides: a joiner reads it and stops - none of the setup is for them.
+JOIN_GUIDE_TITLE = "Joining a friend's ARK server"
+SHARE_GUIDE_TITLE = "Friends over the internet (Beta)"
+
 FIRST_RUN_DONE_KEY = "first_run_done"
+
+# Install Server/Api/Plugin is hidden unless this is on (Settings -> "Show Install tab"):
+# Get Started does the installing. Hidden is not unreachable - see _show_install_tab for
+# every way back to it, including while an install is running.
+INSTALL_TAB_SHOWN_KEY = "install_tab_shown"
+
+# The header chip's two wordings: text, button text, button width, handler,  tooltip.
+# One definition so _update_save_hint and the window sizing that has to fit the widest
+# of them (_lock_initial_size) can't drift apart.
+SAVE_HINT_VARIANTS = {
+    "install": ("next step: Install ARK Server", "Go there", 9, "_goto_install_tab",
+                "Nothing is installed in SERVER_ROOT yet - that's expected. Opens the "
+                "Install Server/Api/Plugin tab, where \"Install ARK Server\" downloads "
+                "the dedicated server into it."),
+    "save": ("make sure to", "Save", 6, "_on_save_hint_click",
+             "Saves every section that has unsaved changes right now - the "
+             "Configuration / Archipelago Setup fields, the Mods list, or both. "
+             "Same as clicking those tabs' own Save buttons."),
+}
 
 # JSON key (in CONFIG_FILENAME, deliberately NOT in the profiles file) holding the newest
 # release version the user has clicked "Check for Updates" through to see. Persisted
@@ -1182,6 +1265,13 @@ APWORLD_INSTALLED_VERSION_KEY = "apworld_installed_version"
 # for the readers that have a config dict but no folder to look in, chiefly the diagnostics
 # version block.
 TRACKER_PACK_INSTALLED_VERSION_KEY = "trackerpack_installed_version"
+# {component: latest version} from the last update check that reached GitHub. When a
+# check can't (GitHub's 60-an-hour anonymous limit is shared by everything on the
+# network), the "!" badge is worked out from these instead of going dark for the session.
+LAST_KNOWN_LATEST_KEY = "update_last_known_latest"
+# ponytail: a fixed retry, not X-RateLimit-Reset - the limit resets within the hour, so a
+# quarter-hour retry lands soon after it and costs a handful of requests at most.
+UPDATE_RETRY_MS = 15 * 60 * 1000
 # ...but these two keys are a FALLBACK, not the source of truth. They only ever exist when
 # the launcher itself did the install: a copy that shipped with the plugin and .apworld
 # already in place recorded neither, which is exactly the install that used to show nothing
@@ -1258,6 +1348,7 @@ THEMES = {
         "scroll_thumb_active":  "#a8a8a8",
         "select_bg":            "#0078d7",
         "select_fg":            "#ffffff",
+        "link_fg":              "#0063b1",
     },
     "dark": {
         "bg":                   "#2b2b2b",
@@ -1291,6 +1382,8 @@ THEMES = {
         "scroll_thumb_active":  "#5e5e5e",
         "select_bg":            "#0a5c9e",
         "select_fg":            "#ffffff",
+        # select_bg is a fill colour; as text on this bg it all but disappears.
+        "link_fg":              "#6cb6ff",
     },
 }
 
@@ -1360,6 +1453,18 @@ PRE_PATHS_MIGRATE_ORDER = PATHS_CMD_CALLERS
 # which Save already uses for its own backups - overwriting that would destroy the
 # user's last known-good pre-Save state to save a file we're about to replace anyway.
 PRE_PATHS_BACKUP_SUFFIX = ".pre-paths.bak"
+# A bundled server script stamped "REM arkap-script-version: N" replaces an installed copy
+# with a lower N (none = 1), keeping the values the launcher manages in it - the same
+# carry-over as the pre-paths.cmd refresh. How a template fix reaches existing installs:
+# otherwise installed scripts are only ever created when missing. Version 2 = the console
+# closes when the server exits instead of sitting on "Press any key to continue".
+SCRIPT_VERSION_RE = re.compile(r"^REM arkap-script-version:\s*(\d+)", re.MULTILINE)
+SCRIPT_UPGRADE_BACKUP_SUFFIX = ".before-v%d.bak"
+
+
+def script_version(text):
+    match = SCRIPT_VERSION_RE.search(text or "")
+    return int(match.group(1)) if match else 1
 
 # --- Game.ini / GameUserSettings.ini upload --------------------------------- #
 # Where ARK reads its two editable server config files from, relative to SERVER_ROOT.
@@ -1373,9 +1478,9 @@ UPLOADABLE_CONFIGS = ("Game.ini", "GameUserSettings.ini")
 
 CONFIG_UPLOAD_HELP = {
     "Game.ini": "Your own Game.ini to copy into the server's config folder, replacing "
-                "the one that's there. This is the file the connector patches "
-                "NPCReplacements into when randomize_dino_spawns is on - if you "
-                "upload over it later, re-apply that block.",
+                "the one that's there. This is the file \"Patch Game.ini for randomized "
+                "creatures\" writes NPCReplacements into when randomize_dino_spawns is "
+                "on - if you upload over it later, re-apply that block.",
     "GameUserSettings.ini": "Your own GameUserSettings.ini to copy into the server's "
                             "config folder, replacing the one that's there. Note ARK "
                             "REWRITES this file itself when the server shuts down, so "
@@ -1808,6 +1913,8 @@ ARK_BETA_BRANCH = "preaquatica"
 
 INSTALL_BTN_HELP = (
     "Installs the ARK: Survival Evolved Dedicated Server, this is where most of your paths will be.\n"
+    "SERVER_ROOT should be an empty folder - not your ARK game's folder. Nothing needs to be "
+    "there yet, this is what puts it there.\n"
     "Note that sometimes the process will fail with exit code 8, press install again and it should work.\n"
     "sometimes the console does not show download progress, if you are worried about it check task manager "
     "and see if steam or the exe has high network usage, otherwise be patient as its a large file!"
@@ -1848,7 +1955,7 @@ GITHUB_API_USER_AGENT = "ArkAPLauncher"
 # and lays down an --onedir install, permanently ending the "Failed to load Python DLL" race
 # (which was the --onefile bootloader losing a lock-timing fight with AV over the freshly
 # extracted _MEI\python313.dll on the first launch after an update). See build.py --bridge.
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.6.0"
 UPDATE_REPO = "aSoberAvocado/ARK-Ipelago-Evolved-Launcher"
 # NEW clients discover updates from the releases LIST (newest release carrying a launcher
 # folder-zip wins), NOT from /releases/latest - that deliberately ignores GitHub's "Latest"
@@ -1977,6 +2084,21 @@ class _ConsoleLineSplitter:
 # ArkServerApi / ArkAP plugin / ArkConnector are not on Steam - point users at the
 # releases page that bundles all three instead of automating a GitHub fetch.
 RELEASES_URL = "https://github.com/Jbaker16163/Ark-Survival-Archipelago/releases"
+
+# The Archipelago Discord - where someone stuck actually gets helped (ARK: Survival
+# Evolved has its own channel there), and where "Export diagnostics" expects its zip to
+# end up. An INVITE link, not a channel link: a channel link only opens for people who
+# are already members, which is exactly who doesn't need it. Opened with webbrowser.open
+# like every other link here; Discord's own app takes it from the browser if installed.
+DISCORD_INVITE_URL = "https://discord.com/channels/731205301247803413/1296950846105321503"
+
+# Where each component comes from, for the link on its row in the update dialog. Used
+# when there is no specific release to point at (version undetected, or the check never
+# came back) - a status that has one carries its own html_url instead. The plugin and the
+# .apworld ship from the same repo.
+UPDATE_COMPONENT_PAGES = {"launcher": UPDATE_RELEASES_PAGE, "plugin": RELEASES_URL,
+                          "apworld": RELEASES_URL,
+                          "trackerpack": TRACKER_PACK_RELEASES_PAGE}
 
 
 # --------------------------------------------------------------------------- #
@@ -2314,6 +2436,1061 @@ def redact_text(text):
     return "".join(out)
 
 
+# --- Server status + graceful stop (the footer bar) ------------------------------- #
+# The footer's light is driven by ShooterGameServer.exe existing (tasklist, polled on a
+# worker thread) plus the RCON port answering: the server opens RCON only once the world
+# is loaded, so "process up, RCON not yet" is exactly "Starting". Polled rather than
+# tracked, so a server started or stopped outside the launcher shows up too.
+SERVER_POLL_MS = 3000
+SERVER_STATES = {                       # state -> (label, theme colour key)
+    "stopped": ("Stopped", "subtle_fg"),
+    "starting": ("Starting…", "status_info"),
+    "running": ("Running", "status_ok"),
+    "stopping": ("Stopping…", "status_info"),
+}
+
+# Source RCON, which ARK speaks. Just enough of it to save and exit.
+RCON_AUTH, RCON_EXEC, RCON_AUTH_RESPONSE = 3, 2, 2
+RCON_CONNECT_TIMEOUT = 5
+# saveworld only answers once the save has actually finished, and a big world takes a
+# while - generous, because giving up here is what leads to a force-close.
+RCON_SAVE_TIMEOUT = 180
+RCON_EXIT_TIMEOUT = 15
+SERVER_EXIT_WAIT = 90        # after doexit: how long the process gets to actually go
+
+
+class RconError(Exception):
+    """RCON didn't do what was asked: no connection, wrong password, no answer."""
+
+
+def _rcon_packet(req_id, kind, body):
+    payload = struct.pack("<ii", req_id, kind) + body.encode("utf-8") + b"\x00\x00"
+    return struct.pack("<i", len(payload)) + payload
+
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RconError("the server closed the RCON connection")
+        buf += chunk
+    return buf
+
+
+def _rcon_read(sock):
+    (size,) = struct.unpack("<i", _recv_exact(sock, 4))
+    data = _recv_exact(sock, size)
+    req_id, kind = struct.unpack("<ii", data[:8])
+    return req_id, kind, data[8:].rstrip(b"\x00").decode("utf-8", "replace")
+
+
+def rcon_command(port, password, command, timeout, host="127.0.0.1"):
+    """Log in with ADMINPASS and run one command; returns the server's reply. Raises
+    RconError for anything short of a reply (socket timeouts included)."""
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=RCON_CONNECT_TIMEOUT)
+    except (OSError, ValueError) as exc:
+        raise RconError("couldn't connect to RCON on port %s (%s)" % (port, exc))
+    try:
+        with sock:
+            sock.sendall(_rcon_packet(1, RCON_AUTH, password))
+            while True:       # some servers send an empty reply before the auth answer
+                req_id, kind, _body = _rcon_read(sock)
+                if kind == RCON_AUTH_RESPONSE:
+                    break
+            if req_id == -1:
+                raise RconError("RCON refused the password - ADMINPASS doesn't match the "
+                                "one the running server was started with")
+            sock.settimeout(timeout)
+            sock.sendall(_rcon_packet(2, RCON_EXEC, command))
+            return _rcon_read(sock)[2]
+    except socket.timeout:
+        raise RconError("no answer to %s within %ds" % (command, timeout))
+    except OSError as exc:
+        raise RconError("RCON connection failed (%s)" % exc)
+
+
+def stop_server_gracefully(port, password, still_running, sleep=time.sleep):
+    """saveworld, then doexit, then wait for the process to go. Returns
+    (stopped, saved, detail). Never kills anything - that's the caller's call, and it
+    knows from `saved` whether a kill would lose anything."""
+    try:
+        reply = rcon_command(port, password, "saveworld", RCON_SAVE_TIMEOUT)
+    except RconError as exc:
+        return False, False, "saveworld failed: %s" % exc
+    try:
+        rcon_command(port, password, "doexit", RCON_EXIT_TIMEOUT)
+    except RconError:
+        pass      # a server that is exiting may drop the line first - the wait decides
+    deadline = time.time() + SERVER_EXIT_WAIT
+    while time.time() < deadline:
+        if not still_running():
+            return True, True, "world saved (%s) and the server exited" % (
+                reply.strip() or "no message")
+        sleep(2)
+    return False, True, ("the world saved, but the server was still running %ds after "
+                         "doexit" % SERVER_EXIT_WAIT)
+
+
+def probe_server_state(rcon_port):
+    """"stopped" / "starting" / "running" for the footer light (see SERVER_STATES)."""
+    if not is_process_running(ARK_SERVER_PROCESS):
+        return "stopped"
+    try:
+        socket.create_connection(("127.0.0.1", int(rcon_port)), timeout=0.5).close()
+        return "running"
+    except (OSError, ValueError):
+        return "starting"
+
+
+def _parse_tasklist_pids(text):
+    """PIDs from `tasklist /fo csv /nh` output (image, pid, session, #, mem per line).
+    The "INFO: No tasks..." line, blanks and anything malformed are skipped."""
+    pids = []
+    for row in csv.reader((text or "").splitlines()):
+        if len(row) >= 2 and row[1].strip().isdigit():
+            pids.append(int(row[1]))
+    return pids
+
+
+def _process_image_path(pid):
+    """Full .exe path of a running process, or None if Windows won't say (an elevated
+    or protected process can refuse). PROCESS_QUERY_LIMITED_INFORMATION is the least
+    access that answers this, and works across most same-user processes."""
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong))
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = ctypes.c_ulong(len(buf))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return None
+        return buf.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def server_processes():
+    """[(pid, exe path or None)] for every running ShooterGameServer.exe. The path is what
+    tells THIS SERVER_ROOT's server from any other one (a transfer server, a second
+    install); None means Windows wouldn't say, which callers treat as "could be ours"."""
+    if os.name != "nt":
+        return []
+    try:
+        out = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh", "/fi", "imagename eq %s" % ARK_SERVER_PROCESS],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [(pid, _process_image_path(pid)) for pid in _parse_tasklist_pids(out.stdout)]
+
+
+def processes_under_root(processes, server_root):
+    """The (pid, path) entries that belong to server_root - or might (path unknown)."""
+    if not server_root:
+        return []
+    root = os.path.normcase(os.path.normpath(server_root)).rstrip("\\/") + os.sep
+    return [(pid, path) for pid, path in processes
+            if path is None or os.path.normcase(os.path.normpath(path)).startswith(root)]
+
+
+# --- SteamCMD install: space and the 0x202 failure ---------------------------------- #
+# A fresh dedicated-server download, plus room for SteamCMD to unpack it.
+ARK_SERVER_INSTALL_GB = 18
+ARK_SERVER_FRESH_NEEDS_GB = ARK_SERVER_INSTALL_GB + 2
+# ponytail: an estimate - validating/updating an existing install stages only the changed
+# files, and how much that is depends on the patch. Raise it if 0x202 updates show up
+# with more free than this.
+ARK_SERVER_UPDATE_NEEDS_GB = 5
+# SteamCMD's "state is 0x202 after update job": update-required + update-paused - Steam
+# stopped the job because it couldn't finish it. Exit code 8 alone only means "failed".
+STEAMCMD_PAUSED_STATE = "0x202"
+
+
+def free_bytes_at(path):
+    """Free space on the drive `path` is (or will be) on, walking up to the nearest
+    folder that exists - SERVER_ROOT itself usually doesn't before a first install.
+    None if it can't be told."""
+    probe = os.path.abspath(path) if path else ""
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free if probe else None
+    except OSError:
+        return None
+
+
+def force_kill_server(pids=None):
+    """Last resort, only ever after the user said yes: (ok, detail). With `pids`, only
+    those processes; otherwise every ShooterGameServer.exe."""
+    target = (sum((["/PID", str(pid)] for pid in pids), []) if pids
+              else ["/IM", ARK_SERVER_PROCESS])
+    try:
+        out = subprocess.run(["taskkill", "/F"] + target,
+                             capture_output=True, text=True, timeout=30,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    return out.returncode == 0, (out.stdout or out.stderr or "").strip()
+
+
+# --------------------------------------------------------------------------- #
+#  Friends over the internet (Beta)
+# --------------------------------------------------------------------------- #
+# ShooterGameServer can't open ports on the router itself - the ARK wiki: manual port
+# forwarding may be needed "since ShooterGameServer does not support UPnP or other
+# automatic port forwarding protocols" - so the launcher asks the router (UPnP), adds
+# the Windows Firewall rule, and says plainly when neither can work.
+#
+# The ports, all UDP (ark.wiki.gg, Dedicated server setup): the game port; the peer
+# port, ALWAYS game port + 1, which ARK advertises the server to the in-game browser
+# over - the one most guides forget, and the classic "it works, but nobody can see it";
+# and the Steam query port. Archipelago's room port (TCP) joins them only while the room
+# is hosted on this PC. RCON is never opened: it carries ADMINPASS and full control.
+SHARE_ENABLED_KEY = "share_with_friends"
+# The section's question: "router" (open ports) or "tailscale". Two separate routes that
+# don't combine - only the chosen one's controls are shown. Blank = not answered yet.
+SHARE_METHOD_KEY = "share_method"
+SHARE_METHODS = (
+    ("router", "Open ports on my router",
+     "Friends join with nothing extra to install. Only works if your router allows it "
+     "(UPnP) and your connection has its own public address - the checks below tell you."),
+    ("tailscale", "Use Tailscale",
+     "Works on any connection, with nothing to change on your router. You and each "
+     "friend install Tailscale and sign in, then you share this PC with them."),
+)
+# [[port, "UDP"|"TCP"], ...] this launcher has open on the router right now. Written as
+# they open, so ports left behind by a launcher that closed or crashed are removed the
+# next time it starts and finds the server stopped.
+SHARE_OPEN_KEY = "share_open_ports"
+SHARE_TAG = "ARKipelago"              # prefix of every router mapping's description
+SHARE_GROUP_COLLAPSE_ID = "friends"
+FIREWALL_RULE_ARK = "ARKipelago - ARK server"
+FIREWALL_RULE_AP = "ARKipelago - Archipelago room"
+# Router mappings lapse unless renewed, so a crash can't leave them open for long.
+UPNP_LEASE_SECONDS = 2 * 60 * 60
+UPNP_RENEW_MS = 30 * 60 * 1000
+# One plain-text answer: the address the internet sees this PC as. Asked only when the
+# user turns sharing on, starts the server with it on, or presses Check - never at startup.
+PUBLIC_IP_URL = "https://api.ipify.org"
+CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")   # RFC 6598 shared address space
+# Home-network ranges (RFC 1918, plus link-local). Spelled out rather than is_private,
+# which also counts documentation and other special ranges no home router hands out.
+HOME_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))
+SSDP_ADDR = ("239.255.255.250", 1900)
+IGD_SERVICE_TYPES = ("urn:schemas-upnp-org:service:WANIPConnection:2",
+                     "urn:schemas-upnp-org:service:WANIPConnection:1",
+                     "urn:schemas-upnp-org:service:WANPPPConnection:1")
+A2S_INFO_REQUEST = b"\xff\xff\xff\xffTSource Engine Query\x00"
+
+
+def share_mappings(gameport, queryport, rconport, ap_port=None):
+    """The (port, protocol) pairs to open for friends - the ONE list both the router and
+    the firewall rule are built from, so the RCON guard below covers both. RCON is TCP,
+    so a UDP port that happens to share its number is harmless; a TCP one never opens."""
+    wanted = [(gameport, "UDP"), (gameport + 1, "UDP"), (queryport, "UDP")]
+    if ap_port:
+        wanted.append((ap_port, "TCP"))
+    out = []
+    for port, proto in wanted:
+        if proto == "TCP" and port == rconport:
+            continue
+        if (port, proto) not in out:
+            out.append((port, proto))
+    return out
+
+
+def classify_connection(wan_ip, public_ip):
+    """What the router's own internet-side address says about reaching this PC:
+      "ok"          the router IS on the internet
+      "cgnat"       the provider shares one public address between customers (RFC 6598
+                    range, or a public-looking router address that isn't the one the
+                    internet sees) - no port forward, UPnP or manual, gets through that
+      "double_nat"  this router sits behind another one (it got a private address)
+      "unknown"     the router didn't say"""
+    try:
+        wan = ipaddress.IPv4Address((wan_ip or "").strip())
+    except ValueError:
+        return "unknown"
+    if wan.is_unspecified:
+        return "unknown"          # 0.0.0.0: the router isn't connected right now
+    if wan in CGNAT_NETWORK:
+        return "cgnat"
+    if any(wan in n for n in HOME_NETWORKS):
+        return "double_nat"
+    if public_ip and public_ip != str(wan):
+        return "cgnat"
+    return "ok"
+
+
+class UpnpError(Exception):
+    def __init__(self, code, text):
+        super().__init__("%s %s" % (code, text))
+        self.code, self.text = str(code), text
+
+
+def _xml_local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _http_request(url, body=None, headers=None, timeout=5.0):
+    """(status, body) - plain http.client, not urllib: urllib would send a router on the
+    LAN through the system proxy."""
+    parts = urllib.parse.urlsplit(url)
+    path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    try:
+        conn.request("GET" if body is None else "POST", path, body=body,
+                     headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.read(1 << 20)
+    finally:
+        conn.close()
+
+
+def parse_ssdp_location(data, sender_ip):
+    """The description URL from a router's SSDP answer - only if it points back at the
+    private-network device that sent it, so nothing can send the launcher elsewhere."""
+    try:
+        if not any(ipaddress.ip_address(sender_ip) in n for n in HOME_NETWORKS):
+            return None
+    except ValueError:
+        return None
+    for line in data.decode("latin-1").split("\r\n")[1:]:
+        name, _sep, value = line.partition(":")
+        if name.strip().lower() == "location":
+            url = value.strip()
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme == "http" and parts.hostname == sender_ip:
+                return url
+            return None
+    return None
+
+
+def upnp_service_from_description(location, timeout=4.0):
+    """(control URL, service type) of the router's port-mapping service, or None."""
+    status, data = _http_request(location, timeout=timeout)
+    if status != 200:
+        return None
+    root = ET.fromstring(data)
+    base = location
+    for el in root.iter():
+        if _xml_local(el.tag) == "URLBase" and (el.text or "").strip():
+            base = el.text.strip()
+    services = {}
+    for svc in root.iter():
+        if _xml_local(svc.tag) == "service":
+            fields = {_xml_local(c.tag): (c.text or "").strip() for c in svc}
+            services[fields.get("serviceType")] = fields.get("controlURL")
+    host = urllib.parse.urlsplit(location).hostname
+    for service in IGD_SERVICE_TYPES:
+        if services.get(service):
+            control = urllib.parse.urljoin(base, services[service])
+            if urllib.parse.urlsplit(control).hostname != host:
+                return None
+            return control, service
+    return None
+
+
+def local_ipv4_addresses():
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        return []
+    return sorted({info[4][0] for info in infos if not info[4][0].startswith("127.")})
+
+
+def upnp_discover(timeout=3.0):
+    """Find the router's port-mapping service over SSDP: (control URL, service type), or
+    None when nothing answers - UPnP off or unsupported, which is common, and sometimes
+    deliberate.
+
+    Asked on EVERY network adapter, not just the default one. Hosts are exactly the
+    people with a VPN or virtual LAN adapter too (Hamachi, Radmin, Tailscale, Cloudflare
+    WARP...), and on a PC like that the default adapter is often the tunnel - found on a
+    real one: the router answered UPnP fine, but only when asked from the Wi-Fi adapter."""
+    socks = []
+    for addr in local_ipv4_addresses() or ["0.0.0.0"]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            sock.bind((addr, 0))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            if addr != "0.0.0.0":
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                socket.inet_aton(addr))
+            for target in ("urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+                           "urn:schemas-upnp-org:device:InternetGatewayDevice:2"):
+                sock.sendto(("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                             "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: %s\r\n\r\n"
+                             % target).encode("ascii"), SSDP_ADDR)
+            socks.append(sock)
+        except OSError:
+            sock.close()
+    seen = set()
+    deadline = time.monotonic() + timeout
+    try:
+        while socks and time.monotonic() < deadline:
+            ready, _w, _x = select.select(socks, [], [], 0.25)
+            for sock in ready:
+                try:
+                    data, (ip, _port) = sock.recvfrom(4096)
+                except OSError:
+                    continue
+                location = parse_ssdp_location(data, ip)
+                if not location or location in seen:
+                    continue
+                seen.add(location)
+                try:
+                    found = upnp_service_from_description(location)
+                except (OSError, ET.ParseError, http.client.HTTPException):
+                    continue
+                if found:
+                    return found
+    finally:
+        for sock in socks:
+            sock.close()
+    return None
+
+
+def upnp_call(igd, action, **args):
+    """One SOAP action on the router; {name: value} of its reply. Arguments are sent in
+    the order given - some routers insist on the spec's order."""
+    control, service = igd
+    body = ('<?xml version="1.0"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+            '<u:%s xmlns:u="%s">%s</u:%s></s:Body></s:Envelope>'
+            % (action, service,
+               "".join("<%s>%s</%s>" % (k, xml_escape(str(v)), k) for k, v in args.items()),
+               action)).encode("utf-8")
+    status, data = _http_request(control, body, {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPAction": '"%s#%s"' % (service, action)})
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        root = None
+    if status != 200:
+        code, text = str(status), "HTTP %d" % status
+        for el in (root.iter() if root is not None else ()):
+            if _xml_local(el.tag) == "errorCode":
+                code = (el.text or "").strip()
+            elif _xml_local(el.tag) == "errorDescription":
+                text = (el.text or "").strip()
+        raise UpnpError(code, text)
+    for el in (root.iter() if root is not None else ()):
+        if _xml_local(el.tag) == action + "Response":
+            return {_xml_local(c.tag): (c.text or "").strip() for c in el}
+    return {}
+
+
+def upnp_external_ip(igd):
+    try:
+        return upnp_call(igd, "GetExternalIPAddress").get("NewExternalIPAddress", "")
+    except (UpnpError, OSError, http.client.HTTPException):
+        return ""
+
+
+def upnp_get_port(igd, port, proto):
+    """The router's entry for this port, or None if there isn't one."""
+    try:
+        return upnp_call(igd, "GetSpecificPortMappingEntry", NewRemoteHost="",
+                         NewExternalPort=port, NewProtocol=proto)
+    except UpnpError:
+        return None
+
+
+def upnp_add_port(igd, port, proto, lan_ip, lease=UPNP_LEASE_SECONDS):
+    """Forward port/proto to this PC; returns the lease the router granted (0 =
+    permanent). A port already forwarded to ANOTHER device is left alone - UpnpError
+    718 names it. Adding it again for this PC just renews it."""
+    entry = upnp_get_port(igd, port, proto)
+    other = (entry or {}).get("NewInternalClient", "")
+    if other and other != lan_ip:
+        raise UpnpError("718", "already forwarded to %s" % other)
+
+    def _add(seconds):
+        upnp_call(igd, "AddPortMapping", NewRemoteHost="", NewExternalPort=port,
+                  NewProtocol=proto, NewInternalPort=port, NewInternalClient=lan_ip,
+                  NewEnabled=1, NewPortMappingDescription="%s %d" % (SHARE_TAG, port),
+                  NewLeaseDuration=seconds)
+    try:
+        _add(lease)
+        return lease
+    except UpnpError as exc:
+        if exc.code != "725" or not lease:      # 725: only permanent mappings supported
+            raise
+    _add(0)
+    return 0
+
+
+def upnp_delete_port(igd, port, proto, lan_ip):
+    """Remove a forward - only one this launcher made (its description) for this PC. A
+    forward the user set up by hand for the same port is never touched."""
+    entry = upnp_get_port(igd, port, proto)
+    if (entry is None or entry.get("NewInternalClient") != lan_ip
+            or not entry.get("NewPortMappingDescription", "").startswith(SHARE_TAG)):
+        return False
+    upnp_call(igd, "DeletePortMapping", NewRemoteHost="", NewExternalPort=port,
+              NewProtocol=proto)
+    return True
+
+
+def local_ip_toward(host):
+    """This PC's address on the network that reaches `host` - what a forward must point
+    at. A UDP connect() only picks the route; nothing is sent."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((host, 9))
+        return sock.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
+def fetch_public_ip(timeout=6):
+    try:
+        req = urllib.request.Request(PUBLIC_IP_URL,
+                                     headers={"User-Agent": GITHUB_API_USER_AGENT})
+        with https_open(req, timeout) as resp:
+            return str(ipaddress.IPv4Address(resp.read(64).decode("ascii", "replace").strip()))
+    except (OSError, ValueError):
+        return ""
+
+
+def a2s_server_name(host, port, timeout=2.0):
+    """The name the server gives Steam's query (A2S_INFO) - exactly what a friend's Steam
+    Favorites asks - or None when nothing answers."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(A2S_INFO_REQUEST, (host, port))
+        data = sock.recv(1400)
+        if data[4:5] == b"A":               # challenge: ask again with it appended
+            sock.sendto(A2S_INFO_REQUEST + data[5:9], (host, port))
+            data = sock.recv(1400)
+        if data[:5] != b"\xff\xff\xff\xffI":
+            return None
+        return data[6:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def _ps_quote(text):
+    return "'%s'" % text.replace("'", "''")
+
+
+def _powershell_args(script):
+    return ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
+
+
+def firewall_read_script(programs):
+    """Unelevated read of the rules that matter, as JSON. Through the firewall's COM
+    object on purpose: Get-NetFirewallRule and friends are "Access is denied" without
+    admin, and netsh's output is translated on non-English Windows. COM answers with
+    numbers: Action 1 allow / 0 block, Direction 1 in, Protocol 17 UDP / 6 TCP / 256 any."""
+    return ("$ErrorActionPreference = 'Stop'\n"
+            "$fw = New-Object -ComObject HNetCfg.FwPolicy2\n"
+            "$names = @(%s, %s)\n"
+            "$progs = @(%s)\n"
+            "$rules = @($fw.Rules | Where-Object { $names -contains $_.Name -or "
+            "($_.ApplicationName -and $progs -contains $_.ApplicationName) } | "
+            "ForEach-Object { @{ name = $_.Name; program = \"$($_.ApplicationName)\"; "
+            "action = [int]$_.Action; direction = [int]$_.Direction; "
+            "protocol = [int]$_.Protocol; ports = \"$($_.LocalPorts)\"; "
+            "profiles = [int]$_.Profiles; enabled = [bool]$_.Enabled } })\n"
+            "$gw = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue"
+            " | Sort-Object RouteMetric | Select-Object -First 1\n"
+            "@{ rules = $rules; profiles = [int]$fw.CurrentProfileTypes; "
+            "gateway = \"$($gw.NextHop)\" } | ConvertTo-Json -Compress -Depth 4\n"
+            % (_ps_quote(FIREWALL_RULE_ARK), _ps_quote(FIREWALL_RULE_AP),
+               ", ".join(_ps_quote(p) for p in programs if p) or "''"))
+
+
+def firewall_read(programs, timeout=60):
+    """{"rules": [...], "profiles": int, "gateway": str}; raises OSError if unreadable."""
+    try:
+        out = subprocess.run(["powershell.exe"] + _powershell_args(firewall_read_script(programs)),
+                             capture_output=True, text=True, timeout=timeout,
+                             stdin=subprocess.DEVNULL,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError("PowerShell didn't run: %s" % exc)
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        raise OSError((out.stderr or out.stdout or "no output").strip()[:300])
+    rules = data.get("rules") or []
+    data["rules"] = [rules] if isinstance(rules, dict) else rules
+    return data
+
+
+def _ports_cover(rule_ports, wanted):
+    if rule_ports.strip() in ("*", ""):
+        return True
+    have = set()
+    for part in rule_ports.split(","):
+        lo, _sep, hi = part.strip().partition("-")
+        try:
+            have.update(range(int(lo), int(hi or lo) + 1))
+        except ValueError:
+            continue
+    return set(wanted) <= have
+
+
+def firewall_verdict(data, exe, udp_ports, ap_exe="", ap_port=None):
+    """(state, detail) for the checks panel: "ok" | "fail". Allowed means an enabled
+    inbound allow rule for the program covers the ports on the network profile in use -
+    ours, or one Windows made when its own "Allow access" popup was answered. Any
+    enabled inbound BLOCK rule for the program beats every allow rule, so it's a fail."""
+    current = data.get("profiles") or 0x7FFFFFFF
+    norm = lambda p: os.path.normcase(os.path.normpath(p)) if p else ""
+
+    def applies(rule, program, proto):
+        return (rule.get("enabled") and rule.get("direction") == 1
+                and norm(rule.get("program")) == norm(program)
+                and rule.get("protocol") in (proto, 256)
+                and (rule.get("profiles", 0x7FFFFFFF) & current))
+
+    rules = data.get("rules") or []
+    checks = [(exe, 17, udp_ports, "the ARK server")]
+    if ap_exe and ap_port:
+        checks.append((ap_exe, 6, [ap_port], "Archipelago's room"))
+    for program, proto, ports, what in checks:
+        blocks = [r["name"] for r in rules if applies(r, program, proto) and r.get("action") == 0]
+        if blocks:
+            return ("fail", "%d rule(s) block %s (%s) - Windows makes these when its "
+                            "\"Allow access\" popup is cancelled. \"Allow through Windows "
+                            "Firewall\" removes them."
+                    % (len(blocks), what, ", ".join(sorted(set(blocks)))))
+        if not any(applies(r, program, proto) and r.get("action") == 1
+                   and _ports_cover(r.get("ports", ""), ports) for r in rules):
+            return ("fail", "Nothing lets friends reach %s yet - click \"Allow through "
+                            "Windows Firewall\"." % what)
+    return ("ok", "Allowed on this network.")
+
+
+def firewall_apply_script(exe, udp_ports, ap_exe, ap_port, result_path):
+    """The elevated half: replace our rule(s) by name, and delete the inbound BLOCK rules
+    for the server (they beat any allow rule). Reports back through result_path - an
+    elevated process can't hand its output to this one directly."""
+    lines = ["$ErrorActionPreference = 'Stop'", "try {",
+             "  $exe = %s" % _ps_quote(exe),
+             "  Get-NetFirewallRule -DisplayName %s -ErrorAction SilentlyContinue | "
+             "Remove-NetFirewallRule" % _ps_quote(FIREWALL_RULE_ARK),
+             "  New-NetFirewallRule -DisplayName %s -Description %s -Direction Inbound "
+             "-Action Allow -Profile Any -Protocol UDP -LocalPort %s -Program $exe | Out-Null"
+             % (_ps_quote(FIREWALL_RULE_ARK),
+                _ps_quote("Lets friends join your ARK server. Added by the ARKipelago "
+                          "Launcher (Configuration -> Friends over the internet)."),
+                ",".join(str(p) for p in udp_ports)),
+             "  Get-NetFirewallRule -Direction Inbound -Action Block -ErrorAction "
+             "SilentlyContinue | Where-Object { ($_ | Get-NetFirewallApplicationFilter)"
+             ".Program -eq $exe } | Remove-NetFirewallRule"]
+    if ap_exe and ap_port:
+        lines += ["  Get-NetFirewallRule -DisplayName %s -ErrorAction SilentlyContinue | "
+                  "Remove-NetFirewallRule" % _ps_quote(FIREWALL_RULE_AP),
+                  "  New-NetFirewallRule -DisplayName %s -Direction Inbound -Action Allow "
+                  "-Profile Any -Protocol TCP -LocalPort %d -Program %s | Out-Null"
+                  % (_ps_quote(FIREWALL_RULE_AP), ap_port, _ps_quote(ap_exe))]
+    lines += ["  Set-Content -LiteralPath %s -Value 'ok'" % _ps_quote(result_path),
+              "} catch {",
+              "  Set-Content -LiteralPath %s -Value ($_ | Out-String)" % _ps_quote(result_path),
+              "  exit 1", "}"]
+    return "\n".join(lines) + "\n"
+
+
+class _ShellExecuteInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("fMask", ctypes.c_ulong),
+                ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
+                ("lpFile", ctypes.c_wchar_p), ("lpParameters", ctypes.c_wchar_p),
+                ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
+                ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
+                ("dwHotKey", ctypes.c_ulong), ("hIconOrMonitor", ctypes.c_void_p),
+                ("hProcess", ctypes.c_void_p)]
+
+
+def run_elevated(exe, args, timeout=180):
+    """Run exe with admin rights - one UAC prompt - and wait for it. The exit code, or
+    None when the prompt was answered No. Only this child is elevated; the launcher
+    never is, and nothing about the PyInstaller build changes for it."""
+    info = _ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x40 | 0x100            # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    info.lpVerb, info.lpFile = "runas", exe
+    info.lpParameters = subprocess.list2cmdline(args)
+    info.nShow = 0                       # SW_HIDE
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = (ctypes.POINTER(_ShellExecuteInfo),)
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        if err == 1223:                  # ERROR_CANCELLED: the user said No
+            return None
+        raise OSError(err, ctypes.FormatError(err))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+    kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    try:
+        if kernel32.WaitForSingleObject(info.hProcess, timeout * 1000) != 0:
+            raise OSError("the admin step didn't finish within %d seconds" % timeout)
+        code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        return code.value
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+
+
+def firewall_apply(exe, udp_ports, ap_exe="", ap_port=None):
+    """(ok, message). ok is None when the admin prompt was declined."""
+    fd, result_path = tempfile.mkstemp(prefix="arkap_fw_", suffix=".txt")
+    os.close(fd)
+    try:
+        code = run_elevated("powershell.exe", _powershell_args(
+            firewall_apply_script(exe, udp_ports, ap_exe, ap_port, result_path)))
+        if code is None:
+            return None, "You said No to the admin prompt, so nothing was changed."
+        try:
+            with open(result_path, encoding="utf-8-sig", errors="replace") as fh:
+                result = fh.read().strip()
+        except OSError:
+            result = ""
+        if code == 0 and result == "ok":
+            return True, "Windows Firewall now lets friends reach the server."
+        return False, result or "PowerShell exited with code %s." % code
+    finally:
+        try:
+            os.remove(result_path)
+        except OSError:
+            pass
+
+
+def share_survey(action, params, lease=UPNP_LEASE_SECONDS):
+    """Everything the Friends-over-the-internet panel shows, gathered on a worker thread.
+    action: "check" (look only), "open" (forward params["mappings"], then look), or
+    "close" (remove params["close"] - ours only - and nothing else).
+
+    The verdict is never "it works": nothing on this PC can prove a friend gets in. UDP
+    tested from inside your own network lies, and most routers can't loop back to their
+    own public address. Only a friend's Steam Favorites can - see share_report_rows."""
+    result = {"action": action, "opened": [], "closed": [], "errors": [],
+              "lan_ip": "", "public_ip": "", "wan_ip": "", "gateway": "", "igd": False}
+    igd = upnp_discover()
+    result["igd"] = bool(igd)
+    fw_data, fw_error = None, ""
+    if action != "close" and params.get("exe"):
+        try:
+            fw_data = firewall_read([params["exe"], params.get("ap_exe", "")])
+            result["gateway"] = fw_data.get("gateway", "")
+        except OSError as exc:
+            fw_error = str(exc)
+    router_host = (urllib.parse.urlsplit(igd[0]).hostname if igd
+                   else result["gateway"] or "8.8.8.8")
+    lan = result["lan_ip"] = local_ip_toward(router_host)
+    # A VPN carrying this PC's internet traffic (Cloudflare WARP, a full-tunnel VPN):
+    # the route to the internet leaves by another adapter than the route to the router.
+    # Then api.ipify.org sees the VPN's address - wrong to share, and comparing it with
+    # the router's would cry carrier-grade NAT - and the server's replies may leave
+    # through the tunnel instead of back through the router.
+    internet_ip = local_ip_toward("8.8.8.8")
+    tunnel = internet_ip if internet_ip and lan and internet_ip != lan else ""
+    result["tunnel_ip"] = tunnel
+    if action == "close":
+        for port, proto in params.get("close", []):
+            if not igd:
+                result["errors"].append(((port, proto), "the router didn't answer"))
+                continue
+            try:
+                upnp_delete_port(igd, port, proto, lan)
+                result["closed"].append((port, proto))
+            except (UpnpError, OSError, http.client.HTTPException) as exc:
+                result["errors"].append(((port, proto), str(exc)))
+        return result
+
+    mappings = list(params.get("mappings", []))
+    ap_port = params.get("ap_port")
+    if ap_port and is_process_running(ARCHIPELAGO_SERVER_EXE):
+        mappings = share_mappings(params["gameport"], params["queryport"],
+                                  params["rconport"], ap_port)
+    mapped, conflict = [], ""
+    if igd:
+        result["wan_ip"] = upnp_external_ip(igd)
+        for port, proto in mappings:
+            try:
+                if action == "open":
+                    upnp_add_port(igd, port, proto, lan, lease)
+                    result["opened"].append((port, proto))
+                    mapped.append((port, proto))
+                else:
+                    entry = upnp_get_port(igd, port, proto) or {}
+                    owner = entry.get("NewInternalClient", "")
+                    if owner == lan:
+                        mapped.append((port, proto))
+                    elif owner:
+                        conflict = conflict or "%d/%s is already forwarded to %s" % (
+                            port, proto, owner)
+            except UpnpError as exc:
+                if exc.code == "718":
+                    conflict = conflict or "%d/%s is %s" % (port, proto, exc.text)
+                result["errors"].append(((port, proto), str(exc)))
+            except (OSError, http.client.HTTPException) as exc:
+                result["errors"].append(((port, proto), str(exc)))
+    fetched = "" if tunnel else fetch_public_ip()
+    result["public_ip"] = fetched
+    if classify_connection(result["wan_ip"], "") == "ok" and not fetched:
+        result["public_ip"] = result["wan_ip"]     # the router's own word for it
+
+    listing = ", ".join(str(p) for p, pr in mappings if pr == "UDP") + " (UDP)" + "".join(
+        ", %d (TCP)" % p for p, pr in mappings if pr == "TCP")
+    if not igd:
+        router = ("fail", "Your router didn't answer: UPnP is turned off or not supported. "
+                          "Turn UPnP on in the router's settings, or forward the ports by "
+                          "hand (below).")
+    elif conflict:
+        router = ("fail", "Port %s - another device on your network. Change GAMEPORT / "
+                          "QUERYPORT, or remove that forward on the router." % conflict)
+    elif mapped and len(mapped) == len(mappings):
+        router = ("ok", "%s forwarded to this PC (%s)." % (listing, lan))
+    elif result["errors"]:
+        router = ("fail", "The router refused: %s" % "; ".join(
+            "%d/%s: %s" % (m[0], m[1], why) for m, why in result["errors"][:3]))
+    elif params.get("server_up"):
+        router = ("idle", "Not forwarded - tick \"Open ports for friends\" above.")
+    else:
+        router = ("idle", "Opened when the server starts, closed again when it stops.")
+    result["router"] = router
+
+    kind = classify_connection(result["wan_ip"], fetched)
+    if kind == "ok":
+        connection = ("ok", "Your router is directly on the internet (%s)." % result["wan_ip"])
+    elif kind == "cgnat":
+        connection = ("fail", "Your internet provider shares one public address between many "
+                              "customers (carrier-grade NAT), so port forwarding can't work on "
+                              "your connection. Choose \"Use Tailscale\" above instead.")
+    elif kind == "double_nat":
+        connection = ("fail", "Your router doesn't have a public address - it was given the "
+                              "private address %s, so something else does NAT in front of it. "
+                              "If you have a second router or a provider's modem-router at "
+                              "home, forward the ports on that too, or put it in bridge mode. "
+                              "If you don't, your provider is doing it (carrier-grade NAT) and "
+                              "port forwarding can't work - choose \"Use Tailscale\" above."
+                      % result["wan_ip"])
+    else:
+        connection = ("idle", "Couldn't tell - the router didn't say its internet address.")
+    if tunnel and connection[0] != "fail":
+        connection = ("warn", (connection[1] + " " if connection[0] == "ok" else "") +
+                      "But this PC sends its internet traffic through another adapter "
+                      "(%s - a VPN such as Cloudflare WARP?). Friends arrive through your "
+                      "router, but the server's replies may leave through the VPN and "
+                      "never reach them. If friends can't connect, pause the VPN while "
+                      "you host." % tunnel)
+    result["connection"] = connection
+
+    exe, udp_ports = params.get("exe", ""), [p for p, pr in mappings if pr == "UDP"]
+    if not exe:
+        result["firewall"] = ("idle", "Install the ARK server first.")
+    elif fw_data is None:
+        result["firewall"] = ("idle", "Couldn't read the firewall rules: %s" % fw_error)
+    else:
+        hosting_ap = any(pr == "TCP" for _p, pr in mappings)
+        result["firewall"] = firewall_verdict(
+            fw_data, exe, udp_ports, params.get("ap_exe", "") if hosting_ap else "",
+            ap_port if hosting_ap else None)
+
+    if params.get("server_up"):
+        name = a2s_server_name(lan or "127.0.0.1", params["queryport"])
+        result["server"] = (("ok", "Answers Steam's query as \"%s\"." % name) if name else
+                            ("warn", "Running, but not answering Steam's query on port %d "
+                                     "yet - a big map can take many minutes to load."
+                             % params["queryport"]))
+    else:
+        result["server"] = ("idle", "Not running.")
+    return result
+
+
+# Tailscale: for when router ports can't work (carrier-grade NAT, double NAT, no UPnP).
+# Chosen over Hamachi / Radmin / ZeroTier because the launcher can drive it end to end -
+# a documented command line (status / login / ip / set), an official signed installer at
+# a stable address - it's free for this, and it goes straight through carrier-grade NAT.
+# Sharing this one PC with friends is the one step with no command: it's a button on
+# Tailscale's own admin page, which the launcher opens.
+TAILSCALE_INSTALLER_URL = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+# The installer runs with admin rights, so it's never run unless Windows says it carries a
+# valid signature from this publisher (what the installed tailscale.exe is signed with).
+TAILSCALE_SIGNER_PREFIX = "CN=Tailscale Inc.,"
+TAILSCALE_ADMIN_MACHINES_URL = "https://login.tailscale.com/admin/machines"
+TAILSCALE_LOGIN_URL_RE = re.compile(r"https://login\.tailscale\.com/[^\s\"'<>]+")
+TAILSCALE_LOGIN_SECONDS = 300
+
+
+def tailscale_exe():
+    path = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                        "Tailscale", "tailscale.exe")
+    return path if os.path.isfile(path) else ""
+
+
+def _run_quiet(args, timeout=20):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def parse_tailscale_status(text):
+    """`tailscale status --json` -> {"state", "ip"}. state is Tailscale's BackendState:
+    Running / NeedsLogin / Stopped / Starting / NoState; "" when unreadable."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {"state": "", "ip": ""}
+    ips = ((data.get("Self") or {}).get("TailscaleIPs")) or []
+    ip = next((a for a in ips if a.count(".") == 3), "")
+    return {"state": data.get("BackendState") or "", "ip": ip}
+
+
+def tailscale_state():
+    """{"installed", "state", "ip", "shields_up", "error"} - read-only."""
+    exe = tailscale_exe()
+    info = {"installed": bool(exe), "state": "", "ip": "", "shields_up": False, "error": ""}
+    if not exe:
+        return info
+    try:
+        info.update(parse_tailscale_status(_run_quiet([exe, "status", "--json"]).stdout))
+        # "Allow incoming connections" off (shields up) blocks friends even when all
+        # else is right. Read from the prefs; a CLI without it just skips the check.
+        prefs = _run_quiet([exe, "debug", "prefs"]).stdout
+        info["shields_up"] = bool(re.search(r'"ShieldsUp":\s*true', prefs))
+    except (OSError, subprocess.SubprocessError) as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def tailscale_login_url(line):
+    """The sign-in link from a line of `tailscale login` output - only ever one on
+    login.tailscale.com, so nothing else can be opened in the user's browser."""
+    match = TAILSCALE_LOGIN_URL_RE.search(line or "")
+    return match.group(0) if match else ""
+
+
+def tailscale_login(exe, on_url, seconds=TAILSCALE_LOGIN_SECONDS, verb="login"):
+    """Run `tailscale login` (it prints a link, then waits until the browser sign-in is
+    done), handing the link to on_url. (ok, message)."""
+    proc = subprocess.Popen([exe, verb, "--timeout=%ds" % seconds],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                            errors="replace",
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    tail, opened = [], False
+    for line in proc.stdout:
+        url = tailscale_login_url(line)
+        if url and not opened:
+            opened = True
+            on_url(url)
+        elif line.strip():
+            tail.append(line.strip())
+    proc.wait()
+    if proc.returncode == 0:
+        return True, "Signed in."
+    return False, (tail[-1] if tail else "tailscale login exited with code %s"
+                   % proc.returncode)
+
+
+def authenticode_signer(path):
+    """(status, signer subject) from Windows' own signature check of a file."""
+    script = ("$s = Get-AuthenticodeSignature -LiteralPath %s\n"
+              "\"$($s.Status)|$($s.SignerCertificate.Subject)\"\n" % _ps_quote(path))
+    out = _run_quiet(["powershell.exe"] + _powershell_args(script), timeout=60).stdout.strip()
+    status, _sep, subject = out.partition("|")
+    return status, subject
+
+
+def is_tailscale_signed(status, subject):
+    return status == "Valid" and subject.startswith(TAILSCALE_SIGNER_PREFIX)
+
+
+def tailscale_install(fetch=None, check=None, run=None):
+    """Download Tailscale's official installer, check its signature, run it (it asks for
+    admin itself, and shows its own terms). (ok, message); ok None = the admin prompt
+    was declined. fetch/check/run are for the test."""
+    fetch = fetch or _download_bytes
+    check = check or authenticode_signer
+    run = run or run_elevated
+    fd, path = tempfile.mkstemp(prefix="tailscale-setup-", suffix=".exe")
+    os.close(fd)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(fetch(TAILSCALE_INSTALLER_URL, timeout=120))
+        status, subject = check(path)
+        if not is_tailscale_signed(status, subject):
+            return False, ("The downloaded installer isn't validly signed by Tailscale Inc. "
+                           "(signature: %s, %s), so it was NOT run. Install Tailscale from "
+                           "tailscale.com/download instead." % (status or "none",
+                                                                subject or "no signer"))
+        code = run(path, [], timeout=900)
+        if code is None:
+            return None, "You said No to the admin prompt, so Tailscale wasn't installed."
+        if code not in (0, 3010) or not tailscale_exe():      # 3010: reboot pending
+            return False, "The Tailscale installer finished without installing (code %s)." % code
+        return True, "Tailscale is installed."
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+SHARE_ROW_TITLES = (("firewall", "Windows Firewall"), ("router", "Router ports (UPnP)"),
+                    ("connection", "Your connection"), ("server", "Server answers on this PC"))
+
+
+def share_report_rows(result):
+    """([(state, title, detail)], (verdict state, verdict text)). Never a green verdict -
+    see share_survey."""
+    rows = [(result[key][0], title, result[key][1])
+            for key, title in SHARE_ROW_TITLES if key in result]
+    states = [r[0] for r in rows]
+    if "fail" in states:
+        verdict = ("fail", "Friends can't get in yet - see the rows marked with an X.")
+    elif states and all(s == "ok" for s in states):
+        verdict = ("warn", "Ready as far as this PC can tell - ask a friend to check. If "
+                           "your server shows up in their Steam Favorites with its name "
+                           "and map, it works.")
+    else:
+        verdict = ("idle", "Not everything could be checked yet - see above.")
+    return rows, verdict
+
+
+def _drop_sections(content, titles):
+    """The (tag, line) guide content minus the named h1 sections and everything under
+    them, up to the next h1. Used to build the tab's copy from the same source the
+    Legacy Instructions window renders whole - one text to keep up to date, not two."""
+    out, skipping = [], False
+    for tag, line in content:
+        if tag == "h1":
+            skipping = line in titles
+        if not skipping:
+            out.append((tag, line))
+    return out
+
+
 def aggregate_status_state(items):
     """Overall Setup Status colour from the per-check list: any hard fail -> "fail",
     else any advisory -> "info", else "ok"."""
@@ -2337,6 +3514,177 @@ def format_setup_status_summary(items):
     lines.append("")
     lines.append("Overall: %s" % tag.get(aggregate_status_state(items), "?"))
     return "\n".join(lines)
+
+
+# --- Get Started tab ---------------------------------------------------------- #
+# The guided setup is a VIEW over the Setup Status rows, never a second set of checks:
+# each step names the row ids (see _gather_setup_status) it is made of, so the two tabs
+# can't disagree.
+#   rows      - must all be present and "ok" for the step to be done. A row that isn't
+#               there yet (e.g. apworld before the Archipelago folder is set) is not done.
+#   problems  - rows that only appear when something is wrong; absent means fine.
+#   extra     - wizard-only facts from _wizard_extras that Setup Status has no row for
+#               (server running, "I'm connected" tick, mods ticked, PopTracker present).
+#   needs     - steps whose rows/extras must pass (or that were skipped) first. Their
+#               problems don't count: a server on the wrong branch is still a server
+#               ArkApi can be installed into. Always EARLIER in this list.
+#   transient - live state, not setup: doesn't count towards "setup complete".
+# Optional steps never block anything and are never the highlighted "current" step.
+# Red rows no button can fix (a hand edit, a folder move, a locked file): the step's
+# button sends you to the row's explanation instead of offering one that won't help.
+WIZARD_NO_BUTTON_ROWS = {"program_files"}
+WIZARD_GROUPS = [
+    ("server", "ARK server"),
+    ("extras", "Extras"),
+    ("archipelago", "Archipelago"),
+    ("play", "Play"),
+]
+WIZARD_STEPS = [
+    {"key": "server", "group": "server", "title": "Install the ARK server",
+     "desc": "Pick an empty folder of its own (never your ARK game folder) and download "
+             "the dedicated server into it - about 18 GB.",
+     "rows": ["server"], "problems": ["branch"], "tab": "tab_install"},
+    {"key": "arkapi", "group": "server", "title": "Install ArkServerApi",
+     "desc": "The plugin loader. Unpacked straight into the server for you.",
+     "rows": ["arkapi"], "needs": ["server"], "tab": "tab_install"},
+    {"key": "plugin", "group": "server", "title": "Install the ArkAP plugin",
+     "desc": "Adds Archipelago to the server. Takes a few seconds.",
+     "rows": ["plugin"], "problems": ["plugin_mode"], "needs": ["arkapi"],
+     "tab": "tab_install"},
+    {"key": "cluster", "group": "server", "title": "Create the cluster folders",
+     "desc": "Where the server keeps saves and cluster data. The server hangs on "
+             "launch without them.",
+     "rows": ["cluster"], "problems": ["cluster_foreign"], "needs": ["server"],
+     "tab": "tab_config"},
+    {"key": "paths", "group": "server", "title": "Check paths and Save",
+     "desc": "Writes your settings into the server scripts. Quick Launch refuses to "
+             "start the server until this is done.",
+     "rows": ["saved", "scripts_sourced"],
+     "problems": ["game_ini_outside", "game_ini_client", "program_files"],
+     "needs": ["plugin", "cluster"], "tab": "tab_config"},
+    {"key": "mods", "group": "extras", "title": "Add mods", "optional": True,
+     "desc": "Steam Workshop mods. Do this before your yaml - its mod list has to "
+             "match what the server loads.",
+     "rows": ["mods_match"], "extra": ["mods_on"], "needs": ["server"],
+     "tab": "tab_mods"},
+    {"key": "stacks", "group": "extras", "title": "Increase stack sizes", "optional": True,
+     "desc": "Bigger item stacks on the server. Turn it on under Configuration -> "
+             "Increase stacks, then apply it.",
+     "rows": ["stacks"], "problems": ["excalibur"], "needs": ["paths"],
+     "tab": "tab_config"},
+    # Always shown open - it's a question, not a task, and the answer may change later.
+    {"key": "role", "group": "archipelago", "title": "Hosting or joining?",
+     "desc": "Decides which Archipelago steps below are yours. Change it any time.",
+     "extra": ["role_answered"], "tab": "tab_archipelago", "questionnaire": True},
+    {"key": "ap_dir", "group": "archipelago", "title": "Find Archipelago",
+     "desc": "Your own Archipelago install - it builds the yaml and the seed. Can be "
+             "done while the server downloads.",
+     "rows": ["ap_dir"], "tab": "tab_archipelago"},
+    {"key": "apworld", "group": "archipelago", "title": "Install the ARK .apworld",
+     "desc": "Teaches Archipelago about ARK. Without it ARK isn't in the game list.",
+     "rows": ["apworld"], "needs": ["ap_dir"], "tab": "tab_archipelago"},
+    {"key": "yaml", "group": "archipelago", "title": "Make your yaml",
+     "desc": "Pick ARK in the Options Creator, Export Options, and save it into the "
+             "Players folder. Note your slot name.",
+     "rows": ["yaml"], "needs": ["apworld"], "tab": "tab_archipelago"},
+    {"key": "seed", "group": "archipelago", "title": "Generate the seed",
+     "desc": "Builds the multiworld from every yaml in the Players folder.",
+     "rows": ["seed"], "needs": ["yaml"], "tab": "tab_archipelago"},
+    {"key": "room", "group": "archipelago", "title": "Host the room",
+     "desc": "Upload the seed to archipelago.gg, or host it on this PC. Then fill in "
+             "server and slot.",
+     "rows": ["room"], "needs": ["seed"], "tab": "tab_archipelago"},
+    {"key": "poptracker", "group": "archipelago", "title": "Set up PopTracker",
+     "optional": True,
+     "desc": "A live tracker map. Downloads PopTracker and the ARK pack.",
+     "extra": ["poptracker"], "needs": ["room"], "tab": "tab_archipelago"},
+    {"key": "start", "group": "play", "title": "Start the ARK server", "transient": True,
+     "desc": "Wait for the console to finish its startup messages before joining.",
+     "problems": ["broken_mods"], "extra": ["running"], "needs": ["paths"],
+     "tab": "tab_config"},
+    {"key": "connect", "group": "play", "title": "Join and connect",
+     "desc": "Join from the LAN server list, spawn in, and paste the connect command "
+             "into chat. Tick it off once you're connected.",
+     "extra": ["connected"], "needs": ["start", "room"], "tab": "tab_archipelago"},
+]
+
+
+def wizard_steps_for(role, yaml_by):
+    """WIZARD_STEPS for the questionnaire's answers. Hosting (or not answered yet) is
+    the full list. Joining someone else's room drops generating a seed and hosting a
+    room - the host does those - and the room step becomes entering the host's details.
+    If the host is also making the yaml, finding Archipelago, the .apworld and the yaml
+    go too: a joiner needs those only to make a yaml. A joiner making their own yaml
+    exports it wherever they like and sends it off, so that step is a tick ("I've sent
+    it"), not a look in Archipelago's Players folder."""
+    if role != "join":
+        return WIZARD_STEPS
+    drop = {"seed"} | ({"ap_dir", "apworld", "yaml"} if yaml_by == "host" else set())
+    out = []
+    for spec in WIZARD_STEPS:
+        if spec["key"] in drop:
+            continue
+        if spec["key"] == "yaml":
+            spec = dict(spec, rows=[], extra=["yaml_sent"],
+                        title="Make your yaml and send it to the host",
+                        desc="Pick ARK in the Options Creator, Export Options, and send "
+                             "the file to whoever is hosting. Tick it off once it's sent.")
+        elif spec["key"] == "room":
+            spec = dict(spec, needs=[], title="Enter the host's room details",
+                        desc="Ask the host for the server address (host:port), your slot "
+                             "name and the room password, and fill them in.")
+        out.append(spec)
+    return out
+
+
+def compute_wizard_steps(items, extras):
+    """(steps, other_problems, complete) for the Get Started tab.
+
+    Each step is its WIZARD_STEPS spec plus: state ("done" / "skipped" / "current" /
+    "ready" / "blocked"), waiting_on (titles of unfinished `needs`), failing (its rows
+    that are a red X right now), todo (its first row that isn't ok, for the hint) and
+    busy. other_problems are red-X rows no step owns. complete never holds while
+    Setup Status has any red X."""
+    by_id = {it["id"]: it for it in items if it.get("id")}
+    skipped = set(extras.get("skipped", ()))
+    busy = set(extras.get("busy", ()))
+    specs = wizard_steps_for(extras.get("role"), extras.get("yaml_by"))
+    titles = {spec["key"]: spec["title"] for spec in specs}
+    states, steps, owned, present = {}, [], set(), set()
+    for spec in specs:
+        owned.update(spec.get("rows", ()))
+        owned.update(spec.get("problems", ()))
+        rows = [by_id.get(r) for r in spec.get("rows", ())]
+        probs = [by_id[r] for r in spec.get("problems", ()) if r in by_id]
+        failing = [r for r in rows + probs if r and r["state"] == "fail"]
+        todo = next((r for r in rows + probs if r and r["state"] != "ok"), None)
+        exists = (all(r and r["state"] == "ok" for r in rows)
+                  and all(extras.get(k) for k in spec.get("extra", ())))
+        done = exists and not failing
+        waiting = [titles[n] for n in spec.get("needs", ())
+                   if n not in present and states.get(n) != "skipped"]
+        if done:
+            state = "done"
+        elif spec.get("optional") and spec["key"] in skipped and not failing:
+            state = "skipped"
+        elif waiting:
+            state = "blocked"
+        else:
+            state = "ready"
+        states[spec["key"]] = state
+        if exists:
+            present.add(spec["key"])
+        steps.append(dict(spec, state=state, waiting_on=waiting, failing=failing,
+                          todo=todo, busy=spec["key"] in busy))
+    for step in steps:
+        if step["state"] == "ready" and not step.get("optional"):
+            step["state"] = "current"
+            break
+    other = [it for it in items if it["state"] == "fail" and it.get("id") not in owned]
+    complete = (aggregate_status_state(items) != "fail"
+                and all(s["state"] == "done" for s in steps
+                        if not s.get("optional") and not s.get("transient")))
+    return steps, other, complete
 
 
 # --- Diagnostics bundle: collection helpers --------------------------------- #
@@ -2568,6 +3916,86 @@ def format_dir_listing(path, label):
     return "\n".join(lines) + "\n"
 
 
+# --- HTTPS: trust what Windows trusts ------------------------------------------ #
+# Python's ssl checks certificates against its own idea of the trusted roots, which
+# misses what Windows itself trusts: the root an antivirus installs to scan HTTPS, a
+# company or school network's inspection certificate, a root Windows hasn't fetched yet.
+# Those users got certificate errors from GitHub while their browser worked fine.
+# truststore verifies through Windows' own certificate-chain API instead, so the launcher
+# trusts exactly what the rest of the PC trusts - no more, no less.
+#
+# Verification is NEVER switched off - not as a fallback, not behind a setting. The
+# launcher downloads DLLs that run inside the ARK server. Without truststore (a source
+# checkout that hasn't installed requirements-build.txt) this is Python's own default
+# context: still verifying, just against the narrower list.
+try:
+    import truststore
+except ImportError:
+    truststore = None
+
+
+def _make_https_context():
+    if truststore is not None:
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return ssl.create_default_context()
+
+
+HTTPS_CONTEXT = _make_https_context()
+HTTPS_TRUST_SOURCE = (
+    "Windows certificate store (truststore %s)" % truststore.__version__
+    if truststore is not None else
+    "Python's bundled CA list (truststore not installed - Windows-trusted inspection "
+    "certificates will be rejected)")
+
+CERT_ERROR_MESSAGE = (
+    "Couldn't make a secure connection to %(host)s: the certificate it presented isn't "
+    "one this PC trusts, so nothing was downloaded.\n\n"
+    "This is usually one of:\n"
+    "  - Antivirus HTTPS / web scanning intercepting the connection. Turn off its "
+    "\"HTTPS scanning\" or \"encrypted connection scanning\", or add an exception for "
+    "this launcher.\n"
+    "  - A school, work or other managed network inspecting HTTPS traffic. Try another "
+    "network.\n"
+    "  - The PC's date or time being wrong. Check it in Windows Settings -> Time & "
+    "language.\n\n"
+    "(For whoever helps you: %(detail)s)")
+
+
+class CertificateProblem(urllib.error.URLError):
+    """A download refused because the server's certificate didn't verify. A URLError
+    (so an OSError), so every existing `except OSError` / `except URLError` around a
+    download still catches it - and prints this plain explanation where it used to print
+    an SSL traceback."""
+
+    def __str__(self):
+        return self.reason
+
+
+def _is_certificate_failure(exc):
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    return isinstance(reason, ssl.SSLError) and "CERTIFICATE" in str(reason).upper()
+
+
+def https_open(req, timeout):
+    """urllib.request.urlopen for every download in the launcher: verified against the
+    Windows certificate store (HTTPS_CONTEXT), with a certificate failure turned into a
+    CertificateProblem that says in plain words what's usually behind it. Redirects (a
+    GitHub asset hops to objects.githubusercontent.com) go through the same context."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=HTTPS_CONTEXT)
+    except (urllib.error.URLError, ssl.SSLError) as exc:
+        if not _is_certificate_failure(exc):
+            raise
+        url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+        reason = getattr(exc, "reason", exc)
+        detail = getattr(reason, "verify_message", None) or str(reason)
+        raise CertificateProblem(CERT_ERROR_MESSAGE % {
+            "host": urllib.parse.urlsplit(url).hostname or url,
+            "detail": detail}) from exc
+
+
 def format_version_block(cfg):
     """Every version a helper would otherwise have to ask for, in one file.
 
@@ -2583,6 +4011,9 @@ def format_version_block(cfg):
             ("ArkServerApi", cfg.get(ARKAPI_INSTALLED_VERSION_KEY, ""))]
     lines = ["Component versions", time.strftime("Generated %Y-%m-%d %H:%M:%S"), ""]
     lines += ["%-24s %s" % (label, str(val).strip() or "unknown") for label, val in rows]
+    # Which certificates downloads were checked against - the first question for any
+    # "certificate verify failed" report.
+    lines += ["%-24s %s" % ("HTTPS trust", HTTPS_TRUST_SOURCE)]
     lines += ["", "\"unknown\" = the version couldn't be established: the launcher has no "
                   "record of installing that component AND couldn't identify the files on "
                   "disk (see _detect_component_versions - a locally built plugin matches no "
@@ -2602,7 +4033,7 @@ def fetch_latest_release_tag(api_url):
         req = urllib.request.Request(
             api_url, headers={"User-Agent": GITHUB_API_USER_AGENT,
                               "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with https_open(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         if isinstance(data, list):
             data = next((r for r in data if isinstance(r, dict) and not r.get("draft")), None)
@@ -2777,7 +4208,7 @@ def _fetch_arkap_release_list():
         ARKAP_PLUGIN_RELEASES_API,
         headers={"User-Agent": GITHUB_API_USER_AGENT,
                  "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with https_open(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data if isinstance(data, list) else []
 
@@ -2794,7 +4225,7 @@ def _fetch_newest_release(api_url):
     req = urllib.request.Request(
         api_url, headers={"User-Agent": GITHUB_API_USER_AGENT,
                           "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with https_open(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     if isinstance(data, dict):
         data = [data]
@@ -2844,7 +4275,7 @@ def _asset_sha256(asset):
 def _download_bytes(url, timeout=60):
     """Whole asset into memory. Only used for the plugin probe's ~380 KB zips."""
     req = urllib.request.Request(url, headers={"User-Agent": GITHUB_API_USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with https_open(req, timeout=timeout) as resp:
         return resp.read()
 
 
@@ -3500,10 +4931,15 @@ def extract_bundled_scripts():
             except OSError as exc:
                 errors.append("%s: %s" % (rel, exc))
                 continue
-            if not is_pre_paths_script(old_text):
-                continue
+            pre_paths = is_pre_paths_script(old_text)
             try:
                 new_text, _ = read_text(src)
+            except OSError as exc:
+                errors.append("%s: %s" % (rel, exc))
+                continue
+            if not pre_paths and script_version(new_text) <= script_version(old_text):
+                continue
+            try:
                 # The fields the GUI owns for this script (MAP, SESSION, ports, ...)
                 # are per-script and live nowhere else, so they come across as-is.
                 # Everything not listed takes the canonical value deliberately: the
@@ -3513,12 +4949,15 @@ def extract_bundled_scripts():
                     kept = bat_read_var(old_text, var)
                     if kept is not None:
                         new_text, _ = bat_write_var(new_text, var, kept)
-                shutil.copyfile(dst, dst + PRE_PATHS_BACKUP_SUFFIX)
+                shutil.copyfile(dst, dst + (
+                    PRE_PATHS_BACKUP_SUFFIX if pre_paths else
+                    SCRIPT_UPGRADE_BACKUP_SUFFIX % script_version(new_text)))
                 write_text(dst, new_text, old_enc)
             except OSError as exc:
                 errors.append("%s: %s" % (rel, exc))
                 continue
-            pre_paths_texts[os.path.basename(rel)] = old_text
+            if pre_paths:     # only those hand their shared values over to paths.cmd
+                pre_paths_texts[os.path.basename(rel)] = old_text
             refreshed.append(rel)
             continue
         try:
@@ -3577,6 +5016,26 @@ def write_text(path, text, encoding="utf-8"):
 INI_SHRINK_RATIO = 0.5
 INI_SHRINK_FLOOR = 512
 
+# Sidecar written next to Game.ini / GameUserSettings.ini every time this launcher
+# writes one, holding an exact copy of what was just written. Setup Status compares it
+# against the live file on every refresh (check_config_not_overwritten): a mismatch means
+# something other than this launcher changed the file since - ARK's own shutdown rewrite,
+# another tool, a second launcher instance - and that's worth saying plainly instead of
+# leaving the user to notice their settings didn't take in game. A full copy rather than
+# just a hash so a mismatch can be described (which lines changed), not only detected.
+_INI_LASTWRITE_SUFFIX = ".arkap_lastwrite"
+
+
+def _record_ini_lastwrite(path, text, encoding):
+    """Best-effort snapshot of a just-written ini for check_config_not_overwritten.
+    Never raises - this is a diagnostic aid, not part of the write itself, and a failure
+    here (read-only sidecar, disk full) must not turn into a reported write failure for
+    a write that actually succeeded."""
+    try:
+        write_text(path + _INI_LASTWRITE_SUFFIX, text, encoding)
+    except OSError:
+        pass
+
 
 def write_ini_guarded(path, text, encoding="utf-8", expect_shrink=False):
     """write_text for Game.ini / GameUserSettings.ini, with a refusal if the new contents
@@ -3609,6 +5068,7 @@ def write_ini_guarded(path, text, encoding="utf-8", expect_shrink=False):
                 "and would drop settings this launcher doesn't manage. Nothing was "
                 "written - your file is unchanged." % (path, old, new))
     write_text(path, text, encoding)
+    _record_ini_lastwrite(path, text, encoding)
 
 
 def _fragment_payload_lines(fragment_text):
@@ -4470,10 +5930,51 @@ def is_steamapps_path(path):
                for part in re.split(r"[\\/]", path or "") if part)
 
 
+# The game CLIENT ships ShooterGameServer.exe too, so that exe alone can't tell the two
+# apart - a SERVER_ROOT pointed at the game passed every check, and auto-detect could pick
+# the game by itself. ShooterGame.exe is the client's own; a dedicated server doesn't have it.
+ARK_CLIENT_EXE_RELPATH = os.path.join("ShooterGame", "Binaries", "Win64", "ShooterGame.exe")
+
+
 def is_ark_server_root(path):
     """True if `path` is the folder that directly contains an ARK dedicated server
-    install (i.e. ShooterGame\\Binaries\\Win64\\ShooterGameServer.exe below it)."""
-    return os.path.isfile(os.path.join(path, ARK_EXE_RELPATH))
+    install (ShooterGameServer.exe below it, and not the game client's install)."""
+    return (os.path.isfile(os.path.join(path, ARK_EXE_RELPATH))
+            and not os.path.isfile(os.path.join(path, ARK_CLIENT_EXE_RELPATH)))
+
+
+def nested_server_root(path):
+    """A dedicated server install one folder below `path`, or "" - a manual download
+    unzipped with its own top folder leaves SERVER_ROOT one level too high."""
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                if entry.is_dir() and is_ark_server_root(entry.path):
+                    return entry.path
+    except OSError:
+        pass
+    return ""
+
+
+def server_root_state(path):
+    """What a SERVER_ROOT holds:
+      "unset"      - no path
+      "installed"  - an ARK dedicated server
+      "client"     - the ARK game, which is the mistake this exists to catch
+      "incomplete" - SteamCMD started installing here and didn't finish
+      "nested"     - the server is one folder further down (see nested_server_root)
+      "empty"      - nothing installed yet. The NORMAL state right before Install ARK
+                     Server, whether or not the folder exists (SteamCMD creates it)."""
+    if not path:
+        return "unset"
+    if os.path.isfile(os.path.join(path, ARK_CLIENT_EXE_RELPATH)):
+        return "client"
+    if os.path.isfile(os.path.join(path, ARK_EXE_RELPATH)):
+        return "installed"
+    if (os.path.isdir(os.path.join(path, "steamapps"))
+            or os.path.isdir(os.path.join(path, "ShooterGame"))):
+        return "incomplete"
+    return "nested" if nested_server_root(path) else "empty"
 
 
 def bounded_drive_scan(log_fn, is_cancelled, matches=is_ark_server_root,
@@ -4890,11 +6391,444 @@ def scoped_scan_paths(server_root, level, is_cancelled=None, progress=None):
 # --------------------------------------------------------------------------- #
 
 def check_ark_server_installed(server_root):
-    """(ok, detail) - ok if ShooterGameServer.exe exists under server_root."""
+    """(ok, detail) - ok if an ARK dedicated server (not the game) is at server_root."""
     if not server_root:
         return False, "SERVER_ROOT is not set."
-    exe = os.path.join(server_root, ARK_EXE_RELPATH)
-    return os.path.isfile(exe), exe
+    state = server_root_state(server_root)
+    if state == "client":
+        return False, ("%s is your ARK: Survival Evolved game, not the dedicated server "
+                       "(the game's ShooterGame.exe is in it)." % server_root)
+    if state == "empty":
+        return False, ("Nothing installed in %s yet - that's expected before the install. "
+                       "Next: Install ARK Server." % server_root)
+    if state == "incomplete":
+        return False, "An install into %s started but didn't finish." % server_root
+    if state == "nested":
+        return False, ("The server is one folder down, in %s - point SERVER_ROOT there."
+                       % nested_server_root(server_root))
+    return True, os.path.join(server_root, ARK_EXE_RELPATH)
+
+
+# Steam's StateFlags bits (EAppState). 4 on its own is "fully installed"; anything set
+# beside it means the last update didn't finish. Only the ones worth naming are listed.
+STEAM_STATE_FULLY_INSTALLED = 4
+STEAM_STATE_NAMES = ((1, "uninstalled"), (2, "update required"), (32, "files missing"),
+                     (128, "files corrupt"), (256, "update running"),
+                     (512, "update paused"), (1024, "update started"))
+
+
+def parse_acf(text):
+    """Valve KeyValues text (an appmanifest .acf) -> nested dict, keys lower-cased."""
+    stack, key = [{}], None
+    for m in re.finditer(r'"((?:[^"\\]|\\.)*)"|([{}])', text):
+        if m.group(2) == "{":
+            child = {}
+            stack[-1][key] = child
+            stack.append(child)
+            key = None
+        elif m.group(2) == "}":
+            if len(stack) > 1:
+                stack.pop()
+            key = None
+        elif key is None:
+            key = m.group(1).lower()
+        else:
+            stack[-1][key] = m.group(1)
+            key = None
+    return stack[0]
+
+
+def find_app_manifest(server_root):
+    """This install's appmanifest_376030.acf, or "". SteamCMD's +force_install_dir writes
+    it to <SERVER_ROOT>\\steamapps; a Steam-client install keeps it in the library's
+    steamapps, two levels above steamapps\\common\\<installdir>."""
+    name = "appmanifest_%s.acf" % ARK_APP_ID
+    for path in (os.path.join(server_root, "steamapps", name),
+                 os.path.join(os.path.dirname(os.path.dirname(server_root)), name)):
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def check_server_branch(server_root):
+    """(state, detail) - state is "ok" when the appmanifest says this install is on
+    ARK_BETA_BRANCH and fully installed, "fail" when it plainly isn't, and "info" for
+    an advisory: the manifest disagrees but looks unreliable (see below) while
+    version.txt looks like a real version. detail always names branch, build and
+    StateFlags (plus version.txt when there is one), since "which build is it on" is
+    the question the row answers.
+
+    A server on the wrong build is invisible to a game client on the right one. Two ways
+    to get there: an update that never finished (StateFlags), or an install nobody ran
+    Install ARK Server against - it is the only thing that runs app_update, and "server
+    installed" only looks for the exe - so a pre-existing, copied or Steam-client install
+    keeps whatever branch it came with (BetaKey).
+
+    But the manifest can also just be lying: SteamCMD only ever writes it UTF-8, so a
+    manifest that comes back UTF-16 was re-saved by something else (PowerShell 5.1,
+    Notepad) after SteamCMD wrote it, and there's no telling what else changed on the
+    way. A red X on that alone has fired on a server that was running fine - so a
+    UTF-16 manifest that disagrees with a version.txt that looks real is reported as an
+    advisory, not a failure."""
+    if not server_root:
+        return "fail", "SERVER_ROOT is not set."
+    path = find_app_manifest(server_root)
+    if not path:
+        return "fail", ("No appmanifest_%s.acf in %s - SteamCMD hasn't installed into "
+                        "this folder, so its branch and build can't be confirmed."
+                        % (ARK_APP_ID, os.path.join(server_root, "steamapps")))
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        return "fail", "could not read %s (%s)" % (path, exc)
+    # SteamCMD writes UTF-8, but a manifest re-saved by PowerShell 5.1 or Notepad comes back
+    # UTF-16, and read_text's cp1252 fallback would turn that into "public, StateFlags 0".
+    is_utf16 = raw[:2] in (b"\xff\xfe", b"\xfe\xff")
+    acf = parse_acf(raw.decode("utf-16" if is_utf16 else "utf-8", errors="replace"))
+
+    def section(d, key):
+        v = d.get(key)
+        return v if isinstance(v, dict) else {}
+
+    app = section(acf, "appstate")
+    # MountedConfig is what's actually on disk, UserConfig what was asked for (and all that
+    # older SteamCMD builds write). Steam leaves BetaKey out entirely for the public branch.
+    cfg = section(app, "mountedconfig" if "mountedconfig" in app else "userconfig")
+    branch = str(cfg.get("betakey") or "public")
+    try:
+        flags = int(app.get("stateflags", 0))
+    except (TypeError, ValueError):
+        flags = 0
+    state_desc = ("fully installed" if flags == STEAM_STATE_FULLY_INSTALLED else
+                  ", ".join(n for bit, n in STEAM_STATE_NAMES if flags & bit)
+                  or "not fully installed")
+    parts = ["branch %s" % branch, "build %s" % (app.get("buildid") or "?"),
+             "StateFlags %d (%s)" % (flags, state_desc)]
+    try:
+        version = read_text(os.path.join(server_root, "version.txt"))[0].strip()[:20]
+    except OSError:
+        version = ""
+    if version:
+        parts.append("version.txt %s" % version)
+    detail = "%s - %s" % (", ".join(parts), path)
+    # ponytail: no comparison against the branch's current buildid. Steam only reports it via
+    # a SteamCMD run (+app_info_print), which takes a minute and can't share steamcmd\ with an
+    # install or mod download. preaquatica's build hasn't moved since 2024; add it if it does.
+    if branch.lower() == ARK_BETA_BRANCH and flags == STEAM_STATE_FULLY_INSTALLED:
+        return "ok", detail
+    # A version.txt that doesn't even look like "123.45" is no more trustworthy than a
+    # re-saved manifest, so it can't vouch for anything - fall through to "fail".
+    if is_utf16 and re.match(r"\d+(?:\.\d+)+", version):
+        return "info", (
+            "the appmanifest says %s, but it's UTF-16 - SteamCMD never writes that "
+            "encoding, so something else re-saved this file and its branch/build/"
+            "StateFlags can't be trusted. version.txt (%s), which SteamCMD does not "
+            "touch, looks like a real version and disagrees with it. %s"
+            % (", ".join(parts[:3]), version, detail))
+    return "fail", detail
+
+
+# Folder names that need administrator rights to write into. Matched by name rather than
+# against %ProgramFiles%, so a second Program Files on another drive is caught too.
+_ADMIN_ONLY_DIR_NAMES = ("program files", "program files (x86)")
+
+
+def _path_parts(path):
+    """Lower-cased path components, for exact-segment name matching. Same split as
+    is_steamapps_path - separator-agnostic, so forward slashes can't hide a segment."""
+    return [p.lower() for p in re.split(r"[\\/]", path or "") if p]
+
+
+def check_path_in_program_files(path):
+    """(in_program_files, detail) - True when `path` is inside Program Files or Program
+    Files (x86), which a non-elevated process cannot write to."""
+    if not path:
+        return False, ""
+    hit = next((p for p in _path_parts(path) if p in _ADMIN_ONLY_DIR_NAMES), None)
+    if not hit:
+        return False, ""
+    return True, ("%s is inside %s, which only an administrator can write to."
+                  % (plain_path(path),
+                     "Program Files (x86)" if "(x86)" in hit else "Program Files"))
+
+
+# Every path field worth cross-checking against SERVER_ROOT. Exactly the Locations group,
+# so it's that tuple rather than a second copy that can drift out of step with it - a
+# field added there needs cross-checking too. connector_ini is not in it, which is right
+# here as well: the standalone connector is a separate program that legitimately lives
+# outside the server install.
+CROSS_CHECK_PATH_KEYS = PATH_GROUP_KEYS
+
+# Section headers and keys that only ever appear in the GAME CLIENT's config. The server
+# has no video settings, so one of these in the file the launcher is told to edit means
+# it is editing the wrong file - the ini the player's game reads, not the one the server
+# reads. Matched case-insensitively against section headers / key names.
+CLIENT_CONFIG_SECTIONS = ("[/script/shootergame.shootergameusersettings]",
+                          "[scalabilitygroups]")
+CLIENT_CONFIG_KEYS = ("resolutionsizex", "resolutionsizey",
+                      "lastuserconfirmedresolutionsizex",
+                      "lastuserconfirmedresolutionsizey",
+                      "lastconfirmedfullscreenmode", "preferredfullscreenmode")
+
+# How much of a candidate Game.ini to read looking for those markers. They sit in the
+# first few sections of any real client config; a Game.ini with a big mod block can run
+# to megabytes, and this check runs on every Setup Status paint.
+_CLIENT_CONFIG_SCAN_BYTES = 64 * 1024
+
+
+def is_ark_install_dir(path):
+    """True if `path` is the top of an ARK install of EITHER edition - the folder that
+    directly contains ShooterGame.
+
+    Deliberately not is_ark_server_root (which wants ShooterGameServer.exe): the mistake
+    these checks exist to catch is a path landing inside the game CLIENT, which has no
+    such exe. Content/ and Binaries/ are both required so a folder that merely happens to
+    be named ShooterGame doesn't count."""
+    if not path:
+        return False
+    sg = os.path.join(path, "ShooterGame")
+    return (os.path.isdir(ext_path(os.path.join(sg, "Content")))
+            and os.path.isdir(ext_path(os.path.join(sg, "Binaries"))))
+
+
+def ark_install_root_for(path):
+    """The ARK install `path` sits inside - itself or its nearest ancestor - else "".
+
+    Walks up rather than testing one fixed depth because these fields point at every
+    level of an install: ShooterGame\\Saved\\Config\\...\\Game.ini is five deep, a
+    ServerCluster folder is one."""
+    if not path:
+        return ""
+    cur = os.path.normpath(os.path.abspath(path))
+    while True:
+        if is_ark_install_dir(cur):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+def foreign_install_paths(server_root, paths):
+    """[(key, value, other_install), ...] for every configured path that sits inside a
+    DIFFERENT ARK install than server_root.
+
+    The condition is deliberately "under another install", not the broader "outside
+    SERVER_ROOT". Keeping saves or backups on a roomier drive is a layout people
+    deliberately run and there is nothing wrong with it. Landing inside a second ARK
+    install is the one arrangement that cannot be intentional: two installs then share
+    one set of saves and cluster data, each writes it on its own schedule, and they
+    drift apart with no error from either."""
+    out = []
+    for key in CROSS_CHECK_PATH_KEYS:
+        value = (paths.get(key) or "").strip()
+        if not value or key == "SERVER_ROOT":
+            continue
+        if server_root and path_is_within(value, server_root):
+            continue
+        other = ark_install_root_for(value)
+        if other and not (server_root and path_is_within(other, server_root)):
+            out.append((key, value, other))
+    return out
+
+
+def foreign_cluster_paths(server_root, paths):
+    """The subset of foreign_install_paths that is a cluster folder.
+
+    Shared by the Setup Status row and its "Fix this" button so the two can never
+    disagree about which of the three fields is actually wrong - the button re-derives
+    this at click time rather than trusting anything captured when the row was drawn."""
+    cluster_keys = {key for key, _ in CLUSTER_PATH_SUBDIRS}
+    return [t for t in foreign_install_paths(server_root, paths) if t[0] in cluster_keys]
+
+
+def check_cluster_paths_not_foreign(server_root, paths):
+    """(ok, detail) - ok unless a cluster path (CLUSTERDIR/SAVESROOT/BACKUPROOT) sits
+    inside a different ARK install than SERVER_ROOT. See foreign_install_paths."""
+    bad = foreign_cluster_paths(server_root, paths)
+    if not bad:
+        return True, ("All three sit under %s." % plain_path(server_root)
+                      if server_root else "SERVER_ROOT is not set.")
+    return False, "; ".join("%s -> %s (an ARK install at %s, not the configured one)"
+                            % (key, plain_path(value), plain_path(other))
+                            for key, value, other in bad)
+
+
+def check_game_ini_under_server_root(server_root, game_ini):
+    """(ok, detail) - ok if the configured Game.ini lives inside SERVER_ROOT.
+
+    Unlike the cluster folders there is no legitimate reason for this one to sit
+    elsewhere: the server only ever reads the Game.ini inside its own install, so a path
+    outside it means every edit the launcher makes lands in a file the server will never
+    read (or, worse, in the file the player's own game reads)."""
+    game_ini = (game_ini or "").strip()
+    if not game_ini:
+        return True, "Not set - derived from SERVER_ROOT."
+    if not server_root:
+        return True, "SERVER_ROOT is not set."
+    if path_is_within(game_ini, server_root):
+        return True, plain_path(game_ini)
+    other = ark_install_root_for(game_ini)
+    return False, ("%s is outside SERVER_ROOT (%s)%s"
+                   % (plain_path(game_ini), plain_path(server_root),
+                      " and inside another ARK install at %s." % plain_path(other)
+                      if other else "."))
+
+
+def check_game_ini_is_server_config(game_ini):
+    """(ok, detail) - ok unless the configured Game.ini reads as a GAME CLIENT config.
+
+    A client ini is a plausible-looking file in a plausible-looking place, so nothing
+    else notices: the launcher writes its settings, the write succeeds, and the server
+    reads none of it - while the player's own game quietly gets the edits instead."""
+    game_ini = (game_ini or "").strip()
+    if not game_ini or not os.path.isfile(ext_path(game_ini)):
+        return True, ""
+    try:
+        with io.open(ext_path(game_ini), "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(_CLIENT_CONFIG_SCAN_BYTES)
+    except OSError as exc:
+        return True, "Could not read %s (%s)." % (plain_path(game_ini), exc)
+    found = []
+    for raw in head.splitlines():
+        line = raw.strip().lower()
+        if line in CLIENT_CONFIG_SECTIONS:
+            found.append(raw.strip())
+        elif "=" in line and line.split("=", 1)[0].strip() in CLIENT_CONFIG_KEYS:
+            found.append(raw.strip().split("=", 1)[0].strip())
+    if not found:
+        return True, plain_path(game_ini)
+    # Deduplicated in first-seen order: a client GameUserSettings.ini repeats the
+    # resolution keys, and a detail line naming ResolutionSizeX six times reads as noise.
+    seen, uniq = set(), []
+    for name in found:
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            uniq.append(name)
+    return False, ("%s is a game CLIENT config - it contains %s, which only the game's "
+                   "own settings file has." % (plain_path(game_ini), ", ".join(uniq[:4])))
+
+
+def find_game_user_settings(server_root):
+    """Every GameUserSettings.ini anywhere under ShooterGame\\Saved. Shared by the check
+    below and its fix, so they can't disagree about what's there."""
+    saved_dir = os.path.join(server_root, "ShooterGame", "Saved") if server_root else ""
+    if not saved_dir or not os.path.isdir(ext_path(saved_dir)):
+        return []
+    return [os.path.join(curdir, fn)
+            for curdir, _subdirs, files in os.walk(saved_dir)
+            for fn in files if fn.lower() == "gameusersettings.ini"]
+
+
+def check_single_game_user_settings(server_root):
+    """(ok, detail) - ok if exactly one GameUserSettings.ini exists under
+    ShooterGame\\Saved, at the one path the server and this launcher both use
+    (SERVER_CONFIG_RELDIR). A second copy elsewhere in the tree - a parallel Steam-client
+    install, a backup restored to the wrong folder, a leftover from a different branch's
+    save layout - means the server could be reading one file while the launcher (or a
+    hand edit) writes another: each side succeeds on its own file and neither ever
+    notices, which looks exactly like settings that were applied and then vanished."""
+    if not server_root:
+        return True, "SERVER_ROOT is not set."
+    saved_dir = os.path.join(server_root, "ShooterGame", "Saved")
+    if not os.path.isdir(ext_path(saved_dir)):
+        return True, "Not installed yet."
+    expected = os.path.normcase(os.path.normpath(_gameusersettings_path(server_root)))
+    found = find_game_user_settings(server_root)
+    if not found:
+        return True, "None on disk yet - the server hasn't been started."
+    if len(found) == 1 and os.path.normcase(os.path.normpath(found[0])) == expected:
+        return True, plain_path(found[0])
+    listing = "; ".join(plain_path(p) for p in found)
+    canonical = plain_path(_gameusersettings_path(server_root))
+    if len(found) > 1:
+        return False, ("%d copies under %s: %s - only %s is ever read by the server or "
+                       "written by this launcher. Check which one actually holds your "
+                       "settings, then delete or rename the others so there is no "
+                       "ambiguity about which file is live."
+                       % (len(found), plain_path(saved_dir), listing, canonical))
+    return False, ("%s, not %s. A file anywhere else in Saved is never read by the "
+                   "server, so anything written there - by hand or by another tool - is "
+                   "silently ignored." % (listing, canonical))
+
+
+_DRIFT_LINES_SHOWN = 6
+
+
+def check_config_not_overwritten(server_root):
+    """(ok, detail) - ok unless GameUserSettings.ini or Game.ini no longer matches the
+    snapshot _record_ini_lastwrite saved right after this launcher last wrote it. A
+    mismatch means something else changed the file afterwards - ARK's own shutdown
+    rewrite, another tool, a second launcher instance - which is exactly what makes a
+    setting that was applied look like it never took: the write succeeded, and something
+    later undid it with nothing to say so. Reports which lines actually differ rather
+    than just that they do.
+
+    Silent (True) wherever there's no snapshot to compare against - this launcher hasn't
+    written that file this install's lifetime, so there's no baseline it could have
+    drifted from."""
+    if not server_root:
+        return True, ""
+    problems = []
+    for name, path in (("GameUserSettings.ini", _gameusersettings_path(server_root)),
+                        ("Game.ini", os.path.join(server_root, SERVER_CONFIG_RELDIR,
+                                                  "Game.ini"))):
+        snapshot = path + _INI_LASTWRITE_SUFFIX
+        if not os.path.isfile(ext_path(snapshot)) or not os.path.isfile(ext_path(path)):
+            continue
+        try:
+            last_text, _e = read_text(snapshot)
+            now_text, _e = read_text(path)
+        except OSError:
+            continue
+        if last_text == now_text:
+            continue
+        diff = list(difflib.unified_diff(last_text.splitlines(), now_text.splitlines(),
+                                         lineterm=""))
+        # ServerAdminPassword is excluded on purpose: the server rewrites it to match
+        # the command line's -ServerAdminPassword on every boot regardless of what was
+        # on disk (see the tooltip on that field), so a change there is expected
+        # reconciliation, not something worth reporting as drift.
+        removed = [ln[1:].strip() for ln in diff
+                  if ln.startswith("-") and not ln.startswith("---")
+                  and not ln[1:].strip().lower().startswith("serveradminpassword=")]
+        added = [ln[1:].strip() for ln in diff
+                if ln.startswith("+") and not ln.startswith("+++")
+                and not ln[1:].strip().lower().startswith("serveradminpassword=")]
+        # A pure addition (ARK filling in a default the file didn't have) is not a loss -
+        # only a line that DISAPPEARED means a setting someone had is no longer there.
+        if not removed:
+            continue
+
+        def _sample(lines):
+            shown = "; ".join(lines[:_DRIFT_LINES_SHOWN])
+            extra = len(lines) - _DRIFT_LINES_SHOWN
+            return shown + (" (+%d more line(s))" % extra if extra > 0 else "")
+
+        bits = ["lost %s" % _sample(removed)]
+        if added:
+            bits.append("now has instead %s" % _sample(added))
+        problems.append("%s changed since this launcher last wrote it - %s"
+                        % (name, "; ".join(bits)))
+    if not problems:
+        return True, "Matches what this launcher last wrote."
+    return False, " | ".join(problems)
+
+
+def check_paths_in_program_files(paths):
+    """(ok, detail) - ok unless a configured path sits under Program Files.
+
+    Every one of these fields is written to at runtime (saves, cluster data, backups,
+    the plugin's ipc files, Game.ini), so this is not only about SERVER_ROOT."""
+    bad = []
+    for key in CROSS_CHECK_PATH_KEYS:
+        value = (paths.get(key) or "").strip()
+        if value and check_path_in_program_files(value)[0]:
+            bad.append("%s -> %s" % (key, plain_path(value)))
+    if not bad:
+        return True, "No configured path is under Program Files."
+    return False, "; ".join(bad)
 
 
 def check_mod_installed(server_root, mod_id):
@@ -5718,6 +7652,9 @@ def is_example_line(line):
 # Concrete sample paths written into the Instructions tab prose. Matched literally
 # (not by a "looks like a path" regex) so only these known-fake paths are ever
 # dimmed and a real path can never be caught by accident.
+# URLs written into the guide prose, made clickable by _tag_instruction_urls.
+INSTRUCTION_LINK_URLS = (DISCORD_INVITE_URL,)
+
 INSTRUCTION_EXAMPLE_SNIPPETS = [
     PLACEHOLDER_EXAMPLE_ROOT + r"\ARK Survival Evolved Dedicated Server\ShooterGame",
     PLACEHOLDER_EXAMPLE_ROOT,
@@ -5805,8 +7742,21 @@ class Tooltip:
 # --------------------------------------------------------------------------- #
 
 class ArkAPLauncher(tk.Tk):
-    def __init__(self):
+    def __init__(self, network_checks=False):
+        """`network_checks`: the silent GitHub checks (the startup update check, the
+        re-checks after an install and on Re-check). Only the real app turns them on -
+        see the __main__ block. Anything that just constructs the window (the test
+        suite does, a hundred times a run) must not spend the network's 60-an-hour
+        GitHub allowance: that once left the real launcher's startup check refused and
+        its "!" badge dark. The explicit "Check for Updates" click always works."""
         super().__init__()
+        self._network_checks = network_checks
+        self._update_retry_id = None
+        # Worker threads hand their results to the window through this - see
+        # _call_on_ui. Drained from the start, so results that land before mainloop
+        # (the startup checks) are delivered as soon as it runs.
+        self._ui_calls = queue.Queue()
+        self._ui_drain_id = self.after(50, self._drain_ui_calls)
         self.title("ARKIpelago Launcher")
         self.minsize(680, 640)
 
@@ -5832,6 +7782,8 @@ class ArkAPLauncher(tk.Tk):
         # than on every click - see the end of _open_poptracker.
         self._poptracker_room_hint_shown = False
         self._last_scoped_scan_root = None
+        # Last SERVER_ROOT already warned about (see _warn_server_root_location).
+        self._last_server_root_warning = ""
         self._last_cluster_dir_scan = None
         # True only while a scan the user explicitly asked for is in flight - see
         # _scoped_scan. Everything else (focus-out, post-install, first-launch
@@ -5880,9 +7832,11 @@ class ArkAPLauncher(tk.Tk):
         # answer for all three Save buttons without recomputing the Mods one (which hits
         # the disk) on every keystroke. See _update_save_hint.
         self._fields_dirty = False
+        self._config_disk_dirty = False   # see _update_save_highlights
+        self._scripts_absent = False
         self._mods_dirty_flag = False
         self._stacks_dirty_flag = False
-        self._save_hint_shown = False
+        self._save_hint_shown = None  # None / "save" / "install" - see _update_save_hint
         # Reserved autosave slot (see AUTOSAVE_PROFILE_NAME). The slot itself is what an
         # idle app compares against, so there is nothing else to remember here.
         self._autosave_after_id = None
@@ -5911,12 +7865,14 @@ class ArkAPLauncher(tk.Tk):
         self._plugin_queue = queue.Queue()
         self._plugin_thread = None
         self._hide_install_reminder = self._is_prompt_hidden(PROMPT_INSTALL_REMINDER)
+        self._reminder_closed = False   # "Close" on the banner, this session only
 
         # Mods tab state - ordered list of {"id","name","enabled","supported"} dicts;
         # order IS load priority (see MODS_KEY). Loaded once here, every mutation
         # re-persists immediately via _save_mods_config.
         self._mods = self._load_mods_config()
         self._mods_selected_id = None   # workshop id the Verify/Open-Workshop buttons act on
+        self._mods_rows = {}            # mod id -> row Frame, rebuilt by _rebuild_mods_rows
         self._mods_action_buttons = []  # populated by _build_mods_tab; disabled when gated
         # Mod download/install worker (own log widget, but shares SteamCMD + SERVER_ROOT
         # with the other installers, so it joins _any_install_running for mutual exclusion).
@@ -5952,6 +7908,15 @@ class ArkAPLauncher(tk.Tk):
         loaded_collapse = saved_settings.get(GROUP_COLLAPSE_KEY)
         self._group_collapse_state = loaded_collapse if isinstance(loaded_collapse, dict) else {}
         self._group_collapse_vars = {}
+        self._auto_revealing = False   # see _auto_reveal
+        # The Get Started questionnaire (see AP_ROLE_KEY / _on_role_changed).
+        stored_role = saved_settings.get(AP_ROLE_KEY)
+        stored_role = stored_role if isinstance(stored_role, dict) else {}
+        self.ap_role_var = tk.StringVar(value=str(stored_role.get("role") or ""))
+        self.ap_yaml_by_var = tk.StringVar(value=str(stored_role.get("yaml_by") or ""))
+        for var in (self.ap_role_var, self.ap_yaml_by_var):
+            var.trace_add("write", self._on_role_changed)
+        self._group_frames = {}         # group_id -> its expanded frame (jump targets)
 
         # --- "Increase stacks" (Configuration tab) -------------------------------- #
         # Intent only. Nothing reaches Game.ini / GameUserSettings.ini until "Apply to
@@ -6104,6 +8069,7 @@ class ArkAPLauncher(tk.Tk):
         # profile just restored above. That initial fill is not an edit, so the baseline
         # is taken here and every Save button comes up dark until the user changes
         # something. See _mark_saved_baseline.
+        self._fill_found_install_dirs()
         self._mark_saved_baseline()
 
         # Armed last, so the first snapshot it writes is of fully-loaded values.
@@ -6119,8 +8085,10 @@ class ArkAPLauncher(tk.Tk):
         if self._is_first_launch and not self.get("SERVER_ROOT"):
             self._start_auto_detect()
 
-        # Brand-new install: open on Instructions rather than Configuration, so the first
+        # Brand-new install: open on Get Started rather than Configuration, so the first
         # thing a user sees is the step-by-step order rather than a wall of empty paths.
+        # (It's also the first tab, so later launches land there too unless it has been
+        # hidden or "reopen on the last-used tab" is on.)
         # Same first-run signal that auto-creates DEFAULT_PROFILE_NAME, plus a stored flag
         # so this greeting happens exactly once (see FIRST_RUN_DONE_KEY).
         #
@@ -6129,7 +8097,7 @@ class ArkAPLauncher(tk.Tk):
         # whole point of that launch.
         if not (saved or {}).get(FIRST_RUN_DONE_KEY):
             if self._is_first_launch:
-                self.notebook.select(self.tab_instructions)
+                self.notebook.select(self.tab_wizard)
             self._write_config_key(FIRST_RUN_DONE_KEY, True, "first-run flag")
         elif self.reopen_last_tab_var.get():
             self._select_tab_by_text(self._saved_last_tab)
@@ -6148,6 +8116,10 @@ class ArkAPLauncher(tk.Tk):
         # feeds both the "!" badge / button highlight and the Setup Status advisory rows.
         # Skipped entirely when "Check for updates on startup" is off - that setting's
         # promise is that the launcher makes no network call of its own accord.
+        # Which certificates every download is checked against (see HTTPS_CONTEXT) - on
+        # record for the first "certificate verify failed" report.
+        launcher_log("HTTPS: downloads are verified against the %s." % HTTPS_TRUST_SOURCE,
+                     "Startup")
         if self.update_check_var.get():
             self._start_component_version_check()
 
@@ -6162,8 +8134,10 @@ class ArkAPLauncher(tk.Tk):
     # toplevel to its requested size until an explicit wm geometry is set, so without the
     # lock below each of these visibly resized the window mid-session:
     #
-    #   save_hint_label   +44px wide  - the "make sure to Save" chip in the header
-    #   mods_gate_banner  +56px tall  - the Mods tab's "install the server first" banner
+    #   save_hint_label   up to +230px wide - the header chip, in its WIDEST wording
+    #                       ("next step: Install ARK Server" + "Go there", which is what a
+    #                       fresh install shows); measuring whatever it happened to say at
+    #                       startup is how it ended up clipped to 97px of the 230 it needs
     #
     # Anything inside one of the scrollable canvases (the install reminder banner, the
     # Setup Status advisory rows, the mod rows) is already isolated: a canvas has its own
@@ -6171,29 +8145,68 @@ class ArkAPLauncher(tk.Tk):
     # update badge/highlight and the Find Prev/Next pair are likewise already stable -
     # they recolour, retext or just go insensitive in place rather than pack/pack_forget
     # (see _set_halo / update_badge_label / _update_find_btns).
+    # Fixed-width content INSIDE a scrollable canvas. A canvas doesn't propagate its
+    # content's width outwards and there is no horizontal scrollbar, so anything wider
+    # than the window is simply cut off - the window needs a floor wide enough for it.
+    def _width_floor_widgets(self):
+        return [(self.reminder_banner, 44)]   # + canvas padding and the scrollbar
+
+    # How far a scrolling area may shrink when the window is at its smallest: a text
+    # pane keeps a few readable lines, a canvas list keeps a sliver you can still scroll.
+    SQUEEZED_TEXT_LINES = 3
+    SQUEEZED_CANVAS_PX = 40
+
+    def _incompressible_height(self):
+        """The window height every tab's FIXED controls need - measured with each
+        Canvas and Text in the notebook asked for almost nothing, then put back. That
+        is the honest minimum: below it a button is cut off, above it only something
+        that scrolls gets shorter. Includes the header and the footer bar, since it's
+        the toplevel's own request."""
+        squeezed = []
+        stack = [self.notebook]
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            cls = w.winfo_class()
+            if cls in ("Canvas", "Text"):
+                try:
+                    squeezed.append((w, w.cget("height")))
+                    w.configure(height=self.SQUEEZED_TEXT_LINES if cls == "Text"
+                                else self.SQUEEZED_CANVAS_PX)
+                except tk.TclError:
+                    continue
+        try:
+            self.update_idletasks()
+            return self.winfo_reqheight()
+        finally:
+            for w, height in squeezed:
+                try:
+                    w.configure(height=height)
+                except tk.TclError:
+                    pass
+            self.update_idletasks()
+
     def _conditional_size_widgets(self):
         """(widget, pack_kwargs) for each of the two above, in the exact form its own
         show-path packs it. Kept in one place so the measurement below and the real
         show-paths can't drift into disagreeing about what "shown" looks like."""
+        # mods_gate_banner used to be measured here too; it can no longer appear -
+        # the Mods tab is hidden for exactly the state it warns about (see
+        # _update_mods_tab_visibility) - so counting it only made the window taller.
         return [
             (self.save_hint_label, {"side": "left", "padx": 12}),
-            (self.mods_gate_banner,
-             {"fill": "x", "pady": (0, 6), "before": self._mods_top_frame}),
+            (self.share_copy_btn, {"side": "left", "padx": (12, 0)}),
         ]
 
-    def _lock_initial_size(self):
-        """Size the window once to fit its FULLEST realistic state, then pin it with an
-        explicit geometry so later layout changes can never move it again.
+    def _measure_fullest(self):
+        """(width, height, height floor) for the window's FULLEST realistic state, capped
+        to the screen. Every conditional widget is packed in, every tab that comes and
+        goes is shown, both wordings of the header chip are tried, then it's all put back
+        exactly as it was. Measured rather than hardcoded: a hardcoded WxH silently stops
+        covering the fullest state the first time any of this content grows.
 
-        Measured rather than hardcoded: every conditional widget is packed in, the
-        request is read, then they're all put back exactly as they were. A hardcoded
-        WxH would silently stop covering the fullest state the first time any of this
-        content grows.
-
-        Only the INITIAL size is set - resizable() is untouched and no maxsize is
-        imposed, so the user can still resize freely afterwards; the minsize floor set
-        in __init__ still applies. Once wm geometry is explicit, Tk stops auto-fitting
-        the toplevel to its requested size, which is what actually stops the jumping."""
+        The height floor is what the fixed controls need once every scrolling area has
+        shrunk as far as it usefully can (_incompressible_height)."""
         restore = []
         for widget, kwargs in self._conditional_size_widgets():
             try:
@@ -6204,12 +8217,31 @@ class ArkAPLauncher(tk.Tk):
                 restore.append((widget, was_mapped, info))
             except tk.TclError:
                 continue
+        want_w = want_h = floor_h = 0
+        # Tabs that come and go (Mods, Install) are measured present: the tab strip
+        # doesn't wrap or scroll, so one that appears later must already fit.
+        hidden_tabs = [t for t in (self.tab_mods, self.tab_install)
+                       if self.notebook.tab(t, "state") == "hidden"]
+        for tab in hidden_tabs:
+            self.notebook.add(tab)
         try:
-            self.update_idletasks()
-            want_w, want_h = self.winfo_reqwidth(), self.winfo_reqheight()
+            # Both wordings of the header chip, not just the one showing now: they are
+            # nearly 100px apart and the app switches between them at runtime.
+            for variant in SAVE_HINT_VARIANTS:
+                self._apply_save_hint_variant(variant)
+                self.update_idletasks()
+                want_w = max(want_w, self.winfo_reqwidth())
+                want_h = max(want_h, self.winfo_reqheight())
+            for widget, extra in self._width_floor_widgets():
+                try:
+                    want_w = max(want_w, widget.winfo_reqwidth() + extra)
+                except tk.TclError:
+                    continue
+            floor_h = self._incompressible_height()
         finally:
-            # Put everything back BEFORE pinning the geometry, so the pinned size is the
-            # fullest state while what's on screen is the real current state.
+            for tab in hidden_tabs:
+                self.notebook.hide(tab)
+            self._apply_save_hint_variant(self._save_hint_shown)
             for widget, was_mapped, info in restore:
                 try:
                     if not was_mapped:
@@ -6219,8 +8251,39 @@ class ArkAPLauncher(tk.Tk):
                 except tk.TclError:
                     pass
             self.update_idletasks()
+        # Never demand more than the screen: a window taller or wider than the monitor
+        # can't be moved back into view. (On a short screen the tallest tab doesn't fit
+        # at full height - its scrolling parts give way instead; see the floor.)
+        cap_w = int(self.winfo_screenwidth() * 0.95)
+        cap_h = int(self.winfo_screenheight() * 0.90)
+        return min(want_w, cap_w), min(want_h, cap_h), min(floor_h, cap_h)
+
+    def _lock_initial_size(self):
+        """Size the window once to fit its fullest realistic state (_measure_fullest),
+        then pin it with an explicit geometry so later layout changes can never move it
+        again. Once wm geometry is explicit, Tk stops auto-fitting the toplevel to its
+        requested size, which is what actually stops the jumping.
+
+        resizable() is untouched and no maxsize is imposed, so the user can still resize
+        freely - down to the floors set here. Width floor = the full measured width: the
+        header row and the tab strip don't scroll or wrap, so width is the axis things get
+        cut off on. Height floor = what the fixed controls need (640 was a guess, and in
+        dark mode the Mods tab's button column alone outgrew it)."""
+        want_w, want_h, floor_h = self._measure_fullest()
         min_w, min_h = self.minsize()
         self.geometry("%dx%d" % (max(want_w, min_w), max(want_h, min_h)))
+        self.minsize(max(want_w, min_w), max(floor_h, min_h))
+
+    def _raise_size_floors(self):
+        """Re-measure after something that changes every widget's size at once - the
+        theme toggle: dark mode's widgets are bigger, and floors measured in light mode
+        let it clip. Only ever RAISES the floors, and never pins a new geometry: a
+        window that's already big enough doesn't move, one that isn't is grown by the
+        window manager to the new minimum."""
+        want_w, _want_h, floor_h = self._measure_fullest()
+        min_w, min_h = self.minsize()
+        if want_w > min_w or floor_h > min_h:
+            self.minsize(max(want_w, min_w), max(floor_h, min_h))
 
     def _select_tab_by_text(self, text):
         """Switch to the tab with this label, if it's still there. Matching on the label
@@ -6229,9 +8292,18 @@ class ArkAPLauncher(tk.Tk):
         selection alone."""
         if not text:
             return
+        # Get Started is labelled by mode, and Setup Status used to be a tab of its own.
+        if text in ("Get Started", "Setup Status"):
+            self.notebook.select(self.tab_wizard)
+            return
+        if text == "Instructions":          # this tab's old name
+            self.notebook.select(self.tab_instructions)
+            return
         for tab_id in self.notebook.tabs():
             try:
-                if self.notebook.tab(tab_id, "text") == text:
+                # A hidden tab (Mods with no server) stays hidden - select() would show it.
+                if (self.notebook.tab(tab_id, "text") == text
+                        and self.notebook.tab(tab_id, "state") != "hidden"):
                     self.notebook.select(tab_id)
                     return
             except tk.TclError:
@@ -6251,8 +8323,8 @@ class ArkAPLauncher(tk.Tk):
                 "The launcher hit an unexpected error, but is still running - you can "
                 "keep going or restart to be safe.\n\n"
                 "A crash report was saved to:\n%s\n\n"
-                "Please attach that file (or use \"Export diagnostics\" on the "
-                "Configuration tab) when reporting this." % where)
+                "Please attach that file (or use \"Export diagnostics\" in the bar "
+                "along the bottom of the window) when reporting this." % where)
         except tk.TclError:
             pass
 
@@ -6336,15 +8408,13 @@ class ArkAPLauncher(tk.Tk):
         # TButton anyway), which is what keeps this reading as a reminder strip.
         self.save_hint_label = ttk.Frame(title_row, style="SaveHint.TFrame",
                                           padding=(6, 2))
-        ttk.Label(self.save_hint_label, text="make sure to",
-                  style="SaveHint.TLabel").pack(side="left")
-        self.save_hint_btn = ttk.Button(self.save_hint_label, text="Save", width=6,
-                                         command=self._on_save_hint_click)
+        # Text, button and tooltip are set by _update_save_hint: the same chip says
+        # "next step: Install ARK Server" until the server is installed.
+        self.save_hint_text = ttk.Label(self.save_hint_label, style="SaveHint.TLabel")
+        self.save_hint_text.pack(side="left")
+        self.save_hint_btn = ttk.Button(self.save_hint_label)
         self.save_hint_btn.pack(side="left", padx=(5, 0))
-        Tooltip(self.save_hint_btn,
-                "Saves every section that has unsaved changes right now - the "
-                "Configuration / Archipelago Setup fields, the Mods list, or both. "
-                "Same as clicking those tabs' own Save buttons.", wraplength=520)
+        self.save_hint_tip = Tooltip(self.save_hint_btn, "", wraplength=520)
 
         # Search bar - left-aligned directly below the title (not centered
         # under the logo). Enter runs the search and jumps to the first match;
@@ -6393,11 +8463,11 @@ class ArkAPLauncher(tk.Tk):
         tab_settings = ttk.Frame(notebook)
         tab_install = ttk.Frame(notebook)
         tab_mods = ttk.Frame(notebook)
-        tab_status = ttk.Frame(notebook)
         tab_debug = ttk.Frame(notebook)
         tab_instructions = ttk.Frame(notebook)
+        tab_wizard = ttk.Frame(notebook)
         # Tab ORDER only - nothing reads a tab by position. Every reference in this app
-        # is to the tab's frame object (self.tab_status, self.tab_instructions, ...),
+        # is to the tab's frame object (self.tab_wizard, self.tab_instructions, ...),
         # and the search feature walks notebook.tabs() and stores the frame it found a
         # match in, so reordering here is purely visual and safe. The stored "last tab"
         # is matched on the LABEL (_select_tab_by_text) for the same reason.
@@ -6405,26 +8475,31 @@ class ArkAPLauncher(tk.Tk):
         # The order is the order a user actually does the setup in: configure, install
         # the server stack, pick mods, then set up the Archipelago side (which needs a
         # slot name from a seed that mods can change), then check the result.
+        # Get Started first: it's where a new user lands (first tab = default
+        # selection), and it's a view over the tabs after it, not a replacement for them.
+        # It also holds Setup Status (the full check list, at its foot) and carries the
+        # overall status glyph. Mods is added here but hidden until there's a server to
+        # put mods in - see _update_mods_tab_visibility.
+        notebook.add(tab_wizard, text="Get Started")
         notebook.add(tab_config, text="Configuration")
         notebook.add(tab_install, text="Install Server/Api/Plugin")
         notebook.add(tab_mods, text="Mods")
         notebook.add(tab_archipelago, text="Archipelago Setup")
-        notebook.add(tab_status, text="Setup Status")
         # Settings sits after the setup tabs and before the reference ones: it's launcher
         # chrome (appearance, prompts, scan defaults, profiles), not a step in getting a
         # server running, so it doesn't belong in the middle of that sequence.
         notebook.add(tab_settings, text="Settings")
         notebook.add(tab_debug, text="Debug Log")
-        notebook.add(tab_instructions, text="Instructions")
+        notebook.add(tab_instructions, text=GUIDE_TAB_LABEL)
         self.notebook = notebook
         self.tab_config = tab_config
         self.tab_archipelago = tab_archipelago
         self.tab_settings = tab_settings
         self.tab_install = tab_install
         self.tab_mods = tab_mods
-        self.tab_status = tab_status
         self.tab_debug = tab_debug
         self.tab_instructions = tab_instructions
+        self.tab_wizard = tab_wizard
         notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
         # Fixed toolbar (never scrolls away) for the group collapse toggles below -
@@ -6468,18 +8543,20 @@ class ArkAPLauncher(tk.Tk):
         self.reminder_banner = tk.Frame(inner, background=self.theme["warn_bg"],
                                          highlightbackground=self.theme["warn_border"],
                                          highlightthickness=1)
-        if not self._hide_install_reminder:
-            self.reminder_banner.pack(fill="x", pady=(0, 8))
+        # Not packed here: shown only while no server is installed in SERVER_ROOT, and
+        # hidden again the moment one is - see _update_reminder_banner.
         tk.Label(self.reminder_banner, background=self.theme["warn_bg"],
                  foreground=self.theme["warn_fg"],
                  justify="left", wraplength=520,
-                 text="Install the ARK dedicated server first. Use the \"Install Server/Api/Plugin\" "
-                      "tab (SteamCMD) to install it before relying on the paths below. Go to the instructions tab for a step by step guide"
+                 text="No ARK dedicated server found in SERVER_ROOT yet. The Get Started "
+                      "tab installs it for you, step by step - and fills in the paths "
+                      "below when it's done."
                  ).pack(side="left", fill="x", expand=True, padx=8, pady=6)
         rbtns = tk.Frame(self.reminder_banner, background=self.theme["warn_bg"])
         rbtns.pack(side="right", padx=6, pady=4)
-        ttk.Button(rbtns, text="Go to Install Server/Api/Plugin",
-                   command=self._goto_install_tab).pack(fill="x", pady=(0, 2))
+        ttk.Button(rbtns, text="Open Get Started",
+                   command=lambda: self.notebook.select(self.tab_wizard)
+                   ).pack(fill="x", pady=(0, 2))
         rbtns2 = tk.Frame(rbtns, background=self.theme["warn_bg"])
         rbtns2.pack(fill="x")
         ttk.Button(rbtns2, text="Close", width=8,
@@ -6518,13 +8595,17 @@ class ArkAPLauncher(tk.Tk):
         self._config_row = 0
 
         self._render_field_groups(groups_area, early_groups, collapse_ids=GROUP_COLLAPSE_IDS)
+        self._build_share_section(groups_area)
         self._build_stack_section(groups_area)
         self._build_config_upload_section(groups_area)
         self._render_field_groups(groups_area, setup_once_groups, collapse_ids=GROUP_COLLAPSE_IDS)
 
         # Bottom action bar (fixed) --------------------------------------------
         bottom = ttk.Frame(tab_config, padding=(10, 8))
-        bottom.pack(fill="x")
+        # Packed ahead of the scrolling field area (side="bottom", before=mid): pack
+        # hands out space in packing order, so when the window is short it's the
+        # canvas - which scrolls - that shrinks, not Quick Launch and Save.
+        bottom.pack(side="bottom", fill="x", before=mid)
 
         q = ttk.LabelFrame(bottom, text="Quick launch", padding=(8, 6))
         q.pack(fill="x")
@@ -6600,18 +8681,12 @@ class ArkAPLauncher(tk.Tk):
                                       highlightbackground=self.theme["bg"],
                                       highlightthickness=1)
         self.save_btn_halo.pack(side="right", padx=3)
-        ttk.Button(self.save_btn_halo, text="Save", command=self.on_save
+        ttk.Button(self.save_btn_halo, text="Save", command=self.save_fields
                    ).pack(padx=2, pady=2)
         ttk.Button(act, text="Reload from files",
                    command=lambda: self.load_from_files()).pack(side="right", padx=3)
-        export_btn = ttk.Button(act, text="Export diagnostics",
-                                command=self.export_diagnostics)
-        export_btn.pack(side="right", padx=3)
-        Tooltip(export_btn,
-                "Bundle ArkAP_debug.log, the launcher's own activity log, a Setup Status "
-                "summary, a password-redacted copy of your config, your Mods tab state + "
-                "output log, and the crash log (if any) into one zip on your Desktop - "
-                "drag it into Discord or a GitHub issue when asking for help.")
+        # Export diagnostics and the Discord link used to sit here; they're in the
+        # footer bar now (_build_server_footer), which is on every tab including this one.
 
         # Status / report log ---------------------------------------------------
         self.log = tk.Text(bottom, height=7, wrap="word", state="disabled",
@@ -6623,10 +8698,12 @@ class ArkAPLauncher(tk.Tk):
         self._build_archipelago_tab(tab_archipelago)
         self._build_install_tab(tab_install)
         self._build_mods_tab(tab_mods)
-        self._build_setup_status_tab(tab_status)
         self._build_debug_log_tab(tab_debug)
         self._build_settings_tab(tab_settings)
         self._build_instructions_tab(tab_instructions)
+        self._build_wizard_tab(tab_wizard)
+        self._apply_install_tab_setting()
+        self._build_server_footer()
         self._tag_instruction_examples()   # both instruction bodies at once
 
         # Live "does this still match the loaded profile?" indicator plus the Save-button
@@ -6706,15 +8783,16 @@ class ArkAPLauncher(tk.Tk):
             highlightbackground=self.theme["bg"], highlightthickness=1)
         self.archipelago_save_btn_halo.pack(side="left")
         save_btn = ttk.Button(self.archipelago_save_btn_halo, text="Save",
-                              command=self.on_save)
+                              command=self.save_fields)
         save_btn.pack(padx=2, pady=2)
         Tooltip(save_btn,
                 "Saves the fields above (and everything on the Configuration tab) to "
                 "disk - the same Save button the Configuration tab has, so the "
                 "Archipelago directory and your server / slot / password survive a "
                 "restart instead of needing a re-scan and a re-type every launch.\n"
-                "Also writes server / slot / password into connector.ini, which is what "
-                "the connector actually reads.", wraplength=520)
+                "Also writes server / slot / password into connector.ini if you have one - "
+                "only the optional standalone connector reads it; /connect in-game "
+                "doesn't need it.", wraplength=520)
 
         arch_entry = self._entries[ARCHIPELAGO_DIR_KEY]
         arch_entry.bind("<FocusOut>", lambda _e: self._refresh_archipelago_buttons(), add="+")
@@ -7609,6 +9687,22 @@ class ArkAPLauncher(tk.Tk):
             self._info_once(PROMPT_POPTRACKER_ROOM, "Open PopTracker", note)
 
     # ------------------------------------------- Archipelago tab: gating ---- #
+    def _fill_found_install_dirs(self):
+        """A blank Archipelago / PopTracker field is filled with a real install found at
+        one of its standard locations (found_install_dir - a few fixed paths, no drive
+        walking), the way SERVER_ROOT is auto-detected. Without it the update check's
+        "Update .apworld" / tracker-pack advice points at buttons that are greyed out for
+        want of a folder. Done before the saved baseline, so it doesn't light Save on its
+        own: the next Save of anything keeps it."""
+        for key in (ARCHIPELAGO_DIR_KEY, POPTRACKER_DIR_KEY):
+            if self.get(key):
+                continue
+            found = found_install_dir("", key)
+            if found:
+                self.set(key, found)
+                self._log("Found %s at %s - filled in its directory field."
+                          % (DIR_SCAN_TARGETS[key]["what"], found))
+
     def _archipelago_dir(self):
         """The configured Archipelago directory, normalised, or "" when unset. get()
         returns "" while the greyed placeholder is showing, so an unconfigured field
@@ -7943,6 +10037,9 @@ class ArkAPLauncher(tk.Tk):
         self._log("  Other players connect to YOUR IP, not localhost - the server "
                   "window prints the address it's hosting on.")
         self._offer_local_server_address(port)
+        if self._share_open_list:
+            # Players reach the room through the router too - forward its port as well.
+            self.after(3000, lambda: self._share_run("open"))
 
     def _offer_local_server_address(self, port):
         """Point the Connector `server` field at the room just started locally.
@@ -8018,7 +10115,7 @@ class ArkAPLauncher(tk.Tk):
         self._config_row += 1
         return row
 
-    def _make_collapsible_group(self, parent, title, group_id, *, default_collapsed=False):
+    def _make_collapsible_group(self, parent, title, group_id, tag=None):
         """Two immutable LabelFrames sharing one grid row in `parent` (which must be
         a grid-only container - see groups_area in _build_ui): `collapsed_lf` (just
         the header) and `expanded_lf` (header + fields), swapped via grid()/
@@ -8026,11 +10123,12 @@ class ArkAPLauncher(tk.Tk):
         Frame callers should build the group's fields into.
 
         Initial state comes from self._group_collapse_state (GROUP_COLLAPSE_KEY, read
-        once in __init__); missing means first run (or an older config predating this)
-        and falls back to `default_collapsed`. Every group's BooleanVar lands in
+        once in __init__); missing means the user never clicked it, and falls back to
+        CONFIG_DEFAULT_COLLAPSED. Every group's BooleanVar lands in
         self._group_collapse_vars, which is what _reveal_group_for_widget and the
         Setup Status jump links (_goto_config_field) walk to auto-expand on demand."""
-        collapsed = bool(self._group_collapse_state.get(group_id, default_collapsed))
+        collapsed = bool(self._group_collapse_state.get(
+            group_id, group_id in CONFIG_DEFAULT_COLLAPSED))
         var = tk.BooleanVar(value=collapsed)
         self._group_collapse_vars[group_id] = var
         row = self._next_config_row()
@@ -8042,6 +10140,9 @@ class ArkAPLauncher(tk.Tk):
             Tooltip(cb, "Collapse this section down to its heading, or expand it.")
             ttk.Label(header, text=title, style="TLabelframe.Label"
                       ).pack(side="left", padx=(2, 0))
+            if tag:     # e.g. "BETA" - a small marker beside the heading
+                ttk.Label(header, text=tag, foreground=self.theme["status_info"],
+                          font=("Segoe UI", 8, "bold")).pack(side="left", padx=(6, 0))
             return header
 
         expanded_lf = ttk.LabelFrame(parent, padding=(10, 6))
@@ -8067,19 +10168,20 @@ class ArkAPLauncher(tk.Tk):
                 expanded_lf.grid(row=row, column=0, sticky="ew", pady=6)
         _apply()
         var.trace_add("write", _apply)
-        var.trace_add("write", lambda *_a: self._save_group_collapse_state())
+        var.trace_add("write", lambda *_a: self._on_group_toggled(group_id, var))
+        self._group_frames[group_id] = expanded_lf     # for "#group" jumps - see below
         return body
 
-    def _make_inline_collapsible(self, parent, title, group_id, row, *,
-                                  default_collapsed=False):
+    def _make_inline_collapsible(self, parent, title, group_id, row):
         """Small inline collapse control for a subsection within an already-collapsible
         group - currently just the Network group's rarely-touched GAMEPORT/QUERYPORT/
-        RCONPORT trio (see NETWORK_PORT_KEYS). Same two-immutable-siblings swap as
+        RCONPORT trio (see NETWORK_SET_ONCE_KEYS). Same two-immutable-siblings swap as
         _make_collapsible_group, minus the LabelFrame border - it needs to read as
         "part of this group", not a group of its own. `parent` must be a grid-only
         container (Network's body - see _render_field_groups) and `row` the grid row
         both siblings share within it."""
-        collapsed = bool(self._group_collapse_state.get(group_id, default_collapsed))
+        collapsed = bool(self._group_collapse_state.get(
+            group_id, group_id in CONFIG_DEFAULT_COLLAPSED))
         var = tk.BooleanVar(value=collapsed)
         self._group_collapse_vars[group_id] = var
 
@@ -8111,12 +10213,29 @@ class ArkAPLauncher(tk.Tk):
                 expanded.grid(row=row, column=0, sticky="ew")
         _apply()
         var.trace_add("write", _apply)
-        var.trace_add("write", lambda *_a: self._save_group_collapse_state())
+        var.trace_add("write", lambda *_a: self._on_group_toggled(group_id, var))
         return body
 
-    def _save_group_collapse_state(self):
-        data = {gid: bool(var.get()) for gid, var in self._group_collapse_vars.items()}
-        self._write_config_key(GROUP_COLLAPSE_KEY, data, "Configuration tab group layout")
+    def _on_group_toggled(self, group_id, var):
+        """Persist a collapse the USER made. Automatic reveals (search match, scan fill,
+        a Setup Status jump - see _auto_reveal) open a group for this session only:
+        saving them made the first scan after a server install pin Paths open for good,
+        undoing CONFIG_DEFAULT_COLLAPSED before anyone had chosen anything."""
+        if self._auto_revealing:
+            return
+        self._group_collapse_state[group_id] = bool(var.get())
+        self._write_config_key(GROUP_COLLAPSE_KEY, dict(self._group_collapse_state),
+                               "Configuration tab group layout")
+
+    def _auto_reveal(self, var):
+        """Expand a group without recording it as the user's layout choice."""
+        if not var.get():
+            return
+        self._auto_revealing = True
+        try:
+            var.set(False)
+        finally:
+            self._auto_revealing = False
 
     def _set_all_config_groups(self, collapsed):
         """Configuration tab's "Expand all" / "Collapse all" toolbar buttons - same
@@ -8137,8 +10256,12 @@ class ArkAPLauncher(tk.Tk):
             group_id = getattr(w, "_collapse_group_id", None)
             if group_id is not None:
                 var = self._group_collapse_vars.get(group_id)
-                if var is not None and var.get():
-                    var.set(False)
+                if var is not None:
+                    self._auto_reveal(var)
+            # Non-Configuration folds (Get Started's Setup Status list) open themselves.
+            reveal = getattr(w, "_on_reveal", None)
+            if reveal is not None:
+                reveal()
             try:
                 parent_name = w.winfo_parent()
             except tk.TclError:
@@ -8155,14 +10278,29 @@ class ArkAPLauncher(tk.Tk):
         collapsible group(s) hold `keys` (self.vars field names, or "#<group_id>" to
         reveal a group with no field of its own, e.g. Increase stacks), and focus/
         center the first real field."""
-        self.notebook.select(self.tab_config)
+        # The tab that actually holds the first field - server/slot/password live on
+        # Archipelago Setup, not Configuration. Group jumps ("#...") are Configuration's.
+        tab = self.tab_config
+        first = next((self._entries.get(k) for k in keys
+                      if not k.startswith("#") and self._entries.get(k) is not None), None)
+        w = first
+        while w is not None and w.master is not None:
+            if w.master is self.notebook:
+                tab = w
+                break
+            w = w.master
+        self.notebook.select(tab)
         self.update()
-        target_widget = None
+        target_widget = target_group = None
         for key in keys:
             if key.startswith("#"):
                 var = self._group_collapse_vars.get(key[1:])
                 if var is not None:
-                    var.set(False)
+                    self._auto_reveal(var)
+                # Jump to it too - opening a section somewhere below the fold and
+                # leaving the view where it was just lands the user on Configuration.
+                if target_group is None:
+                    target_group = self._group_frames.get(key[1:])
                 continue
             entry = self._entries.get(key)
             if entry is None:
@@ -8170,6 +10308,9 @@ class ArkAPLauncher(tk.Tk):
             self._reveal_group_for_widget(entry)
             if target_widget is None:
                 target_widget = entry
+        if target_widget is None and target_group is not None:
+            self.update_idletasks()
+            self._scroll_widget_to_top(target_group)
         if target_widget is not None:
             self.update_idletasks()
             self._center_widget_in_canvas(target_widget)
@@ -8196,7 +10337,7 @@ class ArkAPLauncher(tk.Tk):
         grid-only container (groups_area in _build_ui). Groups not in `collapse_ids`
         (every Archipelago Setup tab group) render as a plain, pack-placed LabelFrame,
         same as before - `parent` there stays the existing pack-only container."""
-        network_row = 0  # Network only - see NETWORK_PORT_KEYS below; grid row within its body
+        network_row = 0  # Network only - see NETWORK_SET_ONCE_KEYS below; grid row within its body
         for title, fields in groups:
             group_id = (collapse_ids or {}).get(title)
             if group_id:
@@ -8206,7 +10347,7 @@ class ArkAPLauncher(tk.Tk):
                 target.pack(fill="x", expand=True, pady=6)
             target.columnconfigure(0, weight=1)
 
-            ports_body = None  # Network only - see NETWORK_PORT_KEYS below
+            ports_body = None  # Network only - see NETWORK_SET_ONCE_KEYS below
 
             if title == "Paths":
                 toolrow = ttk.Frame(target)
@@ -8308,12 +10449,11 @@ class ArkAPLauncher(tk.Tk):
                 # the ports mini-collapsible below needs to share ONE of those rows
                 # via its own swap-siblings trick (_make_inline_collapsible), and Tk
                 # refuses to mix pack and grid slaves under the same parent.
-                if title == "Network" and key in NETWORK_PORT_KEYS:
+                if title == "Network" and key in NETWORK_SET_ONCE_KEYS:
                     if ports_body is None:
                         ports_body = self._make_inline_collapsible(
-                            target, "Ports (GAMEPORT / QUERYPORT / RCONPORT)",
-                            NETWORK_PORTS_GROUP_COLLAPSE_ID, network_row,
-                            default_collapsed=True)
+                            target, "Set once: ports and CLUSTERID",
+                            NETWORK_PORTS_GROUP_COLLAPSE_ID, network_row)
                         network_row += 1
                     field_parent = ports_body
                 else:
@@ -8399,8 +10539,8 @@ class ArkAPLauncher(tk.Tk):
                                            command=self._copy_port)
                     port_btn.pack(side="left", padx=(6, 0))
                     Tooltip(port_btn, "Copies just the port number from the server field "
-                            "(the digits after the colon) - handy for the connector and "
-                            "for firewall/port-forward entries.")
+                            "(the digits after the colon) - handy for firewall/port-forward "
+                            "entries.")
 
     def _build_config_upload_section(self, parent):
         """Copy the user's own Game.ini / GameUserSettings.ini over the server's.
@@ -8675,7 +10815,7 @@ class ArkAPLauncher(tk.Tk):
                                          highlightthickness=1)
         self.stack_apply_halo.pack(side="left")
         apply_btn = ttk.Button(self.stack_apply_halo, text="Apply to server config",
-                               command=self.apply_stack_settings)
+                               command=self.save_stacks)
         apply_btn.pack(padx=2, pady=2)
         Tooltip(apply_btn,
                 "Writes the settings above into <SERVER_ROOT>\\%s - the multiplier into "
@@ -9231,9 +11371,10 @@ class ArkAPLauncher(tk.Tk):
         ttk.Label(ext, foreground=self.theme["subtle_fg"], wraplength=640, justify="left",
                   text="The ArkAP plugin (via Install Plugin above) and ArkServerApi (via "
                        "Install ArkServerApi above) can be installed automatically now. "
-                       "Its not required, but if you have connection issues"
-                       "The ArkConnector still needs a manual download/run - grab it from "
-                       "the releases page below.").pack(anchor="w")
+                       "You connect in-game with /connect, so the standalone ArkConnector "
+                       "isn't required - it's an optional fallback if you have connection "
+                       "issues, and still a manual download from the releases page below."
+                  ).pack(anchor="w")
         ttk.Button(ext, text="Open Releases Page",
                    command=lambda: webbrowser.open(RELEASES_URL)).pack(anchor="w", pady=(4, 0))
 
@@ -9292,6 +11433,9 @@ class ArkAPLauncher(tk.Tk):
         list_outer.pack(side="left", fill="both", expand=True)
         canvas = tk.Canvas(list_outer, borderwidth=0, highlightthickness=0,
                            background=self.theme["bg"])
+        # Kept on self so _rebuild_mods_rows can put the view back where it was: the rows
+        # are destroyed and re-created wholesale, which otherwise drops the list at the top.
+        self.mods_canvas = canvas
         vsb = ttk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -9331,7 +11475,7 @@ class ArkAPLauncher(tk.Tk):
                                            highlightthickness=1)
         self.mods_save_btn_halo.pack(fill="x", pady=2)
         self.mods_save_btn = ttk.Button(self.mods_save_btn_halo, text="Save",
-                                        command=self.on_mods_save)
+                                        command=self.save_mods)
         self.mods_save_btn.pack(fill="x", padx=2, pady=2)
         Tooltip(self.mods_save_btn,
                 "Apply the checkboxes above to GameUserSettings.ini's ActiveMods right "
@@ -9358,6 +11502,17 @@ class ArkAPLauncher(tk.Tk):
             "activation are unchanged, and the mod is still left out of the YAML copy "
             "if it's unsupported. Supported mods keep their apworld names and can't be "
             "renamed.", gated=False)
+        # Not gated either, and for the same reason: removing a row is a list edit, so
+        # someone who mistyped an ID in "Add mod..." must be able to undo it before a
+        # server exists. Enabled by selection in _update_mods_button_states.
+        self.mods_remove_btn = _add_btn(
+            "Remove from list", self.on_mods_remove,
+            "Delete the selected mod's entry from this list. Asks first, then asks "
+            "separately whether to also delete its downloaded files (default: keep "
+            "them). A mod that's in ActiveMods on the server is taken out of it as part "
+            "of the removal, so the server can't keep loading a mod this list no longer "
+            "knows about - restart the ARK server afterwards. A supported mod comes "
+            "back, unticked, the next time the launcher starts.", gated=False)
         self.mods_uninstall_btn = _add_btn(
             "Uninstall unchecked", self.on_mods_uninstall_unchecked,
             "Deletes the installed files for every mod that's currently unchecked, "
@@ -9458,30 +11613,78 @@ class ArkAPLauncher(tk.Tk):
         # ticks were being read from the config rather than from ActiveMods.
         self._save_mods_config()
 
-    def _refresh_mods_list(self):
+    def _refresh_mods_list(self, keep_visible=None):
         """Rebuild every row from REAL disk state: checkbox = is the mod in
         GameUserSettings.ini's ActiveMods (read_active_mods), icon = is_mod_installed.
         This is the "re-verify against disk" path - called on tab load, manual Refresh,
-        reorder, and add."""
+        reorder, and add. `keep_visible` is a mod id to scroll back into view afterwards
+        (see _rebuild_mods_rows)."""
         self._sync_mods_enabled_from_disk()
-        self._rebuild_mods_rows()
+        self._rebuild_mods_rows(keep_visible)
 
-    def _rebuild_mods_rows(self):
+    def _rebuild_mods_rows(self, keep_visible=None):
         """Redraw rows from whatever `enabled` currently sits in-memory, without
         re-reading disk - used after a pure GUI-intent edit (Check all/Uncheck all)
-        that must not be clobbered by _refresh_mods_list's disk sync."""
+        that must not be clobbered by _refresh_mods_list's disk sync.
+
+        The scroll position is part of that same "must survive a rebuild" state: every
+        row widget is destroyed here, so the canvas is left with nothing to hold its view
+        against and drops to the top. `keep_visible` (a mod id) additionally nudges the
+        view so that row is fully on screen - for a reorder, where the row that moved is
+        the one the user is watching and can otherwise step off the edge of the view."""
+        frac = self.mods_canvas.yview()[0]
         for child in self.mods_items_frame.winfo_children():
             child.destroy()
+        self._mods_rows = {}
         gate_ok, server_root = self._mods_gate_state()
         for idx, mod in enumerate(self._mods):
             self._build_mod_row(idx, mod, server_root, gate_ok)
         self._update_mods_button_states()
+        self._restore_mods_scroll(frac, keep_visible)
+
+    def _restore_mods_scroll(self, frac, keep_visible=None):
+        """Put the list back at `frac` after a rebuild, then keep `keep_visible` on screen.
+
+        At idle, not now: the canvas only recomputes its scrollregion when the rebuilt
+        inner frame fires <Configure>, so moving the view before that clamps it against
+        the region of a list that no longer exists."""
+        def _restore():
+            canvas = self.mods_canvas
+            canvas.yview_moveto(frac)
+            row = self._mods_rows.get(keep_visible)
+            if row is None:
+                return
+            canvas.update_idletasks()
+            total = max(self.mods_items_frame.winfo_height(), 1)
+            top, view_h = canvas.canvasy(0), canvas.winfo_height()
+            y, h = row.winfo_y(), row.winfo_height()
+            if y < top:
+                canvas.yview_moveto(y / total)
+            elif y + h > top + view_h:
+                canvas.yview_moveto((y + h - view_h) / total)
+        # Tracked so it can be cancelled with the window (see _cancel_pending_timers) -
+        # an idle job firing into a torn-down interpreter prints a Tcl error.
+        self._mods_scroll_id = self.after_idle(_restore)
+
+    def _paint_mods_selection(self):
+        """Recolour the rows for the current selection in place. Selecting is a UI-only
+        change, so it must not go through _rebuild_mods_rows - that used to throw the
+        scroll position away on every click in a long list. Only the plain-tk widgets
+        carry the row background; the ttk ones in the row draw their own."""
+        for mod_id, row in self._mods_rows.items():
+            bg = (self.theme["tab_active_bg"] if mod_id == self._mods_selected_id
+                  else self.theme["bg"])
+            row.configure(background=bg)
+            for child in row.winfo_children():
+                if isinstance(child, tk.Label):
+                    child.configure(background=bg)
 
     def _build_mod_row(self, idx, mod, server_root, gate_ok):
         selected = (mod["id"] == self._mods_selected_id)
         row_bg = self.theme["tab_active_bg"] if selected else self.theme["bg"]
         row = tk.Frame(self.mods_items_frame, background=row_bg)
         row.pack(fill="x", pady=1)
+        self._mods_rows[mod["id"]] = row   # _paint_mods_selection recolours these in place
 
         # When gated (no SERVER_ROOT / server not installed) the whole row is read-only.
         interactive = "normal" if gate_ok else "disabled"
@@ -9531,8 +11734,11 @@ class ArkAPLauncher(tk.Tk):
         id_lbl.pack(side="left", padx=(6, 4))
 
         def _select(_e=None, mod_id=mod["id"]):
+            # No rebuild: the only thing a selection changes is which row is highlighted
+            # and which buttons are lit, and rebuilding scrolled the list back to the top.
             self._mods_selected_id = mod_id
-            self._refresh_mods_list()
+            self._paint_mods_selection()
+            self._update_mods_button_states()
         for w in (row, name_lbl, id_lbl):
             w.bind("<Button-1>", _select)
 
@@ -9549,12 +11755,30 @@ class ArkAPLauncher(tk.Tk):
         # explain why that one can't be renamed, rather than greying out silently.
         self.mods_rename_btn.configure(
             state="normal" if (has_selection and not busy) else "disabled")
+        # Ungated like Rename: undoing an "Add mod..." typo mustn't need a server.
+        self.mods_remove_btn.configure(
+            state="normal" if (has_selection and not busy) else "disabled")
         self.mods_verify_btn.configure(
             state="normal" if (enabled and has_selection) else "disabled")
-        # Same rule as the other two Save buttons - lit only while there's something
-        # unapplied. This runs from _rebuild_mods_rows, i.e. after every toggle, Check
-        # all/Uncheck all, reorder, add, Refresh and Save. Cached in _mods_dirty_flag so
-        # the header hint can reuse the verdict instead of re-reading the .ini.
+        self._refresh_mods_dirty()
+
+    def _refresh_mods_dirty(self):
+        """Light the Mods Save whenever what Save would write differs from ActiveMods on
+        disk - edits this session or not.
+
+        It used to be computed only from _rebuild_mods_rows, so a mismatch that was
+        already there at startup (ticks saved in config.json against an ActiveMods line
+        something else rewrote) left the button dark until the tab was opened AND
+        something was clicked, while Setup Status showed a red X that only a Save would
+        clear. _mods_dirty() already compares against disk, so nothing new is being
+        decided here - it just gets asked at the right times (see _refresh_setup_status).
+
+        Deliberately not tied to the Setup Status row: that row also fails for a mod
+        ticked but not installed, which Save does NOT fix (it writes checked AND
+        installed), and a lit Save that changes nothing is worse than no hint at all.
+        That case is the row's hint - "Download checked" - instead."""
+        if not hasattr(self, "mods_save_btn_halo"):
+            return          # Mods tab not built yet
         self._mods_dirty_flag = self._mods_dirty()
         self._set_halo(self.mods_save_btn_halo, self._mods_dirty_flag)
         self._update_save_hint()
@@ -9580,7 +11804,9 @@ class ArkAPLauncher(tk.Tk):
             return
         self._mods[idx], self._mods[new_idx] = self._mods[new_idx], self._mods[idx]
         self._save_mods_config()
-        self._refresh_mods_list()
+        # Follow the row that moved: it's the one being watched, and a step off the top or
+        # bottom edge of the view is exactly when that matters.
+        self._refresh_mods_list(keep_visible=self._mods[new_idx]["id"])
 
     def _on_mod_toggle(self, mod, var):
         # GUI-intent only - this does NOT touch the server yet. The change is applied to
@@ -9650,6 +11876,19 @@ class ArkAPLauncher(tk.Tk):
             messagebox.showinfo("ARKIpelago Launcher",
                                 "A mod install is running - wait for it to finish.")
             return
+        # Same hard refusal apply_stack_settings/patch_game_ini already make: ActiveMods
+        # is read at server startup, and a write now would be ignored and then may be
+        # overwritten when the server shuts down. This function used to skip the check
+        # entirely - the one write path into GameUserSettings.ini that did.
+        if is_process_running(ARK_SERVER_PROCESS):
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "%s is currently running.\n\nActiveMods is read when the server starts, "
+                "so any change made now would be ignored and may be overwritten when the "
+                "server shuts down. Stop the ARK dedicated server first.\n\n(Mods: "
+                "nothing was written.)" % ARK_SERVER_PROCESS)
+            self._log("Mods Save: aborted - %s is running." % ARK_SERVER_PROCESS)
+            return
         gate_ok, server_root = self._mods_gate_state()
         if not gate_ok:
             self._mods_gate_warn()
@@ -9699,7 +11938,21 @@ class ArkAPLauncher(tk.Tk):
             return
         pending = [m for m in checked if not check_mod_installed(server_root, m["id"])[0]]
         if not pending:
-            # All checked mods are already installed - just (re)apply activation.
+            # All checked mods are already installed - just (re)apply activation. Same
+            # refusal on_mods_save makes: nothing downloads here, so the only thing this
+            # branch does is the ActiveMods write, and skipping the check would make
+            # "everything's already installed" the one path in this tab that still wrote
+            # to a running server.
+            if is_process_running(ARK_SERVER_PROCESS):
+                messagebox.showerror(
+                    "ARKIpelago Launcher",
+                    "%s is currently running.\n\nActiveMods is read when the server "
+                    "starts, so activating now would be ignored and may be overwritten "
+                    "when the server shuts down. Stop the ARK dedicated server first."
+                    % ARK_SERVER_PROCESS)
+                self._mods_log_line("Download checked: aborted - %s is running."
+                                    % ARK_SERVER_PROCESS)
+                return
             ok, msg = set_active_mods(server_root, [m["id"] for m in checked])
             self._mods_log_line("Every checked mod is already installed.")
             self._mods_log_line(msg if ok else "! " + msg)
@@ -9729,6 +11982,19 @@ class ArkAPLauncher(tk.Tk):
         if self._any_install_running():
             messagebox.showinfo("ARKIpelago Launcher",
                                 "A mod install is running - wait for it to finish.")
+            return
+        # Deletes files the running server may have loaded, then rewrites ActiveMods -
+        # same refusal on_mods_save makes, and doubly so here since this doesn't just
+        # risk a write being ignored, it risks pulling files out from under a live server.
+        if is_process_running(ARK_SERVER_PROCESS):
+            messagebox.showerror(
+                "ARKIpelago Launcher",
+                "%s is currently running.\n\nUninstalling mod files it has loaded (and "
+                "the ActiveMods update that follows) would be ignored and may be "
+                "overwritten when the server shuts down. Stop the ARK dedicated server "
+                "first." % ARK_SERVER_PROCESS)
+            self._mods_log_line("Uninstall unchecked: aborted - %s is running."
+                                % ARK_SERVER_PROCESS)
             return
         gate_ok, server_root = self._mods_gate_state()
         if not gate_ok:
@@ -9803,6 +12069,99 @@ class ArkAPLauncher(tk.Tk):
         ttk.Button(btnrow, text="Rename", command=_submit).pack(side="right", padx=(4, 0))
         ttk.Button(btnrow, text="Cancel", command=win.destroy).pack(side="right")
         entry.bind("<Return>", lambda _e: _submit())
+
+    def on_mods_remove(self):
+        """Delete the selected mod's entry from the list, optionally uninstalling its
+        files too.
+
+        Rewrites ActiveMods here rather than demanding an untick + Save first. Save's
+        contract is unchanged - it still owns applying the *checkboxes* - but the entry
+        is about to stop existing, and a row that's gone can't be unticked, saved or
+        uninstalled later, so leaving it in ActiveMods would strand a mod the tab can no
+        longer reach (and Setup Status would then report a mismatch with nothing in the
+        list to fix it with). It's the same defensive rewrite on_mods_uninstall_unchecked
+        already does when it deletes files. Requiring untick + Save would also make
+        removal impossible while gated, where Save is disabled and Add/Rename still work.
+
+        Only what's actually in ActiveMods on disk is rewritten. A ticked-but-unsaved mod
+        is pending intent that never reached the server, so dropping the row drops the
+        intent and orphans nothing."""
+        if self._any_install_running():
+            messagebox.showinfo("ARKIpelago Launcher",
+                                "A mod install is running - wait for it to finish.")
+            return
+        mod = next((m for m in self._mods if m["id"] == self._mods_selected_id), None)
+        if not mod:
+            messagebox.showinfo("Remove from list", "Select a mod in the list first.")
+            return
+        name = mod.get("name") or mod["id"]
+        gate_ok, server_root = self._mods_gate_state()
+        installed = gate_ok and check_mod_installed(server_root, mod["id"])[0]
+        # Unknown-aware read for the same reason on_mods_uninstall_unchecked uses it:
+        # read_active_mods flattens "couldn't read it" into [], and the rewrite below
+        # would then write that empty list back and deactivate every mod on the server.
+        active = read_active_mods_or_none(server_root) if gate_ok else None
+        was_active = active is not None and mod["id"] in active
+
+        notes = []
+        if was_active:
+            notes.append("It's active on the server right now, so it will also be taken "
+                         "out of ActiveMods - otherwise the server would keep loading a "
+                         "mod this list no longer knows about. Restart the ARK server "
+                         "afterwards.")
+        elif active is None and mod.get("enabled"):
+            notes.append("It's ticked, but ActiveMods can't be read from here (no "
+                         "SERVER_ROOT / server not installed), so nothing on a server is "
+                         "changed.")
+        if installed:
+            notes.append("Its downloaded files stay on disk unless you choose to delete "
+                         "them next.")
+        if mod.get("supported", True):
+            notes.append("This is one of the mods the launcher supports, so it comes "
+                         "back in this list - unticked - next time the launcher starts. "
+                         "That's also how you get it back if you remove it by mistake.")
+        if not messagebox.askyesno(
+                "Remove from list",
+                ("Remove \"%s\" (%s) from the mod list?\n\n%s"
+                 % (name, mod["id"], "\n\n".join(notes))).strip()):
+            self._mods_log_line("Remove from list: cancelled.")
+            return
+
+        # Default No: removing the entry is the reversible half and it's what the button
+        # says; deleting the files isn't, so it has to be asked for. Skipped entirely
+        # when there are no files to delete (the common case - a mistyped ID).
+        uninstall = installed and messagebox.askyesno(
+            "Remove from list",
+            "Also delete the downloaded files for \"%s\"?\n\n%s\n\nYes - remove the "
+            "entry and delete the files. No - remove the entry only and leave the files "
+            "where they are; re-adding the mod by ID later will find them already "
+            "installed."
+            % (name, os.path.join(server_root, MODS_CONTENT_RELDIR, mod["id"])),
+            default=messagebox.NO)
+
+        self._mods.remove(mod)
+        self._mods_selected_id = None   # the row the buttons acted on is gone
+        self._save_mods_config()
+        self._mods_log_line("Removed mod %s [%s] from the list." % (name, mod["id"]))
+
+        if uninstall:
+            ok, msg = uninstall_mod(server_root, mod["id"])
+            self._mods_log_line(msg if ok else "! " + msg)
+        # Same refusal on_mods_save makes: only the ActiveMods write is skipped - the
+        # list entry above is already gone, which is the point of the button either way.
+        if was_active and is_process_running(ARK_SERVER_PROCESS):
+            self._mods_log_line("! %s is running - ActiveMods was NOT updated (it would "
+                                "be ignored and may be overwritten on shutdown). Stop the "
+                                "ARK server and click Save on the Mods tab."
+                                % ARK_SERVER_PROCESS)
+        elif was_active:
+            ok, msg = set_active_mods(server_root,
+                                      [mid for mid in active if mid != mod["id"]])
+            self._mods_log_line(msg if ok else "! " + msg)
+            if ok:
+                self._mods_log_line(
+                    "Restart the ARK server for the change to take effect.")
+        self._refresh_mods_list()
 
     def on_mods_open_workshop_page(self):
         mod = next((m for m in self._mods if m["id"] == self._mods_selected_id), None)
@@ -9907,16 +12266,25 @@ class ArkAPLauncher(tk.Tk):
                 log("! " + result.message)
 
         if activate is not None:
-            # ActiveMods = the checked mods that actually ended up installed, in order.
-            active_ids = [m["id"] for m in activate
-                          if is_mod_installed(server_root, m["id"])]
-            skipped = [m["id"] for m in activate
-                       if not is_mod_installed(server_root, m["id"])]
-            ok, msg = set_active_mods(server_root, active_ids)
-            log(msg if ok else "! " + msg)
-            if skipped:
-                log("! Left inactive (not installed): %s" % ", ".join(skipped))
-            log("Restart the ARK server for the change to take effect.")
+            # A download can run for minutes - long enough for the server to have been
+            # started after this was kicked off. Same refusal on_mods_save makes; logged
+            # rather than a messagebox since this runs on the background thread.
+            if is_process_running(ARK_SERVER_PROCESS):
+                log("! %s is now running - ActiveMods was NOT written (it would be "
+                    "ignored and may be overwritten on shutdown). Stop the ARK server "
+                    "and click Save on the Mods tab to activate these mods."
+                    % ARK_SERVER_PROCESS)
+            else:
+                # ActiveMods = the checked mods that actually ended up installed, in order.
+                active_ids = [m["id"] for m in activate
+                              if is_mod_installed(server_root, m["id"])]
+                skipped = [m["id"] for m in activate
+                           if not is_mod_installed(server_root, m["id"])]
+                ok, msg = set_active_mods(server_root, active_ids)
+                log(msg if ok else "! " + msg)
+                if skipped:
+                    log("! Left inactive (not installed): %s" % ", ".join(skipped))
+                log("Restart the ARK server for the change to take effect.")
         q.put(("done", all_ok))
 
     def _poll_mods_queue(self):
@@ -9949,45 +12317,6 @@ class ArkAPLauncher(tk.Tk):
         "info": "ℹ",
     }
 
-    def _build_setup_status_tab(self, parent):
-        wrap = ttk.Frame(parent, padding=(10, 8))
-        wrap.pack(fill="both", expand=True)
-
-        top = ttk.Frame(wrap)
-        top.pack(fill="x")
-        ttk.Label(top, text="Setup Status", font=("Segoe UI", 11, "bold")).pack(side="left")
-        ttk.Button(top, text="Re-check", command=self._recheck_setup_status
-                   ).pack(side="right")
-
-        ttk.Label(wrap, foreground=self.theme["subtle_fg"], wraplength=640, justify="left",
-                  text="Read-only check of common setup steps, based on the current "
-                       "Configuration tab paths and the files on disk. Nothing here is "
-                       "changed automatically - use Configuration / Install Server/Api/Plugin to fix "
-                       "a ✗."
-                  ).pack(anchor="w", pady=(4, 8))
-
-        # Scrollable list of checks - same Canvas + Scrollbar pattern as the Configuration
-        # tab, since the check rows grow past the visible area (cluster folders, connector.ini,
-        # plugin mode, component-version advisories, ...).
-        items_wrap = ttk.Frame(wrap)
-        items_wrap.pack(fill="both", expand=True)
-        canvas = tk.Canvas(items_wrap, borderwidth=0, highlightthickness=0,
-                           background=self.theme["bg"])
-        vsb = ttk.Scrollbar(items_wrap, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        self.status_items_frame = ttk.Frame(canvas)
-        inner_id = canvas.create_window((0, 0), window=self.status_items_frame, anchor="nw")
-        self.status_items_frame.bind(
-            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
-
-        def _on_wheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
-
     def _arkapi_win64_dir(self):
         root = self.get("SERVER_ROOT")
         return os.path.normpath(root) if root else ""
@@ -10002,16 +12331,196 @@ class ArkAPLauncher(tk.Tk):
 
         ok, detail = check_ark_server_installed(root)
         items.append({
+            "id": "server",
             "label": "ARK dedicated server installed",
-            "state": "ok" if ok else "fail",
+            # Not yet installed is a step still to do, not a fault - see server_root_state.
+            "state": "ok" if ok else ("info" if server_root_state(root) == "empty"
+                                      else "fail"),
             "detail": detail,
-            "hint": "Set SERVER_ROOT on the Configuration tab, then Install Server/Api/Plugin -> "
-                    "Install ARK Server.",
+            "hint": "SERVER_ROOT should be an empty folder of its own - not your ARK game "
+                    "install. Install Server/Api/Plugin -> Install ARK Server downloads the "
+                    "dedicated server into it.",
             "goto_keys": ["SERVER_ROOT"],
         })
 
+        # Only once there is an install to ask about - with no exe the row above is already
+        # red, and "no appmanifest" would be the same news twice.
+        if ok:
+            state, detail = check_server_branch(root)
+            items.append({
+                "id": "branch",
+                "label": "ARK server is on the %s branch and fully installed" % ARK_BETA_BRANCH,
+                "state": state,
+                "detail": detail,
+                "hint": "A game client on the %s branch only sees servers on the same "
+                        "build, so a server on another branch, or one whose last update "
+                        "never finished, doesn't show up - not even for you. The launcher "
+                        "never updates a server on its own: an install that came from "
+                        "somewhere else (the Steam client, a copy, an older setup) stays on "
+                        "whatever it came with. Fix: stop the ARK server, then Install "
+                        "Server/Api/Plugin -> Install ARK Server, which re-runs SteamCMD "
+                        "with -beta %s validate against this SERVER_ROOT and hit Re-check "
+                        "when it finishes." % (ARK_BETA_BRANCH, ARK_BETA_BRANCH),
+                "fix": self._fix_server_branch if state != "ok" else None,
+            })
+
+            # Only when it fires - see the "cross-path consistency" comment below for why
+            # a permanent green "no stray copies" line would be noise on every healthy
+            # install. This is exactly the setup a config that "worked, then vanished"
+            # would show: something is reading or writing a file that isn't the one this
+            # tab (or Setup Status) is looking at.
+            ok2, detail2 = check_single_game_user_settings(root)
+            if not ok2:
+                items.append({
+                    "id": "gus_stray",
+                    "label": "Exactly one GameUserSettings.ini exists, in the right place",
+                    "state": "fail",
+                    "detail": detail2,
+                    "hint": "The launcher's settings, your own hand edits and Setup "
+                            "Status all assume there is one live GameUserSettings.ini. "
+                            "A second copy - or the only copy sitting somewhere else - "
+                            "means edits can land in a file the server never reads while "
+                            "everything here still looks fine.",
+                })
+
+            # Only when it fires, same as above - most installs never touch this path.
+            ok3, detail3 = check_config_not_overwritten(root)
+            if not ok3:
+                items.append({
+                    "id": "config_drift",
+                    "label": "Game.ini / GameUserSettings.ini match what this launcher "
+                             "last wrote",
+                    "state": "fail",
+                    "detail": detail3,
+                    "hint": "Something changed this file after the launcher last wrote "
+                            "it - most likely the ARK server itself, rewriting its config "
+                            "on shutdown from whatever it had loaded at startup, before "
+                            "your later edit landed. Re-apply the setting shown above "
+                            "while the server is stopped, then hit Re-check.",
+                })
+
+        # ---- cross-path consistency ------------------------------------------
+        # Every path below is individually valid - it exists, it's spelled right, the
+        # field looks filled in. What's wrong is that they disagree with each other about
+        # which ARK install this launcher is driving, and nothing else in the app ever
+        # notices: each operation succeeds, against the wrong install. All four rows only
+        # appear when they fire; they are detectors for specific wrong combinations, not
+        # setup steps, and a green "your paths don't contradict each other" line on every
+        # healthy install is noise.
+        cross_paths = {key: self.get(key) for key in CROSS_CHECK_PATH_KEYS}
+
+        # Red X and not an advisory: the two installs share one set of saves and cluster
+        # data, both write it, and they drift apart silently. Only fires for a path
+        # inside ANOTHER ARK install - cluster folders on a roomier drive are a layout
+        # people run deliberately and are none of this check's business.
+        ok, detail = check_cluster_paths_not_foreign(root, cross_paths)
+        if not ok:
+            items.append({
+                "id": "cluster_foreign",
+                "label": "Cluster folders belong to a different ARK install",
+                "state": "fail",
+                "detail": detail,
+                "hint": "SERVER_ROOT points at one ARK install and these cluster folders "
+                        "live inside another one. The server writes its world saves and "
+                        "cluster data into them the whole time it runs, so both installs "
+                        "end up writing the same files on their own schedules and the "
+                        "two worlds drift apart - with no error from either. It usually "
+                        "means SERVER_ROOT was changed to a new install and these fields "
+                        "were left pointing at the old one. Fix: Configuration tab -> "
+                        "\"Create %s folders\" puts all three back under the current "
+                        "SERVER_ROOT (existing folders are left untouched), or \"Scan "
+                        "for paths\" re-derives them. Copy any saves you want to keep "
+                        "across by hand first - neither button moves data."
+                        % CLUSTER_ROOT_DIRNAME,
+                "goto_keys": [key for key, _ in CLUSTER_PATH_SUBDIRS],
+                "fix": self._fix_cluster_paths,
+            })
+
+        # game_ini gets no "different drive is fine" allowance the cluster folders get:
+        # the server reads only the Game.ini inside its own install, so anywhere else is
+        # a file it will never look at.
+        ok, detail = check_game_ini_under_server_root(root, self.get("game_ini"))
+        if not ok:
+            items.append({
+                "id": "game_ini_outside",
+                "label": "Game.ini is outside SERVER_ROOT",
+                "state": "fail",
+                "detail": detail,
+                "hint": "The ARK server only ever reads the Game.ini inside its own "
+                        "install. Every setting the launcher writes here - stack sizes, "
+                        "the Archipelago blocks, anything from \"Apply to server "
+                        "config\" - is landing in a file the server never opens, so the "
+                        "writes keep succeeding and nothing ever changes in game. Fix: "
+                        "clear the \"Game.ini file\" field and Save, which makes the "
+                        "launcher use the one under SERVER_ROOT, or \"Scan for paths\" "
+                        "to point it there.",
+                "goto_keys": ["game_ini"],
+                # Guarded rather than unconditional: with the field already on the right
+                # path there is nothing for the button to change, and one that no-ops is
+                # worse than none.
+                "fix": (self._fix_game_ini_path
+                        if self._game_ini_fix_available() else None),
+            })
+
+        # The confirmed real case: game_ini pointing at the ARK CLIENT's config. Worth a
+        # row of its own rather than folding into the one above, because it also fires
+        # for a client config that happens to sit inside SERVER_ROOT (a copied-in file),
+        # and because "you are editing your own game's settings" is the thing the user
+        # needs told - not "wrong folder".
+        ok, detail = check_game_ini_is_server_config(self._game_ini_path())
+        if not ok:
+            items.append({
+                "id": "game_ini_client",
+                "label": "Game.ini is the game client's config, not the server's",
+                "state": "fail",
+                "detail": detail,
+                "hint": "This file is the one your ARK GAME reads - it has the video and "
+                        "scalability settings the dedicated server has no use for. The "
+                        "launcher has been editing your game's settings instead of the "
+                        "server's: the writes succeed, the server sees none of them, and "
+                        "your own game gets the changes. Fix: clear the \"Game.ini file\" "
+                        "field and Save so the launcher uses the one under SERVER_ROOT "
+                        "(ShooterGame\\Saved\\Config\\WindowsServer\\Game.ini), or "
+                        "\"Scan for paths\" to point it there. Worth opening the file "
+                        "afterwards to undo anything that was written into it.",
+                "goto_keys": ["game_ini"],
+                "fix": (self._fix_game_ini_path
+                        if self._game_ini_fix_available() else None),
+            })
+
+        # Not SERVER_ROOT-only: every one of these fields is written to at runtime, so
+        # any of them under Program Files fails the same way. Red X rather than an
+        # advisory - Windows gives a non-elevated 64-bit process no way to write here (no
+        # UAC file virtualization), so it fails outright. It CAN be made to work by
+        # running everything elevated forever, which the hint says, but that is a
+        # workaround for a folder choice and it breaks again the first time anyone
+        # forgets.
+        ok, detail = check_paths_in_program_files(cross_paths)
+        if not ok:
+            items.append({
+                "id": "program_files",
+                "label": "Configured paths are inside Program Files",
+                "state": "fail",
+                "detail": detail,
+                "hint": "These folders are not just where things live, they are written "
+                        "to the whole time the server runs - world saves, "
+                        "GameUserSettings.ini/Game.ini, ShooterGame.log and the plugin's "
+                        "ipc files all land inside them. Program Files is "
+                        "administrator-only, so those writes fail and the server exits "
+                        "during startup (or starts and loses every save); SteamCMD's "
+                        "download into it usually fails the same way. Fix: move the "
+                        "install, or reinstall it, somewhere you own - E:\\ARKServer, "
+                        "C:\\ARKServer, anywhere outside Program Files - and point these "
+                        "fields there. Running the launcher as administrator every "
+                        "single time also works, but it breaks again the first time "
+                        "anyone forgets.",
+                "goto_keys": [key for key in CROSS_CHECK_PATH_KEYS
+                              if check_path_in_program_files(self.get(key))[0]],
+            })
+
         ok, detail = check_arkapi_installed(root)
         items.append({
+            "id": "arkapi",
             "label": "ArkApi installed",
             "state": "ok" if ok else "fail",
             "detail": detail,
@@ -10025,6 +12534,7 @@ class ArkAPLauncher(tk.Tk):
         cluster_paths = {key: self.get(key) for key, _ in CLUSTER_PATH_SUBDIRS}
         ok, detail = check_cluster_dirs(cluster_paths)
         items.append({
+            "id": "cluster",
             "label": "Cluster folders exist (CLUSTERDIR / SAVESROOT / BACKUPROOT)",
             "state": "ok" if ok else "fail",
             "detail": detail,
@@ -10038,6 +12548,11 @@ class ArkAPLauncher(tk.Tk):
                     "server hang on launch with no error."
                     % CLUSTER_ROOT_DIRNAME,
             "goto_keys": [key for key, _ in CLUSTER_PATH_SUBDIRS],
+            # The same action the hint names, so there is one code path and the button
+            # cannot drift from the instructions beside it. Offered only with a
+            # SERVER_ROOT to derive from - without one there is nothing it could do, and
+            # the row above is already red about that.
+            "fix": self._on_create_cluster_folders if root else None,
         })
 
         # BattlEye isn't a persisted setting, but it doesn't need to be: the only way
@@ -10045,16 +12560,21 @@ class ArkAPLauncher(tk.Tk):
         # -NoBattlEye unconditionally (no flag, no branch). So it's guaranteed by the
         # launch line rather than unknown - a checkmark, not an info icon.
         items.append({
+            "id": "battleye",
             "label": "BattlEye disabled",
             "state": "ok",
             "detail": "Always disabled by start_ase_server.bat (-NoBattlEye is passed "
                       "on every launch).",
             "hint": "",
+            # Rows that pass on every working install are left off the tab while they
+            # pass (see _refresh_setup_status); the export and tab symbol still count them.
+            "hide_when_ok": True,
         })
 
         plugin_dir = self._arkap_plugin_dir()
         ok, detail = check_plugin_installed(plugin_dir)
         items.append({
+            "id": "plugin",
             "label": "ArkAP plugin installed",
             "state": "ok" if ok else "fail",
             "detail": detail,
@@ -10063,11 +12583,13 @@ class ArkAPLauncher(tk.Tk):
 
         ok, detail = check_plugin_mode(plugin_dir)
         items.append({
+            "id": "plugin_mode",
             "label": "Plugin mode is \"ap\" (not offline)",
             "state": "ok" if ok else "fail",
             "detail": detail,
             "hint": "Set \"mode\": \"ap\" in ArkAP.config.json for real multiworld play "
                     "(\"offline\" self-randomizes locally for solo hook testing).",
+            "hide_when_ok": True,
         })
 
         # Its own row rather than folding into the per-mod icons: a corrupt <id>.mod is
@@ -10075,6 +12597,7 @@ class ArkAPLauncher(tk.Tk):
         # by a mod this launcher doesn't even have in its list.
         broken = find_broken_mod_files(self.get("SERVER_ROOT"))
         items.append({
+            "id": "broken_mods",
             "label": "No corrupt .mod files in Content\\Mods",
             "state": "fail" if broken else "ok",
             "detail": ("; ".join("%s - %s" % (os.path.basename(p), why) for p, why in broken)
@@ -10090,6 +12613,7 @@ class ArkAPLauncher(tk.Tk):
         # else in the app notices when the two drift apart (see check_active_mods_match).
         ok, detail = check_active_mods_match(self.get("SERVER_ROOT"), self._mods)
         items.append({
+            "id": "mods_match",
             "label": "Mods tab matches ActiveMods on disk",
             "state": "ok" if ok else "fail",
             "detail": detail,
@@ -10120,6 +12644,7 @@ class ArkAPLauncher(tk.Tk):
                 self.stacks_mult_var.get().strip(),
                 stack_items)
             items.append({
+                "id": "stacks",
                 "label": "Increase stacks matches the server's config files",
                 "state": "ok" if ok else "info",
                 "detail": detail,
@@ -10143,6 +12668,7 @@ class ArkAPLauncher(tk.Tk):
             ok, detail = check_excalibur_unlocker(
                 _gameusersettings_path(self.get("SERVER_ROOT")))
             items.append({
+                "id": "excalibur",
                 "label": "%s: %s=true" % (EXCALIBUR_MOD_NAME, EU_BUFFS_UNLOCKER_KEY),
                 "state": "ok" if ok else "fail",
                 "detail": detail,
@@ -10163,6 +12689,7 @@ class ArkAPLauncher(tk.Tk):
 
         ok, detail = check_scripts_sourced(self._scripts_dir)
         items.append({
+            "id": "scripts_sourced",
             "label": "Server scripts read their paths from paths.cmd",
             "state": "ok" if ok else "fail",
             "detail": detail,
@@ -10178,6 +12705,12 @@ class ArkAPLauncher(tk.Tk):
         # compared against what is actually written in the file, so a value typed but never
         # Saved reads as unsaved even though the field on screen looks right.
         missing, unsaved, absent = self._preflight_bat("start_ase_server.bat")
+        # Values that ARE set but aren't in the file yet: Save is exactly the fix, so the
+        # Configuration Save lights up for them even with no edits this session (see
+        # _update_save_highlights). `missing` is deliberately not included - a blank field
+        # needs filling in, and Save would write the blank.
+        self._config_disk_dirty = bool(unsaved)
+        self._scripts_absent = bool(absent)     # Save recreates them - see _setup_fix_for
         parts = []
         if missing:
             parts.append("not set: %s" % ", ".join(missing))
@@ -10187,6 +12720,7 @@ class ArkAPLauncher(tk.Tk):
         if absent:
             parts.append("missing from the scripts folder: %s" % ", ".join(absent))
         items.append({
+            "id": "saved",
             "label": "Configuration is saved into the server scripts",
             "state": "fail" if parts else "ok",
             "detail": ("; ".join(parts) if parts else
@@ -10219,6 +12753,7 @@ class ArkAPLauncher(tk.Tk):
         else:
             state = "ok" if ok else "info"
         items.append({
+            "id": "connector_ini",
             "label": "connector.ini filled in (optional standalone connector fallback only)",
             "state": state,
             "detail": detail,
@@ -10230,12 +12765,366 @@ class ArkAPLauncher(tk.Tk):
             "goto_keys": [] if state == "ok" else ["connector_ini", "ipc_dir"],
         })
 
+        # ---- Archipelago side --------------------------------------------------
+        # What the Get Started tab's Archipelago steps read (see WIZARD_STEPS), kept here
+        # so it and this tab can't disagree. Advisory only, never a red X: someone whose
+        # friend hosts the room needs none of this on their own PC. Hidden once passing,
+        # so a finished setup's tab doesn't grow five permanent green lines.
+        # Only the checks that apply to the questionnaire's answers (see
+        # wizard_steps_for) - so neither this list nor the tab's status symbol nags a
+        # joiner about a seed they'll never generate.
+        role, yaml_by = self._ap_role()
+        joining = role == "join"
+        needs_ap = not (joining and yaml_by == "host")
+        ap_root = self._archipelago_dir()
+        ap_ok = is_archipelago_dir(ap_root)
+        if needs_ap:
+            items.append({
+                "id": "ap_dir",
+                "label": "Archipelago directory set",
+                "state": "ok" if ap_ok else "info",
+                "detail": ap_root if ap_ok else (
+                    "Not a valid Archipelago install: %s" % ap_root if ap_root else
+                    "Not set - only needed to build a yaml, generate or host a seed here."),
+                "hint": "Archipelago Setup tab -> \"Scan for Archipelago\", or Browse to the "
+                        "folder holding ArchipelagoLauncher.exe.",
+                "hide_when_ok": True,
+            })
+        # Only with a real install to look in - otherwise the row above already says it.
+        if ap_ok and needs_ap:
+            apworld = resolve_apworld_path(self.get)
+            have = os.path.isfile(apworld)
+            items.append({
+                "id": "apworld",
+                "label": "%s installed" % APWORLD_ASSET_NAME,
+                "state": "ok" if have else "info",
+                "detail": apworld if have else "Not in %s" % os.path.dirname(apworld),
+                "hint": "Archipelago Setup tab -> \"Update .apworld\". Without it the "
+                        "ARK options don't exist in the Options Creator or Generate.",
+                "hide_when_ok": True,
+            })
+            yamls, _note = find_player_yamls(ap_root, self.get("slot"))
+        if ap_ok and not joining:
+            # Host only: a joiner's yaml is exported anywhere and sent to the host (a
+            # tick on Get Started), and the host generates the seed.
+            items.append({
+                "id": "yaml",
+                "label": "ARK yaml in Archipelago's Players folder",
+                "state": "ok" if yamls else "info",
+                "detail": ", ".join(os.path.basename(p) for p in yamls) if yamls else
+                          "No yaml for ARK in %s" % os.path.join(ap_root, "Players"),
+                "hint": "Build one with \"Open Options Creator (YAML)\", export it, and "
+                        "put it in the Players folder.",
+                "hide_when_ok": True,
+            })
+            seeds = archipelago_seed_files(ap_root)
+            # ponytail: mtime heuristic - a seed older than the newest yaml was built
+            # from something else. A yaml edited after generating reads as stale even
+            # if the edit didn't matter; good enough for a nudge.
+            stale = bool(seeds and yamls and os.path.getmtime(seeds[0])
+                         < max(os.path.getmtime(p) for p in yamls))
+            items.append({
+                "id": "seed",
+                "label": "Seed generated",
+                "state": "ok" if seeds and not stale else "info",
+                "detail": ("%s is older than your yaml - generate again to use your "
+                           "latest options." % os.path.basename(seeds[0])) if stale else (
+                           os.path.basename(seeds[0]) if seeds else
+                           "Nothing in %s" % os.path.join(ap_root, "output")),
+                "hint": "Archipelago Setup tab -> \"Generate seed\".",
+                "hide_when_ok": True,
+            })
+        room_ok = bool(self.get("server") and self.get("slot"))
+        items.append({
+            "id": "room",
+            "label": "Archipelago room details filled in (server and slot)",
+            "state": "ok" if room_ok else "info",
+            "detail": "%s as %s" % (self.get("server"), self.get("slot")) if room_ok else
+                      "server and slot are empty on the Archipelago Setup tab.",
+            "hint": ("Ask the host for the server address (host:port), your slot name "
+                     "and the room password, fill them in and Save." if joining else
+                     "Host the seed on archipelago.gg or with \"Host local Archipelago "
+                     "server\", then fill in server, slot and password and Save."),
+            "hide_when_ok": True,
+        })
+
         # Component/launcher version rows (yellow "i" when newer, green check for the
         # launcher when up to date - never a ✗) computed off the main thread against the
         # GitHub releases; empty until that check comes back. See
         # _component_version_check_worker.
         items.extend(getattr(self, "_component_advisories", []))
+        # Every row the launcher can resolve itself gets its "Fix this" here, from one
+        # table (_setup_fix_for), rather than each row deciding on its own - so what's
+        # fixable, and what each fix does, reads in one place. Rows that set their own
+        # fix above keep it.
+        by_id = {it.get("id"): it for it in items}
+        for item in items:
+            if item["state"] != "ok" and not item.get("fix"):
+                found = self._setup_fix_for(item, by_id)
+                if found:
+                    item["fix"], item["fix_tip"] = found
         return items
+
+    def _setup_fix_for(self, item, by_id):
+        """(fix, tooltip) for a red X or yellow i the launcher can resolve by itself, or
+        None. A fix is the ONE action that resolves the row - an install, a save, a
+        setting put back - and every fix that changes or removes a file asks first,
+        says exactly what will change, and backs up what it replaces.
+
+        Deliberately no fix for: configured paths inside Program Files (moving an
+        install is the user's call), several GameUserSettings.ini copies (which one holds
+        the real settings is a question only the user can answer), a missing yaml or
+        room (both are the user's own choices), and blank Configuration fields (Save
+        would just write the blank)."""
+        rid = item.get("id") or ""
+        root = self.get("SERVER_ROOT")
+        if rid == "server":
+            state = server_root_state(root)
+            if state in ("empty", "incomplete"):
+                return (self.on_install_server,
+                        "Downloads the ARK dedicated server into SERVER_ROOT with SteamCMD "
+                        "(about 18 GB) - the same as Get Started's Install ARK Server.")
+            if state == "nested":
+                return (self._fix_nested_server_root,
+                        "The server is installed one folder further down - points "
+                        "SERVER_ROOT at it. Nothing on disk is moved.")
+            return (self._wizard_choose_server_root,
+                    "Choose an empty folder of its own for the server - never your ARK "
+                    "game folder.")
+        if rid == "arkapi" and check_ark_server_installed(root)[0]:
+            return (self.on_install_arkapi,
+                    "Downloads ArkServerApi and unpacks it into the server.")
+        if rid == "plugin" and check_arkapi_installed(root)[0]:
+            return (self.on_install_plugin,
+                    "Downloads the ArkAP plugin and installs it into ArkApi.")
+        if rid == "plugin_mode" and os.path.isfile(self._plugin_config_path()):
+            return (self._fix_plugin_mode,
+                    "Sets \"mode\" to \"ap\" in ArkAP.config.json (the old file is "
+                    "backed up). Restart the server afterwards.")
+        if rid == "broken_mods":
+            return (self._fix_broken_mods,
+                    "Deletes the corrupt .mod file(s) - they crash the server on start - "
+                    "so the mod reads as not installed and the Mods tab can re-download it.")
+        if rid == "mods_match" and self._mods_gate_state()[0]:
+            if self._mods_dirty():
+                return (self.save_mods,
+                        "Writes the Mods tab's ticks into ActiveMods - the Mods tab's Save.")
+            if any(m.get("enabled") and not check_mod_installed(root, m["id"])[0]
+                   for m in self._mods):
+                return (self.on_mods_download_checked,
+                        "Downloads the ticked mods that aren't installed yet, then saves - "
+                        "the Mods tab's Download checked.")
+        if rid == "stacks":
+            return (self.save_stacks,
+                    "Writes the Increase stacks settings into Game.ini and "
+                    "GameUserSettings.ini (the server must be stopped).")
+        if rid == "excalibur":
+            return (self.install_excalibur_buffs,
+                    "Rewrites the %s block with the engram unlocker off (the server must "
+                    "be stopped)." % EXCALIBUR_MOD_NAME)
+        if rid == "scripts_sourced":
+            return (self._fix_scripts,
+                    "Replaces outdated server scripts with the launcher's current ones. "
+                    "Your settings carry over; the old files are backed up.")
+        if rid == "saved" and (self._config_disk_dirty or self._scripts_absent):
+            return (self.save_fields,
+                    "Saves the Configuration fields into the server scripts (and "
+                    "recreates any that are missing).")
+        if rid == "connector_ini":
+            ini = self.get("connector_ini")
+            if (ini and os.path.isfile(ini)
+                    and all(self.get(k) for k in ("server", "slot", "ipc_dir"))):
+                return (self.save_fields,
+                        "Save writes server, slot and ipc_dir into connector.ini.")
+        if rid == "gus_stray" and len(find_game_user_settings(root)) == 1:
+            return (self._fix_stray_gus,
+                    "Copies the only GameUserSettings.ini into the one place the server "
+                    "reads it from. The original is left where it is.")
+        if rid == "config_drift":
+            return (self._fix_config_drift,
+                    "Puts back what the launcher last wrote to the file (the current "
+                    "file is backed up first). The server must be stopped.")
+        if rid == "ap_dir":
+            return (self._on_scan_archipelago,
+                    "Looks for Archipelago in the usual places, then on your drives.")
+        if rid == "apworld":
+            return (self._on_update_apworld,
+                    "Downloads the ARK .apworld into Archipelago's custom_worlds.")
+        if rid == "seed" and (by_id.get("yaml") or {}).get("state") == "ok":
+            return (self._open_generate,
+                    "Runs Archipelago's Generate on the yaml(s) in its Players folder.")
+        updates = {"update_arkapi": self.on_install_arkapi,
+                   "update_plugin": self.on_install_plugin,
+                   "update_apworld": self._on_update_apworld,
+                   "update_trackerpack": self._on_install_tracker_pack,
+                   "update_launcher": self._on_check_for_updates}
+        if rid in updates:
+            return updates[rid], "Installs the newer release."
+        return None
+
+    def _plugin_config_path(self):
+        return os.path.join(self._arkap_plugin_dir() or "", "ArkAP.config.json")
+
+    def _server_running_refusal(self, title):
+        """The fixes that write a server config refuse while it runs: ARK rewrites its
+        config on shutdown, so a change made now would be undone."""
+        if not is_process_running(ARK_SERVER_PROCESS):
+            return False
+        self._fix_unavailable(title, "%s is running. ARK rewrites its config files when "
+                                     "it shuts down, so a change made now would be "
+                                     "undone. Stop the server first, then press Fix this "
+                                     "again." % ARK_SERVER_PROCESS)
+        return True
+
+    def _fix_nested_server_root(self):
+        title = "Fix SERVER_ROOT"
+        root = self.get("SERVER_ROOT")
+        nested = nested_server_root(root) if root else ""
+        if not nested:
+            return self._fix_unavailable(title, "No server was found one folder below "
+                                                "SERVER_ROOT any more.")
+        if not messagebox.askyesno(
+                title, "The ARK server is installed one folder further down than "
+                       "SERVER_ROOT.\n\nSERVER_ROOT\n    was %s\n    now %s\n\nNothing on "
+                       "disk is moved. Press Save afterwards." % (root, nested)):
+            return
+        self.set("SERVER_ROOT", os.path.normpath(nested))
+        self._log("%s:\n    was %s\n    now %s" % (title, root, nested))
+        self._refresh_setup_status()
+
+    def _fix_plugin_mode(self):
+        title = "Fix plugin mode"
+        path = self._plugin_config_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            return self._fix_unavailable(title, "Couldn't read %s:\n%s" % (path, exc))
+        if not isinstance(data, dict):
+            return self._fix_unavailable(title, "%s isn't a JSON object." % path)
+        old = data.get("mode")
+        if not messagebox.askyesno(
+                title, "ArkAP.config.json \"mode\"\n    was %s\n    now \"ap\"\n\n"
+                       "\"ap\" connects to your Archipelago room; \"offline\" only "
+                       "randomizes locally for testing. The current file is backed up "
+                       "first. Restart the ARK server afterwards.\n\n%s"
+                       % (json.dumps(old) if old is not None else "(not set)", path)):
+            return
+        try:
+            backup = self._backup_file(path, time.strftime("%Y%m%d-%H%M%S"))
+            data["mode"] = "ap"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+        except OSError as exc:
+            return self._fix_unavailable(title, "Couldn't write %s:\n%s" % (path, exc))
+        self._log("%s: mode %s -> \"ap\" in %s (backup: %s). Restart the ARK server."
+                  % (title, json.dumps(old), path, backup))
+        self._refresh_setup_status()
+
+    def _fix_broken_mods(self):
+        title = "Remove corrupt mod files"
+        if self._server_running_refusal(title):
+            return
+        broken = find_broken_mod_files(self.get("SERVER_ROOT"))
+        if not broken:
+            self._refresh_setup_status()
+            return
+        if not messagebox.askyesno(
+                title, "These .mod files are corrupt and would crash the ARK server on "
+                       "startup:\n\n%s\n\nDelete them? Each mod then shows as not "
+                       "installed, and Download on the Mods tab gets it back."
+                       % "\n".join("%s - %s" % (os.path.basename(p), why)
+                                   for p, why in broken)):
+            return
+        self._sweep_broken_mod_files()      # deletes, logs, and reports what it couldn't
+        self._refresh_setup_status()
+
+    def _fix_scripts(self):
+        """Re-run the startup extraction, which replaces any pre-paths.cmd script with the
+        bundled one (backing it up and carrying its values over to paths.cmd) and puts
+        back any that are missing."""
+        title = "Update server scripts"
+        dest, extracted, refreshed, errors, migrated = extract_bundled_scripts()
+        lines = ["%s in %s:" % (title, dest)]
+        lines += ["    replaced %s (old copy backed up)" % r for r in refreshed]
+        lines += ["    restored missing %s" % e for e in extracted]
+        if migrated:
+            lines.append("    carried over to paths.cmd: %s" % ", ".join(migrated))
+        lines += ["  ! %s" % e for e in errors]
+        self._log("\n".join(lines))
+        if errors:
+            messagebox.showerror(title, "Some scripts couldn't be updated:\n\n%s\n\nClose "
+                                        "anything that has them open and try again."
+                                 % "\n".join(errors))
+        self._refresh_setup_status()
+
+    def _fix_stray_gus(self):
+        title = "Move GameUserSettings.ini into place"
+        if self._server_running_refusal(title):
+            return
+        root = self.get("SERVER_ROOT")
+        copies = find_game_user_settings(root)
+        target = _gameusersettings_path(root)
+        if len(copies) != 1:
+            return self._fix_unavailable(
+                title, "There are %d copies now - which one holds your settings is for "
+                       "you to decide. Keep that one at %s and rename the others."
+                       % (len(copies), plain_path(target)))
+        source = copies[0]
+        if not messagebox.askyesno(
+                title, "Copy\n    %s\nto\n    %s\n\nThe server only ever reads the second "
+                       "location. The original is left where it is."
+                       % (plain_path(source), plain_path(target))):
+            return
+        try:
+            os.makedirs(ext_path(os.path.dirname(target)), exist_ok=True)
+            shutil.copy2(ext_path(source), ext_path(target))
+        except OSError as exc:
+            return self._fix_unavailable(title, "Couldn't copy it:\n%s" % exc)
+        self._log("%s: copied %s -> %s" % (title, plain_path(source), plain_path(target)))
+        self._refresh_setup_status()
+
+    def _fix_config_drift(self):
+        """Put back what the launcher last wrote (the .arkap_lastwrite snapshot) over a
+        config something else has changed since. The current file is backed up first -
+        if the change was a hand edit you meant, it's in the .bak."""
+        title = "Restore server config"
+        if self._server_running_refusal(title):
+            return
+        root = self.get("SERVER_ROOT")
+        _ok, detail = check_config_not_overwritten(root)
+        drifted = []
+        for path in (_gameusersettings_path(root),
+                     os.path.join(root, SERVER_CONFIG_RELDIR, "Game.ini")):
+            snapshot = path + _INI_LASTWRITE_SUFFIX
+            try:
+                last, enc = read_text(ext_path(snapshot))
+                now, _e = read_text(ext_path(path))
+            except OSError:
+                continue
+            if last != now:
+                drifted.append((path, last, enc))
+        if not drifted:
+            self._refresh_setup_status()
+            return
+        if not messagebox.askyesno(
+                title, "%s\n\nPut back what the launcher last wrote to %s? The current "
+                       "file%s backed up first."
+                       % (detail, " and ".join(os.path.basename(p) for p, _l, _e in drifted),
+                          "s are" if len(drifted) > 1 else " is")):
+            return
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        for path, last, enc in drifted:
+            try:
+                backup = self._backup_file(path, ts)
+                write_ini_guarded(path, last, enc, expect_shrink=True)
+            except OSError as exc:
+                return self._fix_unavailable(title, "Couldn't restore %s:\n%s"
+                                             % (plain_path(path), exc))
+            self._log("%s: %s put back to the launcher's last write (backup: %s)"
+                      % (title, plain_path(path), backup))
+        self._refresh_setup_status()
 
     def _refresh_setup_status(self):
         for child in self.status_items_frame.winfo_children():
@@ -10246,6 +13135,14 @@ class ArkAPLauncher(tk.Tk):
             "info": self.theme["status_info"],
         }
         items = self._gather_setup_status()
+        # Every row, passing ones included: this list is what gets screenshotted for
+        # support, and it's folded away by default now, so completeness costs nothing.
+        # (hide_when_ok still marks the rows a healthy install never needs to look at.)
+        counts = {state: sum(1 for it in items if it["state"] == state)
+                  for state in ("fail", "info", "ok")}
+        self.status_summary.configure(text="   ".join(
+            "%d %s" % (counts[state], self.STATUS_ICONS[state])
+            for state in ("fail", "info", "ok") if counts[state]))
         for item in items:
             icon = self.STATUS_ICONS[item["state"]]
             color = state_colors[item["state"]]
@@ -10283,6 +13180,24 @@ class ArkAPLauncher(tk.Tk):
                 hint.pack(anchor="w")
                 if goto_keys:
                     hint.bind("<Button-1>", lambda _e, k=goto_keys: self._goto_config_field(k))
+            # "Fix this" for the rows the launcher can resolve itself. Placed after
+            # the hint so it reads as the hint's own action, and only where a fix is
+            # genuinely automatic and unambiguous - see the Setup Status fixes section.
+            #
+            # Gated on "fail"/"info" here rather than in each row: a permanent row (the
+            # cluster folders one) keeps its fix attached whether it passes or not, and a
+            # green row offering to fix itself reads as a problem the user cannot see.
+            # "info" is included for the branch row's advisory case - the manifest is
+            # unreadable rather than provably wrong, and Install ARK Server is what
+            # actually clears the ambiguity either way.
+            if item["state"] in ("fail", "info") and item.get("fix"):
+                fix_btn = ttk.Button(textcol, text="Fix this", width=10,
+                                     command=item["fix"])
+                fix_btn.pack(anchor="w", pady=(3, 0))
+                # What pressing it will do - _setup_fix_for writes one per fix.
+                if item.get("fix_tip"):
+                    Tooltip(fix_btn, item["fix_tip"], wraplength=420)
+
             # Clickable release link for the component-version advisories.
             if item.get("link"):
                 link = ttk.Label(textcol, text=item["link"],
@@ -10294,6 +13209,16 @@ class ArkAPLauncher(tk.Tk):
         # regardless of what triggered this refresh (Re-check, tab switch, theme toggle,
         # or the async component check landing).
         self._update_status_tab_indicator(aggregate_status_state(items))
+        # Same moment the server row was just re-read: a server that appeared or went
+        # away shows or hides the Mods tab, and the two Save buttons whose "unsaved"
+        # state lives on DISK rather than in this session's edits get re-lit.
+        self._update_mods_tab_visibility()
+        self._update_reminder_banner()
+        self._refresh_mods_dirty()
+        self._update_save_highlights()
+        # Every caller of this (Re-check, a fix, an install finishing, the version check
+        # landing) changes what the Get Started tab shows too - one refresh for both.
+        self._refresh_wizard(items)
 
     def _make_status_glyph(self, state):
         """A tiny colored symbol (green check / amber "i" / red X) for the Setup Status
@@ -10327,14 +13252,15 @@ class ArkAPLauncher(tk.Tk):
         return img
 
     def _update_status_tab_indicator(self, state):
-        """Show the aggregate state as a small colored symbol to the right of the "Setup
-        Status" tab label, so it's visible from every tab. Called on every refresh."""
+        """Show the aggregate state as a small colored symbol to the right of the Get
+        Started tab label (where Setup Status lives), so it's visible from every tab.
+        Called on every refresh."""
         if not hasattr(self, "notebook"):
             return
         try:
             img = self._make_status_glyph(state)
             self._status_tab_glyphs[state] = img  # keep a ref so Tk doesn't GC it
-            self.notebook.tab(self.tab_status, image=img, compound="right")
+            self.notebook.tab(self.tab_wizard, image=img, compound="right")
         except (tk.TclError, KeyError):
             pass
 
@@ -10343,6 +13269,1527 @@ class ArkAPLauncher(tk.Tk):
         component GitHub releases in the background (which redraws again when it lands)."""
         self._refresh_setup_status()
         self._start_component_version_check()
+
+    # ------------------------------------------------------- Get Started --- #
+    # A view over Setup Status (see WIZARD_STEPS / compute_wizard_steps): every tick here
+    # is a Setup Status row, and every button calls the same handler the other tabs use.
+    def _build_wizard_tab(self, parent):
+        wrap = ttk.Frame(parent, padding=(10, 8))
+        wrap.pack(fill="both", expand=True)
+
+        top = ttk.Frame(wrap)
+        top.pack(fill="x")
+        self.wizard_title = ttk.Label(top, text="Get Started", font=("Segoe UI", 11, "bold"))
+        self.wizard_title.pack(side="left")
+        ttk.Button(top, text="Re-check", command=self._recheck_setup_status
+                   ).pack(side="right")
+        # One click to the full check list from the top of the tab - it's the view people
+        # screenshot for support, and it lives at the foot of this tab, folded.
+        status_btn = ttk.Button(top, text="Setup Status", command=self._show_status_checks)
+        status_btn.pack(side="right", padx=(0, 6))
+        Tooltip(status_btn, "Opens the full check list at the bottom of this tab - every "
+                            "check, passing ones included. The view to screenshot when "
+                            "asking for help.")
+        self.wizard_intro = ttk.Label(
+            wrap, foreground=self.theme["subtle_fg"], wraplength=640, justify="left",
+            text="Setup in order, one button per step. The ticks come from the Setup "
+                 "Status checks at the bottom of this tab, and every setting is still on "
+                 "its own tab for changing later.")
+        self.wizard_intro.pack(anchor="w", pady=(4, 6))
+        joining = ttk.Frame(wrap)
+        joining.pack(anchor="w", pady=(0, 6))
+        ttk.Label(joining, text="Only joining a friend's ARK server? You don't need any of "
+                                "this.").pack(side="left")
+        self._link_label(joining, "How to join",
+                         lambda: self._show_guide_section(JOIN_GUIDE_TITLE)
+                         ).pack(side="left", padx=(6, 0))
+
+        # Red X rows no step owns, or "setup complete". Rebuilt with the steps.
+        self.wizard_banner = ttk.Frame(wrap)
+        self.wizard_banner.pack(fill="x")
+
+        # Footer before the list, so the list's expand can't push it off-screen.
+        footer = ttk.Frame(wrap)
+        footer.pack(side="bottom", fill="x", pady=(6, 0))
+        legacy = self._link_label(footer, LEGACY_GUIDE_LABEL,
+                                   self._open_instructions_popout)
+        legacy.pack(side="left", padx=(0, 12))
+        Tooltip(legacy, "The old step-by-step instructions, including the install order "
+                        "these steps automate, in a window of their own - the fallback "
+                        "for anything Get Started doesn't get you through.")
+        self._link_label(footer, GUIDE_TAB_LABEL,
+                          lambda: self.notebook.select(self.tab_instructions)
+                          ).pack(side="left", padx=(0, 12))
+        self._link_label(footer, "Debug Log",
+                          lambda: self.notebook.select(self.tab_debug)
+                          ).pack(side="left", padx=(0, 12))
+
+        self.wizard_hide_btn = ttk.Button(
+            footer, command=lambda: self._set_wizard_hidden(self.wizard_visible_var.get()))
+        self.wizard_hide_btn.pack(side="right")
+        Tooltip(self.wizard_hide_btn,
+                "Hiding the setup steps leaves just Setup Status here (the tab is renamed "
+                "to match). Also on Settings -> \"Show the Get Started steps\".")
+
+        self.wizard_list_area = items_wrap = ttk.Frame(wrap)
+        items_wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(items_wrap, borderwidth=0, highlightthickness=0,
+                           background=self.theme["bg"])
+        vsb = ttk.Scrollbar(items_wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.wizard_canvas = canvas
+        inner = ttk.Frame(canvas)
+        self.wizard_inner = inner
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+
+        self.wizard_items_frame = ttk.Frame(inner)
+        self.wizard_items_frame.pack(fill="x")
+        self._build_status_section(inner)
+
+        self._wizard_poll_id = None
+        self._wizard_busy_shown = frozenset()
+        self._wizard_activate_pending = False
+        # Coming back from the Options Creator, Explorer or the server console is when
+        # the yaml/seed/"server running" steps change - nothing in the app hears about it.
+        self.bind("<Activate>", self._on_wizard_activate, add="+")
+        # Both timers below outlive the window otherwise, and Tk prints an "invalid
+        # command name" for each one that fires into a torn-down interpreter.
+        self.bind("<Destroy>", self._cancel_pending_timers, add="+")
+        self._apply_wizard_mode()
+
+    def _build_status_section(self, parent):
+        """Setup Status: the full check list, at the foot of Get Started. Open by
+        default - it's the view people screenshot for help, and a fold is one more thing
+        to find - and collapsible from its own heading for anyone who wants the steps
+        alone. The header's "Setup Status" button, the steps' "Show in Setup Status" and
+        a search match inside it (via _on_reveal) all re-open it and scroll to it."""
+        section = ttk.Frame(parent, padding=(0, 14, 0, 0))
+        section.pack(fill="x")
+        self.status_section = section
+        # _reveal_group_for_widget walks a search match's ancestors and calls this.
+        section._on_reveal = lambda: self.status_open_var.set(True)
+        self.status_open_var = tk.BooleanVar(value=True)
+
+        head = ttk.Frame(section)
+        head.pack(fill="x")
+        self.status_toggle = ttk.Label(head, font=("Segoe UI", 11, "bold"), cursor="hand2")
+        self.status_toggle.pack(side="left")
+        self.status_toggle.bind(
+            "<Button-1>", lambda _e: self.status_open_var.set(not self.status_open_var.get()))
+        self.status_summary = ttk.Label(head, foreground=self.theme["subtle_fg"])
+        self.status_summary.pack(side="left", padx=(10, 0))
+        self.status_summary.bind(
+            "<Button-1>", lambda _e: self.status_open_var.set(not self.status_open_var.get()))
+        ttk.Button(head, text="Re-check", command=self._recheck_setup_status
+                   ).pack(side="right")
+        # The one route to the installers that survives hiding both the Install tab
+        # and the setup steps - a dismissed wizard must not mean "can't reinstall".
+        repair = self._link_label(head, "Install / repair",
+                                  lambda: self._show_install_tab())
+        repair.pack(side="right", padx=(0, 12))
+        Tooltip(repair, "Opens the Install Server/Api/Plugin tab: reinstall or update the "
+                        "ARK server, ArkServerApi or the plugin, and watch the SteamCMD "
+                        "console.")
+
+        self.status_body = ttk.Frame(section)
+        ttk.Label(self.status_body, foreground=self.theme["subtle_fg"], wraplength=640,
+                  justify="left",
+                  text="Every check the launcher runs, passing ones included - this is the "
+                       "view to screenshot when asking for help. Read-only: nothing here "
+                       "changes by itself. A ✗ has a hint (click it to jump to the field) "
+                       "and sometimes a Fix this button."
+                  ).pack(anchor="w", pady=(4, 8))
+        self.status_items_frame = ttk.Frame(self.status_body)
+        self.status_items_frame.pack(fill="x")
+        self.status_open_var.trace_add("write", lambda *_a: self._apply_status_open())
+        self._apply_status_open()
+
+    def _apply_status_open(self):
+        is_open = self.status_open_var.get()
+        self.status_toggle.configure(
+            text="%s Setup Status - every check" % ("▾" if is_open else "▸"))
+        if is_open:
+            self.status_body.pack(fill="x")
+        else:
+            self.status_body.pack_forget()
+
+    def _show_status_checks(self):
+        """One click from anywhere to the full check list, opened and scrolled into view."""
+        self.notebook.select(self.tab_wizard)
+        self.status_open_var.set(True)
+        self.update_idletasks()
+        height = max(1, self.wizard_inner.winfo_height())
+        self.wizard_canvas.yview_moveto(self.status_section.winfo_y() / height)
+
+    def _apply_wizard_mode(self):
+        """Steps shown: the tab is Get Started, the check list folded at its foot.
+        Steps hidden (setup done, or never wanted): the same tab becomes plain Setup
+        Status with the list open - hiding the steps must never hide the checks or the
+        glyph."""
+        steps_on = self.wizard_visible_var.get()
+        label = "Get Started" if steps_on else "Setup Status"
+        self.notebook.tab(self.tab_wizard, text=label)
+        self.wizard_title.configure(text=label)
+        self.wizard_hide_btn.configure(
+            text="Hide setup steps" if steps_on else "Show setup steps")
+        if steps_on:
+            self.wizard_intro.pack(anchor="w", pady=(4, 6), before=self.wizard_list_area)
+            self.wizard_banner.pack(fill="x", before=self.wizard_list_area)
+            self.wizard_items_frame.pack(fill="x", before=self.status_section)
+        else:
+            for frame in (self.wizard_items_frame, self.wizard_banner):
+                for child in frame.winfo_children():
+                    child.destroy()
+            self.wizard_intro.pack_forget()
+            self.wizard_banner.pack_forget()
+            self.wizard_items_frame.pack_forget()
+            self.status_open_var.set(True)
+
+    def _link_label(self, parent, text, command):
+        """A clickable text link in the theme's link colour. Styled, not coloured inline,
+        so the light/dark toggle repaints links built once (see Link.TLabel)."""
+        link = ttk.Label(parent, text=text, style="Link.TLabel", cursor="hand2")
+        link.bind("<Button-1>", lambda _e: command())
+        return link
+
+    def _wizard_visible(self):
+        try:
+            return self.notebook.select() == str(self.tab_wizard)
+        except (tk.TclError, AttributeError):
+            return False
+
+    def _on_wizard_activate(self, event):
+        # <Activate> reaches every widget in the window; one refresh per activation.
+        if event.widget is not self or self._wizard_activate_pending \
+                or not self._wizard_visible():
+            return
+        self._wizard_activate_pending = True
+
+        def run():
+            self._wizard_activate_pending = False
+            self._refresh_setup_status()
+        self.after(250, run)
+
+    def _call_on_ui(self, fn, *args):
+        """For worker threads: run fn(*args) on the Tk thread, soon.
+
+        A worker must never call Tk itself - not even after(). Before mainloop is
+        running (and the startup checks finish then), tkinter refuses with "main thread
+        is not in main loop", and every worker swallowed that as "window closed". That
+        silently dropped the startup update check's result (no "!" badge though the log
+        said GitHub was reached) and wedged the footer's status probe for the whole
+        session (stuck on "Starting…" with a server long since up). A queue.put works
+        from any thread at any time; _drain_ui_calls runs them on the Tk thread."""
+        self._ui_calls.put((fn, args))
+
+    def _drain_ui_calls(self):
+        # Rescheduled FIRST: a call that raises (reported by Tk like any callback) must
+        # not stop the ones behind it, or every later one.
+        try:
+            self._ui_drain_id = self.after(50, self._drain_ui_calls)
+        except tk.TclError:
+            return      # window gone
+        while True:
+            try:
+                fn, args = self._ui_calls.get_nowait()
+            except queue.Empty:
+                return
+            fn(*args)
+
+    def _cancel_pending_timers(self, event=None):
+        """Drop the debounced status refresh and the busy poll when the window goes."""
+        if event is not None and event.widget is not self:
+            return
+        for attr in ("_status_refresh_id", "_wizard_poll_id", "_mods_scroll_id",
+                     "_server_poll_id", "_update_retry_id", "_ui_drain_id",
+                     "_share_renew_id"):
+            timer = getattr(self, attr, None)
+            if timer:
+                try:
+                    self.after_cancel(timer)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+
+    def _wizard_busy(self):
+        """Step keys with a background job running right now."""
+        busy = set()
+        for key, attr in (("server", "_install_thread"), ("arkapi", "_arkapi_thread"),
+                          ("plugin", "_plugin_thread"), ("apworld", "_apworld_thread"),
+                          ("poptracker", "_poptracker_thread"),
+                          ("ap_dir", "_dir_scan_thread"), ("paths", "_scan_thread")):
+            thread = getattr(self, attr, None)
+            if thread is not None and getattr(thread, "is_alive", lambda: True)():
+                busy.add(key)
+        return frozenset(busy)
+
+    def _wizard_list_setting(self, key):
+        stored = self._read_settings().get(key)
+        return [k for k in stored if isinstance(k, str)] if isinstance(stored, list) else []
+
+    def _ap_role(self):
+        """(role, yaml_by) from the questionnaire - ("", "") until it's answered, which
+        everything treats as hosting (the full setup, as before it existed)."""
+        return self.ap_role_var.get(), self.ap_yaml_by_var.get()
+
+    def _role_state(self):
+        role, yaml_by = self._ap_role()
+        return {"role": role, "yaml_by": yaml_by}
+
+    def _on_role_changed(self, *_a):
+        """Saved the moment an answer changes - a questionnaire has no Save button - and
+        redrawn at idle: the click that changed it came from a radio button that the
+        redraw destroys and rebuilds."""
+        self._write_config_key(AP_ROLE_KEY, self._role_state(), "hosting/joining answer")
+        self.after_idle(self._refresh_setup_status)
+
+    def _wizard_extras(self):
+        """The facts WIZARD_STEPS needs that Setup Status has no row for."""
+        pt = self._poptracker_dir()
+        role, yaml_by = self._ap_role()
+        return {
+            "role": role, "yaml_by": yaml_by,
+            "role_answered": role == "host" or (role == "join" and yaml_by in ("self", "host")),
+            "yaml_sent": bool(self._read_settings().get(WIZARD_YAML_SENT_KEY)),
+            "busy": self._wizard_busy(),
+            "skipped": self._wizard_list_setting(WIZARD_SKIPPED_KEY),
+            "connected": bool(self._read_settings().get(WIZARD_CONNECTED_KEY)),
+            "mods_on": any(m.get("enabled") for m in self._mods),
+            "poptracker": is_poptracker_dir(pt)
+                          and bool(installed_tracker_pack(poptracker_packs_dir(pt))[0]),
+            # ponytail: tasklist per refresh (~0.1s); refreshes only happen while this
+            # tab is showing.
+            "running": is_process_running(ARK_SERVER_PROCESS),
+        }
+
+    def _refresh_wizard(self, items):
+        """Redraw Get Started from `items` (the list _refresh_setup_status just drew).
+        Only while the tab is showing - it's rebuilt on entry anyway, and the extras
+        include a tasklist call."""
+        if (not hasattr(self, "wizard_items_frame") or not self._wizard_visible()
+                or not self.wizard_visible_var.get()):
+            return
+        steps, other, complete = compute_wizard_steps(items, self._wizard_extras())
+        for frame in (self.wizard_items_frame, self.wizard_banner):
+            for child in frame.winfo_children():
+                child.destroy()
+
+        if other:
+            box = ttk.Frame(self.wizard_banner, style="SaveHint.TFrame", padding=(8, 4))
+            box.pack(fill="x", pady=(0, 6))
+            ttk.Label(box, style="SaveHint.TLabel", wraplength=560, justify="left",
+                      text="Setup Status also has a red X for: %s"
+                           % "; ".join(it["label"] for it in other)).pack(side="left")
+            ttk.Button(box, text="Show in Setup Status", command=self._show_status_checks
+                       ).pack(side="right")
+        elif complete:
+            ttk.Label(self.wizard_banner, foreground=self.theme["status_ok"],
+                      font=("Segoe UI", 10, "bold"),
+                      text="✓ Setup complete. You can hide the setup steps - Setup "
+                           "Status stays here and keeps checking everything."
+                      ).pack(anchor="w", pady=(0, 6))
+
+        n = 0
+        for group, group_title in WIZARD_GROUPS:
+            ttk.Label(self.wizard_items_frame, text=group_title.upper(),
+                      foreground=self.theme["subtle_fg"], font=("Segoe UI", 8, "bold")
+                      ).pack(anchor="w", pady=(8, 2))
+            for step in steps:
+                if step["group"] == group:
+                    n += 1
+                    self._wizard_row(self.wizard_items_frame, n, step)
+
+        self._wizard_busy_shown = frozenset(s["key"] for s in steps if s["busy"])
+        if self._wizard_poll_id:
+            self.after_cancel(self._wizard_poll_id)
+            self._wizard_poll_id = None
+        if self._wizard_busy_shown:
+            self._wizard_poll_id = self.after(1500, self._wizard_poll)
+
+    def _wizard_poll(self):
+        """While an install/scan runs: redraw only once its busy state flips, so an 18 GB
+        download doesn't re-run every check every second and a half."""
+        self._wizard_poll_id = None
+        if not self._wizard_visible():
+            return
+        if self._wizard_busy() != self._wizard_busy_shown:
+            self._refresh_setup_status()
+        else:
+            self._wizard_poll_id = self.after(1500, self._wizard_poll)
+
+    def _wizard_row(self, parent, n, step):
+        t = self.theme
+        state = step["state"]
+        settled = state in ("done", "skipped")
+        row = ttk.Frame(parent, padding=(0, 3))
+        row.pack(fill="x")
+
+        if state == "done":
+            glyph, fg, bg = "✓", t["status_ok"], t["bg"]
+        elif state == "skipped":
+            glyph, fg, bg = "–", t["subtle_fg"], t["bg"]
+        elif state == "current":
+            glyph, fg, bg = str(n), t["select_fg"], t["select_bg"]
+        else:
+            glyph, fg, bg = str(n), t["fg"] if state == "ready" else t["subtle_fg"], t["bg"]
+        tk.Label(row, text=glyph, width=3, foreground=fg, background=bg,
+                 font=("Segoe UI", 10, "bold")).pack(side="left", anchor="n", padx=(0, 8))
+
+        primary, links = self._wizard_actions(step)
+        actions = ttk.Frame(row)
+        actions.pack(side="right", anchor="n")
+        if primary and not settled:
+            label, command = primary
+            if step["busy"]:
+                label, command = "Working…", None
+            btn = ttk.Button(actions, text=label,
+                             command=(lambda c=command: self._wizard_do(c)))
+            btn.pack(side="right")
+            if command is None or state == "blocked":
+                btn.state(["disabled"])
+
+        col = ttk.Frame(row)
+        col.pack(side="left", fill="x", expand=True)
+        if step.get("questionnaire"):
+            settled = False    # never folds away: the answer may change later
+        head = ttk.Frame(col)
+        head.pack(fill="x")
+        ttk.Label(head, text=step["title"],
+                  foreground=t["subtle_fg"] if state in ("blocked", "skipped") else t["fg"],
+                  font=("Segoe UI", 10, "normal" if settled else "bold")
+                  ).pack(side="left")
+        if step.get("optional"):
+            ttk.Label(head, text="optional", foreground=t["subtle_fg"],
+                      font=("Segoe UI", 8, "italic")).pack(side="left", padx=(6, 0))
+        for text, command in links:
+            self._link_label(head, text, lambda c=command: self._wizard_do(c)
+                              ).pack(side="left", padx=(10, 0))
+        if settled:
+            return  # done and skipped steps are one line
+        if step.get("questionnaire"):
+            self._render_role_questions(col)
+            return
+
+        if state == "blocked":
+            desc = "Waiting on: %s" % ", ".join(step["waiting_on"])
+        else:
+            desc = step["desc"]
+        ttk.Label(col, text=desc, wraplength=480, justify="left",
+                  foreground=t["status_detail_fg"]).pack(anchor="w")
+        # Nothing chosen yet is a to-do, not a fault: the server row is red for an unset
+        # SERVER_ROOT, but the step's own button is what fixes that.
+        # A blocked step's rows are red because the thing it waits on isn't there yet
+        # ("SERVER_ROOT is not set" under every server step) - "Waiting on" says it.
+        unset_root = step["key"] == "server" and not self.get("SERVER_ROOT")
+        quiet = unset_root or state == "blocked"
+        for bad in ([] if quiet else step["failing"]):
+            ttk.Label(col, text="✗ %s - %s" % (bad["label"], bad.get("detail", "")),
+                      wraplength=480, justify="left", foreground=t["status_fail"]
+                      ).pack(anchor="w")
+        todo = step["todo"]
+        if (not step["failing"] and todo and todo["state"] == "info"
+                and state != "blocked" and todo.get("detail")):
+            ttk.Label(col, text=str(todo["detail"]), wraplength=480, justify="left",
+                      foreground=t["note_fg"]).pack(anchor="w")
+
+    ROLE_SUMMARIES = {
+        ("host", ""): "You'll make the yaml, generate the seed and host the room - every "
+                      "step below applies.",
+        ("join", "self"): "Seed and hosting are skipped - the host does those. You'll make "
+                          "your yaml, send it to them, then enter their room details.",
+        ("join", "host"): "Archipelago, the .apworld, the yaml, the seed and hosting are all "
+                          "skipped. You only need the host's room details.",
+    }
+
+    def _render_role_questions(self, parent):
+        """The questionnaire: hosting or joining, and - joining - who makes the yaml. The
+        second question only appears once it applies."""
+        t = self.theme
+        ttk.Label(parent, text="Are you hosting the room, or joining someone else's?",
+                  foreground=t["status_detail_fg"]).pack(anchor="w", pady=(2, 0))
+        answers = ttk.Frame(parent)
+        answers.pack(anchor="w")
+        for text, value in (("I'm hosting", "host"),
+                            ("I'm joining someone else's room", "join")):
+            ttk.Radiobutton(answers, text=text, value=value,
+                            variable=self.ap_role_var).pack(side="left", padx=(0, 14))
+        role, yaml_by = self._ap_role()
+        if role == "join":
+            ttk.Label(parent, text="Who's making your yaml?",
+                      foreground=t["status_detail_fg"]).pack(anchor="w", pady=(6, 0))
+            answers = ttk.Frame(parent)
+            answers.pack(anchor="w")
+            for text, value in (("I'll make it and send it to the host", "self"),
+                                ("The host is making it", "host")):
+                ttk.Radiobutton(answers, text=text, value=value,
+                                variable=self.ap_yaml_by_var).pack(side="left", padx=(0, 14))
+        summary = self.ROLE_SUMMARIES.get((role, yaml_by if role == "join" else ""))
+        if summary:
+            ttk.Label(parent, text=summary, wraplength=480, justify="left",
+                      foreground=t["note_fg"]).pack(anchor="w", pady=(4, 0))
+
+    def _wizard_actions(self, step):
+        """(primary, links) for one step: primary is (label, command) or None, links a
+        list of (label, command) shown as small links beside the title."""
+        key, state = step["key"], step["state"]
+        tab = getattr(self, step["tab"])
+        tab_name = self.notebook.tab(tab, "text")
+        # No link to a tab that isn't there (Mods before the server exists) - select()
+        # on a hidden tab would quietly un-hide it. The Install tab is the exception: it
+        # is hidden by preference, not because it can't work, and it's where the
+        # SteamCMD console is - so its link always shows, and brings it back.
+        if tab is self.tab_install:
+            links = [("Show console" if step["busy"] else "Install tab",
+                      self._show_install_tab)]
+        elif self.notebook.tab(tab, "state") == "hidden":
+            links = []
+        else:
+            links = [("Open %s" % tab_name, lambda: self.notebook.select(tab))]
+        if step.get("questionnaire"):
+            return None, []
+        joining = self._ap_role()[0] == "join"
+        if state == "skipped":
+            return None, [("Undo skip", lambda: self._wizard_set_skipped(key, False))]
+        ticks = {"connect": WIZARD_CONNECTED_KEY}
+        if joining:
+            ticks["yaml"] = WIZARD_YAML_SENT_KEY
+        if key in ticks and state == "done":
+            return None, [("Undo", lambda k=ticks[key]: self._write_config_key(
+                k, False, "Get Started tick"))] + links
+        if state == "done":
+            # Done isn't the end for the installs: an update, a repair after a bad
+            # patch, or a reinstall is this same button again. Offered on the finished
+            # step so nobody needs the Install tab for it.
+            repair = {"server": ("Update / repair", self.on_install_server),
+                      "arkapi": ("Reinstall", self.on_install_arkapi),
+                      "plugin": ("Reinstall", self.on_install_plugin)}.get(key)
+            return None, ([repair] if repair else []) + links
+
+        show_status = ("Show in Setup Status", self._show_status_checks)
+        ids = {r["id"] for r in step["failing"]}
+        fix = next((r["fix"] for r in step["failing"] if r.get("fix")), None)
+        ap_folder = lambda sub, label: (lambda: self._open_archipelago_subfolder(sub, label))
+        defaults = {
+            # The branch row's fix is a re-run of the same install (-beta ... validate).
+            "server": ((("Update ARK Server" if "branch" in ids else "Install ARK Server"),
+                        self.on_install_server) if self.get("SERVER_ROOT") else
+                       ("Choose folder…", self._wizard_choose_server_root)),
+            "arkapi": ("Install ArkServerApi", self.on_install_arkapi),
+            "plugin": ("Install Plugin", self.on_install_plugin),
+            "cluster": ("Create folders", self._on_create_cluster_folders),
+            # Save when something is typed but not in the scripts yet - the same
+            # verdict that lights the Configuration tab's own Save halo
+            # (_config_disk_dirty), so the step and that button always agree. A field
+            # that is simply blank needs filling in, not saving: the row says which.
+            "paths": (("Save", self.save_fields) if self._config_disk_dirty
+                      else show_status),
+            # Save is the fix when the tab and ActiveMods disagree, so offer it here
+            # rather than sending the user to hunt for the button (which is lit too).
+            "mods": (("Save mods", self.save_mods) if self._mods_dirty_flag else
+                     ("Open Mods", lambda: self.notebook.select(self.tab_mods))),
+            "stacks": ("Show Increase stacks",
+                       lambda: self._goto_config_field(["#" + STACKS_GROUP_COLLAPSE_ID])),
+            "ap_dir": ("Scan for Archipelago", self._on_scan_archipelago),
+            "apworld": ("Install .apworld", self._on_update_apworld),
+            "yaml": ("Open Options Creator", self._open_options_creator),
+            "seed": ("Generate seed", self._open_generate),
+            "room": (("Enter room details", lambda: self._goto_config_field(["server"]))
+                     if joining else ("Host on this PC", self._host_local_server)),
+            "poptracker": ("Download PopTracker", self._on_download_poptracker),
+            "start": ("Start server", lambda: self.run_bat("start_ase_server.bat")),
+            "connect": ("Copy connect command", self._copy_connect_command),
+        }
+        primary = defaults[key]
+        # A row's fix that IS the step's own action keeps the step's label ("Install
+        # Plugin" says more than "Fix this"); a different one - a side problem's fix -
+        # takes over the button.
+        if fix and fix != primary[1]:
+            primary = ("Fix this", fix)
+        elif ids & WIZARD_NO_BUTTON_ROWS:
+            primary = show_status
+
+        extra = {
+            # For someone who has done this before: point at the server they already
+            # have, instead of picking an empty folder to download a new one into.
+            "server": [("Server already installed?", self._wizard_browse_existing_server)]
+                      + ([("Change folder", self._wizard_choose_server_root)]
+                         if self.get("SERVER_ROOT") else []),
+            "ap_dir": [("Browse…", self._wizard_browse_archipelago)],
+            "yaml": ([("I've sent it ✓", lambda: self._write_config_key(
+                          WIZARD_YAML_SENT_KEY, True, "Get Started yaml-sent tick"))]
+                     if joining else
+                     [("Players folder", ap_folder("Players", "Open Players folder"))]),
+            "seed": [("Output folder", ap_folder("output", "Open output folder"))],
+            "room": ([] if joining else
+                     [("Use archipelago.gg", lambda: webbrowser.open(ARCHIPELAGO_UPLOAD_URL))]),
+            "connect": [("I'm connected ✓", lambda: self._write_config_key(
+                WIZARD_CONNECTED_KEY, True, "Get Started connected tick"))],
+        }.get(key, [])
+        if step.get("optional"):
+            extra.append(("Skip", lambda: self._wizard_set_skipped(key, True)))
+        return primary, extra + links
+
+    def _wizard_do(self, command):
+        """Run a step's action, then redraw: most of them change a row straight away
+        (Save, a fix, a folder chosen), and the ones that start a thread show "Working…"
+        until _wizard_poll sees it end."""
+        if command is None:
+            return
+        command()
+        # An install writes its progress to the SteamCMD console on the Install tab -
+        # put the tab back (without switching to it) so that console is one click away.
+        if self._wizard_busy() & {"server", "arkapi", "plugin"}:
+            self._show_install_tab(select=False)
+        self._refresh_setup_status()
+
+    def _wizard_choose_server_root(self):
+        path = filedialog.askdirectory(
+            parent=self, title="Choose an EMPTY folder for the ARK server (not your ARK "
+                               "game folder)")
+        if path:
+            self.set("SERVER_ROOT", os.path.normpath(path))
+
+    def _wizard_browse_existing_server(self):
+        """Get Started step 1's "Server already installed?": browse for the folder an
+        existing ARK dedicated server is in and use it - no download. Checked before
+        it's accepted: a server one folder further down (a zip unpacked with its own top
+        folder) is taken from there, and the ARK GAME folder is refused rather than
+        adopted - pointing SERVER_ROOT at it is the mistake this whole flow guards against."""
+        title = "Use an existing server"
+        path = filedialog.askdirectory(
+            parent=self, title="Choose the folder your ARK dedicated server is installed "
+                               "in (the one holding ShooterGame)")
+        if not path:
+            return
+        path = os.path.normpath(path)
+        state = server_root_state(path)
+        if state == "nested":
+            path, state = os.path.normpath(nested_server_root(path)), "installed"
+        if state == "client":
+            messagebox.showwarning(
+                title, "That's your ARK: Survival Evolved GAME folder, not a dedicated "
+                       "server:\n\n%s\n\nThe launcher never uses your game install. "
+                       "Choose the folder your dedicated server is in - or, if you don't "
+                       "have one, use \"Choose folder…\" to pick an empty folder and let "
+                       "Install ARK Server download it." % path)
+            return
+        if state != "installed":
+            messagebox.showwarning(
+                title, "No ARK dedicated server was found in:\n\n%s\n\nIt should hold "
+                       "%s. Choose the folder that contains ShooterGame - or, if you don't "
+                       "have a server yet, use \"Choose folder…\" and let Install ARK "
+                       "Server download one." % (path, ARK_EXE_RELPATH))
+            return
+        self.set("SERVER_ROOT", path)
+        self._log("%s: SERVER_ROOT set to %s" % (title, path))
+        # The same quick scan an install runs when it finishes: PLUGINS_DIR, ipc_dir and
+        # game_ini come from the server that's there. Save when it's done, as ever.
+        self._scoped_scan(level=SCAN_QUICK)
+
+    def _wizard_browse_archipelago(self):
+        path = filedialog.askdirectory(
+            parent=self, title="Choose your Archipelago folder (holds ArchipelagoLauncher.exe)",
+            initialdir=ARCHIPELAGO_DEFAULT_DIR if os.path.isdir(ARCHIPELAGO_DEFAULT_DIR)
+            else None)
+        if path:
+            self.set(ARCHIPELAGO_DIR_KEY, os.path.normpath(path))
+
+    def _wizard_set_skipped(self, key, skipped):
+        keys = set(self._wizard_list_setting(WIZARD_SKIPPED_KEY))
+        if skipped:
+            keys.add(key)
+        else:
+            keys.discard(key)
+        self._write_config_key(WIZARD_SKIPPED_KEY, sorted(keys), "skipped setup steps")
+
+    def _set_wizard_hidden(self, hidden):
+        """Hide or show the setup steps. The tab itself always stays: it carries Setup
+        Status and the overall glyph (see _apply_wizard_mode)."""
+        self._write_config_key(WIZARD_HIDDEN_KEY, hidden, "Get Started steps")
+        self.wizard_visible_var.set(not hidden)
+        self._apply_wizard_mode()
+        self._refresh_setup_status()
+
+    def _schedule_status_refresh(self):
+        """Re-run the checks shortly after a field edit, while Get Started is on screen.
+        It's the landing tab and carries Setup Status, so a list still saying "SERVER_ROOT
+        is not set" after auto-detect or a scan filled it in is visible now. Debounced:
+        this fires on every keystroke."""
+        if not self._wizard_visible():
+            return
+        if getattr(self, "_status_refresh_id", None):
+            self.after_cancel(self._status_refresh_id)
+
+        def run():
+            self._status_refresh_id = None
+            self._refresh_setup_status()
+        self._status_refresh_id = self.after(600, run)
+
+    # ------------------------------------------------------------ footer bar --- #
+    def _build_server_footer(self):
+        """One row under the notebook, on every tab: the server's status light, Run /
+        Stop server, Export diagnostics and the Discord.
+
+        Packed side="bottom" BEFORE the notebook, so when the window is made small it's
+        the notebook that gives up space, never this row. Every label in it has a fixed
+        width (the state text is padded to its longest wording), so nothing in it
+        changes size at runtime and _lock_initial_size's one measurement stays true."""
+        bar = ttk.Frame(self, padding=(10, 3, 10, 5))
+        bar.pack(side="bottom", fill="x", before=self.notebook)
+        ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x",
+                                                      before=self.notebook)
+        self.server_footer = bar
+
+        self.server_dot = ttk.Label(bar, text="●", font=("Segoe UI", 11))
+        self.server_dot.pack(side="left")
+        self.server_state_label = ttk.Label(
+            bar, width=max(len(label) for label, _c in SERVER_STATES.values()) + 1)
+        self.server_state_label.pack(side="left", padx=(2, 8))
+        for w in (self.server_dot, self.server_state_label):
+            Tooltip(w, "Is the ARK server running? Checked every few seconds, so a server "
+                       "started or stopped outside the launcher shows up too. Starting "
+                       "= the process is up but the world isn't loaded yet (RCON doesn't "
+                       "answer until it is).", wraplength=420)
+        self.run_server_btn = ttk.Button(bar, text="Run server",
+                                         command=self._footer_run_server)
+        self.run_server_btn.pack(side="left")
+        Tooltip(self.run_server_btn, "Starts the server with start_ase_server.bat - the "
+                                     "same as Quick Launch -> Run start_ase_server.")
+        self.stop_server_btn = ttk.Button(bar, text="Stop server",
+                                          command=self._stop_server)
+        self.stop_server_btn.pack(side="left", padx=(6, 0))
+        Tooltip(self.stop_server_btn,
+                "Saves the world and shuts the server down cleanly over RCON (saveworld, "
+                "then doexit, using RCONPORT and ADMINPASS). Only if RCON never answers "
+                "does it offer to force-close - and it says so, because that loses "
+                "anything since the last autosave.", wraplength=420)
+        self.share_copy_btn = ttk.Button(bar, text="Copy join address",
+                                         command=self._share_copy_address)
+        Tooltip(self.share_copy_btn, "Copies the address friends join your server at "
+                                     "(your public address and GAMEPORT). Shown while "
+                                     "Friends over the internet has ports open.")
+
+        discord = self._link_label(bar, "Discord",
+                                   lambda: webbrowser.open(DISCORD_INVITE_URL))
+        discord.pack(side="right")
+        Tooltip(discord, "Opens the Archipelago Discord (ARK: Survival Evolved has its own "
+                         "channel there) - the place to ask when you're stuck. Post the "
+                         "zip from Export diagnostics with your question.",
+                wraplength=420)
+        export_btn = ttk.Button(bar, text="Export diagnostics",
+                                command=self.export_diagnostics)
+        export_btn.pack(side="right", padx=(0, 12))
+        Tooltip(export_btn,
+                "Bundle ArkAP_debug.log, the launcher's own activity log, a Setup Status "
+                "summary, a password-redacted copy of your config, your Mods tab state + "
+                "output log, and the crash log (if any) into one zip on your Desktop - "
+                "drag it into Discord or a GitHub issue when asking for help.",
+                wraplength=420)
+
+        self._server_state = "stopped"
+        self._server_probe_busy = False
+        self._server_poll_id = None
+        self._render_server_state()
+        self._poll_server_state()
+
+    def _render_server_state(self):
+        if not hasattr(self, "server_dot"):
+            return
+        text, colour = SERVER_STATES[self._server_state]
+        self.server_dot.configure(foreground=self.theme[colour])
+        self.server_state_label.configure(text=text)
+        self.run_server_btn.state(
+            ["!disabled"] if self._server_state == "stopped" else ["disabled"])
+        self.stop_server_btn.state(
+            ["!disabled"] if self._server_state in ("running", "starting") else ["disabled"])
+        self._share_follow_state()
+
+    def _poll_server_state(self):
+        """The light poll: a tasklist + a local port probe on a worker thread, every
+        SERVER_POLL_MS. Skipped while a stop is in progress (that owns the state) or
+        while the previous probe hasn't come back."""
+        self._server_poll_id = None
+        if self._server_state != "stopping" and not self._server_probe_busy:
+            self._server_probe_busy = True
+            port = self.get("RCONPORT")
+            threading.Thread(target=self._probe_server_worker, args=(port,),
+                             daemon=True).start()
+        try:
+            self._server_poll_id = self.after(SERVER_POLL_MS, self._poll_server_state)
+        except tk.TclError:
+            pass
+
+    def _probe_server_worker(self, port):
+        state = probe_server_state(port)
+        self._call_on_ui(self._on_server_probe, state)
+
+    def _on_server_probe(self, state):
+        self._server_probe_busy = False
+        self._server_probe_seen = True
+        if self._server_state != "stopping" and state != self._server_state:
+            self._server_state = state
+            self._render_server_state()
+        self._share_follow_state()
+
+    def _footer_run_server(self):
+        if self.run_bat("start_ase_server.bat"):
+            self._server_state = "starting"
+            self._render_server_state()
+
+    def _stop_server(self, pids=None, then=None):
+        """Graceful stop, on a worker thread - a save can take a while and the window
+        must stay responsive (the light says Stopping… the whole time).
+
+        `pids` limits any force-close to those processes; without it, it's this
+        SERVER_ROOT's servers when they can be identified (a transfer server or another
+        install is left alone). `then` runs once they're gone - the install uses it, so
+        a stuck or crashed server is cleared and the install continues in one step."""
+        if then is None and self._server_state not in ("running", "starting"):
+            return
+        if pids is None:
+            pids = [p for p, _x in processes_under_root(server_processes(),
+                                                        self.get("SERVER_ROOT"))] or None
+        self._stop_pids, self._after_stop = pids, then
+        port, password = self.get("RCONPORT"), self.get("ADMINPASS")
+        self._server_state = "stopping"
+        self._render_server_state()
+        self._log("Stop server: saving the world over RCON (port %s), then shutting "
+                  "down..." % port)
+        threading.Thread(target=self._stop_server_worker, args=(port, password, pids),
+                         daemon=True).start()
+
+    def _stop_server_worker(self, port, password, pids=None):
+        if pids:
+            still_running = lambda: any(p in pids for p, _x in server_processes())
+        else:
+            still_running = lambda: is_process_running(ARK_SERVER_PROCESS)
+        result = stop_server_gracefully(port, password, still_running)
+        self._call_on_ui(self._on_server_stopped, result)
+
+    def _on_server_stopped(self, result):
+        stopped, saved, detail = result
+        self._log("Stop server: %s." % detail)
+        if not stopped:
+            if saved:
+                question = ("The world was saved, but the server didn't exit on its own "
+                            "(%s).\n\nForce-close it now? Nothing is lost - the save "
+                            "already finished." % detail)
+            else:
+                question = ("The server didn't answer over RCON (%s), so the world could "
+                            "NOT be saved first.\n\nForce-close it anyway? Anything since "
+                            "the server's last autosave will be lost.\n\nChoose No to "
+                            "leave it running - it may just be busy, and you can try "
+                            "Stop again in a minute." % detail)
+            if messagebox.askyesno("Stop server", question, icon="warning"):
+                ok, why = force_kill_server(getattr(self, "_stop_pids", None))
+                stopped = ok
+                self._log("Stop server: force-close %s%s." % (
+                    "done" if ok else "FAILED", (" - %s" % why) if why else ""))
+                if ok and not saved:
+                    messagebox.showwarning(
+                        "Stop server",
+                        "The server was force-closed without saving. Progress since its "
+                        "last autosave may be lost.")
+                elif not ok:
+                    messagebox.showerror("Stop server",
+                                         "Couldn't force-close the server:\n%s" % why)
+        # Hand the light back to the poll, which says what's really true now.
+        self._server_state = "stopped" if stopped else "running"
+        self._render_server_state()
+        if self._server_poll_id:
+            self.after_cancel(self._server_poll_id)
+        self._poll_server_state()
+        then, self._after_stop, self._stop_pids = getattr(self, "_after_stop", None), None, None
+        if then is not None and stopped:
+            # A killed process can hold its files for a moment after it's gone from the
+            # process list - give Windows a beat before SteamCMD reaches for them.
+            self.after(1500, then)
+
+    # ------------------------------------------ Friends over the internet --- #
+    SHARE_TITLE = "Friends over the internet"
+    SHARE_GLYPHS = {"ok": ("✓", "status_ok"), "warn": ("!", "status_info"),
+                    "fail": ("✗", "status_fail"), "idle": ("–", "subtle_fg")}
+
+    def _build_share_section(self, parent):
+        """Configuration -> Friends over the internet (BETA). Opt-in, and tied to the
+        server's own life rather than to a button: ports open when it starts and close
+        when it stops, however it was started or stopped - see _share_follow_state."""
+        t = self.theme
+        box = self._make_collapsible_group(parent, self.SHARE_TITLE, SHARE_GROUP_COLLAPSE_ID,
+                                           tag="BETA")
+        ttk.Label(box, wraplength=640, justify="left", foreground=t["subtle_fg"],
+                  text="Lets friends in other homes join your ARK server. Friends on your "
+                       "own home network don't need it, and nor does anyone joining someone "
+                       "else's server.").pack(anchor="w")
+        ttk.Label(box, wraplength=640, justify="left", foreground=t["status_info"],
+                  text="Beta: this is new, and every router is different, so we can't test "
+                       "it everywhere ourselves. Whether it worked for you or not, please "
+                       "tell us on the Discord (bottom right) - with your router's make and "
+                       "model if you know it.").pack(anchor="w", pady=(4, 0))
+
+        self._share_open_list = [tuple(m) for m in
+                                 self._read_settings().get(SHARE_OPEN_KEY) or []]
+        self._share_result = None
+        self._share_busy = False
+        self._share_pending = None
+        self._share_renew_id = None
+        self._share_seen_state = None
+        self._share_warned = False
+
+        method = self._read_settings().get(SHARE_METHOD_KEY) or ""
+        self.share_method_var = tk.StringVar(value=method)
+        ttk.Label(box, text="How should friends reach your server?",
+                  foreground=t["status_detail_fg"]).pack(anchor="w", pady=(8, 0))
+        for value, text, detail in SHARE_METHODS:
+            ttk.Radiobutton(box, text=text, value=value, variable=self.share_method_var,
+                            command=self._on_share_method_changed
+                            ).pack(anchor="w", pady=(2, 0))
+            ttk.Label(box, text=detail, foreground=t["subtle_fg"], wraplength=610,
+                      justify="left").pack(anchor="w", padx=(22, 0))
+
+        self.share_body = ttk.Frame(box)
+        self.share_body.pack(fill="x")
+        # Ports only open in "router" mode, so a leftover tick from before can't open any.
+        self.share_var = tk.BooleanVar(value=method == "router" and bool(
+            self._read_settings().get(SHARE_ENABLED_KEY)))
+        self.share_router_top = ttk.Frame(self.share_body)
+        cb = ttk.Checkbutton(self.share_router_top, variable=self.share_var,
+                             command=self._on_share_toggled,
+                             text="Open ports on my router for friends while the server runs")
+        cb.pack(anchor="w")
+        Tooltip(cb, "When the server starts, asks your router (UPnP) to forward UDP "
+                    "GAMEPORT, GAMEPORT+1 and QUERYPORT to this PC - plus Archipelago's "
+                    "room port while you host the room here - and removes them when the "
+                    "server stops. RCONPORT is never opened: it carries your admin "
+                    "password. Keep the launcher open while friends play: it renews "
+                    "them every 30 minutes.", wraplength=460)
+
+        self.share_buttons_row = row = ttk.Frame(self.share_body)
+        fw_btn = ttk.Button(row, text="Allow through Windows Firewall",
+                            command=self._share_allow_firewall)
+        fw_btn.pack(side="left")
+        Tooltip(fw_btn, "Adds an inbound rule letting friends reach ShooterGameServer.exe "
+                        "on those UDP ports, and removes any rule BLOCKING it - Windows "
+                        "makes one if its own \"Allow access\" popup was ever cancelled, "
+                        "and a block beats every allow. Windows asks for admin permission "
+                        "once. Needed for both ways.", wraplength=460)
+        self.share_check_btn = ttk.Button(row, text="Check now", command=self._share_check_now)
+        self.share_check_btn.pack(side="left", padx=(6, 0))
+        Tooltip(self.share_check_btn,
+                "Open ports: looks at the firewall, your router and your connection, and "
+                "asks api.ipify.org for your public address - nothing else leaves your "
+                "network. Tailscale: reads its status.", wraplength=420)
+        self.share_status = ttk.Label(row, text="", foreground=t["subtle_fg"])
+        self.share_status.pack(side="left", padx=8)
+
+        self.share_report_frame = ttk.Frame(self.share_body)
+        self._render_share_report()
+        self.share_ts_holder = ttk.Frame(self.share_body)
+        self._build_tailscale_block(self.share_ts_holder)
+        self._apply_share_method()
+
+    def _apply_share_method(self):
+        """Show only the chosen way's controls - nothing but the question until answered."""
+        parts = {"router": (self.share_router_top, self.share_buttons_row,
+                            self.share_report_frame),
+                 "tailscale": (self.share_buttons_row, self.share_ts_holder)
+                 }.get(self.share_method_var.get(), ())
+        for child in self.share_body.winfo_children():
+            child.pack_forget()
+        for i, part in enumerate(parts):
+            part.pack(fill="x", pady=(8 if i == 0 else 6, 0))
+
+    def _on_share_method_changed(self):
+        method = self.share_method_var.get()
+        self._write_config_key(SHARE_METHOD_KEY, method, "friends-over-the-internet choice")
+        self._log("%s: %s." % (self.SHARE_TITLE, dict(
+            (v, t) for v, t, _d in SHARE_METHODS)[method]))
+        if method != "router" and self.share_var.get():
+            # They don't combine: leaving port forwarding turns it off, and closes any
+            # ports it has open right now.
+            self.share_var.set(False)
+            self._on_share_toggled()
+        self._apply_share_method()
+        if method == "tailscale":
+            self._ts_refresh()
+
+    def _share_check_now(self):
+        if self.share_method_var.get() == "tailscale":
+            self._ts_refresh()
+        else:
+            self._share_run("check")
+
+    def _share_set_status(self, text):
+        try:
+            self.share_status.configure(text=text)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _share_params(self):
+        """What a survey / firewall change needs, read on the Tk thread. None when a
+        port field isn't a usable number."""
+        try:
+            game, query, rcon = (int(self.get(k)) for k in ("GAMEPORT", "QUERYPORT", "RCONPORT"))
+        except ValueError:
+            return None
+        if not all(0 < p < 65535 for p in (game, query, rcon)):
+            return None
+        root = self.get("SERVER_ROOT")
+        exe = os.path.normpath(os.path.join(root, ARK_EXE_RELPATH)) if root else ""
+        ap_dir = self.get(ARCHIPELAGO_DIR_KEY)
+        ap_exe = os.path.normpath(os.path.join(ap_dir, ARCHIPELAGO_SERVER_EXE)) if ap_dir else ""
+        ap_exe = ap_exe if ap_exe and os.path.isfile(ap_exe) else ""
+        ap_port = archipelago_host_port(ap_dir) if ap_exe else None
+        return {"gameport": game, "queryport": query, "rconport": rcon,
+                "mappings": share_mappings(game, query, rcon),
+                "exe": exe if exe and os.path.isfile(exe) else "",
+                "ap_exe": ap_exe, "ap_port": ap_port if ap_port != rcon else None,
+                "server_up": self._server_state in ("starting", "running")}
+
+    def _share_password_problem(self):
+        admin = self.get("ADMINPASS")
+        example = DEFAULT_VALUES["ADMINPASS"]
+        if not admin:
+            return ("ADMINPASS is blank. Give the server a real admin password before "
+                    "opening it to the internet.")
+        if admin == example:
+            return ("ADMINPASS is still the example password, %s. Anyone who joins could "
+                    "type  enablecheats %s  in the game's console and take full admin "
+                    "control of your server." % (example, example))
+        return None
+
+    def _on_share_toggled(self):
+        title = "%s (Beta)" % self.SHARE_TITLE
+        on = self.share_var.get()
+        if on:
+            problem = self._share_password_problem()
+            if problem:
+                self.share_var.set(False)
+                messagebox.showwarning(title, problem + "\n\nSet your own ADMINPASS "
+                                       "(Configuration -> Network) and Save, then tick "
+                                       "this again.")
+                self._goto_config_field(["ADMINPASS"])
+                return
+            if not self.get("SERVERPASS") and not messagebox.askyesno(
+                    title, "SERVERPASS is blank, so anyone who finds your server can "
+                           "join it - not only your friends.\n\nSetting one is "
+                           "recommended (Configuration -> Network, then Save). Open to "
+                           "the internet without one anyway?", icon="warning"):
+                self.share_var.set(False)
+                self._goto_config_field(["SERVERPASS"])
+                return
+        self._write_config_key(SHARE_ENABLED_KEY, on, "Friends over the internet setting")
+        self._log("%s: %s." % (self.SHARE_TITLE, "on" if on else "off"))
+        if on:
+            self._share_run("open" if self._server_state in ("starting", "running")
+                            else "check")
+        elif self._share_open_list:
+            self._share_run("close")
+
+    def _share_follow_state(self):
+        """Router ports follow the server, however it was started or stopped: opened as
+        it comes up (sharing on), removed once it has stopped. Waits for the first real
+        probe - a launcher opened while the server is already running with friends on
+        it must not read the initial "Stopped" as a stop and close their ports. That
+        first probe is also what cleans up ports a closed or crashed launcher left."""
+        if not getattr(self, "_server_probe_seen", False) or not hasattr(self, "share_var"):
+            return
+        state, prev = self._server_state, self._share_seen_state
+        if state == prev:
+            return
+        self._share_seen_state = state
+        up = ("starting", "running")
+        if state in up and prev not in up:
+            if self.share_var.get():
+                self._share_run("open")
+        elif state == "stopped" and self._share_open_list:
+            self._share_run("close")
+        elif state == "running" and prev == "starting" and self._share_open_list:
+            self._share_run("check")        # does it answer Steam's query now?
+
+    def _share_run(self, action, quiet=False):
+        """Start a survey ("check" / "open" / "close") on a worker thread. One at a time;
+        a request arriving meanwhile runs next (the latest one wins)."""
+        if self._share_busy:
+            self._share_pending = (action, quiet)
+            return
+        params = self._share_params()
+        if params is None:
+            self._share_set_status("GAMEPORT, QUERYPORT and RCONPORT must be port numbers.")
+            return
+        if action == "open":
+            problem = self._share_password_problem()
+            if problem:
+                self._log("! %s: ports NOT opened - %s" % (self.SHARE_TITLE, problem))
+                if not self._share_warned:
+                    self._share_warned = True
+                    messagebox.showwarning("%s (Beta)" % self.SHARE_TITLE,
+                                           "Ports were not opened for friends.\n\n%s\n\n"
+                                           "Set your own ADMINPASS (Configuration -> "
+                                           "Network) and Save." % problem)
+                action = "check"
+        params["close"] = list(self._share_open_list)
+        self._share_busy = True
+        self.share_check_btn.state(["disabled"])
+        self._share_set_status({"open": "Opening ports…", "close": "Closing ports…",
+                                "check": "Checking…"}[action])
+        threading.Thread(target=self._share_worker, args=(action, params, quiet),
+                         daemon=True).start()
+
+    def _share_worker(self, action, params, quiet):
+        try:
+            result = share_survey(action, params)
+        except Exception as exc:    # must always hand back, or the panel sticks on "Checking…"
+            result = {"action": action, "crash": "%s: %s" % (type(exc).__name__, exc),
+                      "opened": [], "closed": [], "errors": [], "igd": False}
+        self._call_on_ui(self._on_share_result, action, result, quiet)
+
+    def _on_share_result(self, action, result, quiet):
+        self._share_busy = False
+        try:
+            self.share_check_btn.state(["!disabled"])
+        except tk.TclError:
+            return
+        self._share_set_status("")
+        if result.get("crash"):
+            self._log("! %s: the check failed - %s" % (self.SHARE_TITLE, result["crash"]))
+            self._share_set_status("The check failed - see the Debug Log.")
+        listing = lambda ms: ", ".join("%d/%s" % m for m in ms)
+        if action == "open":
+            self._share_open_list = sorted(set(self._share_open_list) | set(result["opened"]))
+            if result["opened"]:
+                if not quiet:
+                    self._log("%s: router forwarded %s to this PC (%s)."
+                              % (self.SHARE_TITLE, listing(result["opened"]), result["lan_ip"]))
+                self._share_schedule_renew()
+            for mapping, why in result["errors"]:
+                self._log("! %s: couldn't forward %d/%s - %s"
+                          % ((self.SHARE_TITLE,) + tuple(mapping) + (why,)))
+            if not result["opened"] and not quiet and not self._share_warned:
+                self._share_warned = True
+                messagebox.showwarning(
+                    "%s (Beta)" % self.SHARE_TITLE,
+                    "The server's ports couldn't be opened on your router, so friends "
+                    "can't join over the internet yet.\n\nConfiguration -> %s says why, "
+                    "and what to do instead." % self.SHARE_TITLE)
+        elif action == "close":
+            closed = set(result["closed"])
+            self._share_open_list = [m for m in self._share_open_list if m not in closed]
+            if closed:
+                self._log("%s: removed %s from the router." % (self.SHARE_TITLE, listing(closed)))
+            if self._share_open_list:
+                self._log("! %s: couldn't remove %s yet (the router didn't answer) - tried "
+                          "again next launch; they lapse on their own within 2 hours."
+                          % (self.SHARE_TITLE, listing(self._share_open_list)))
+            if not self._share_open_list and self._share_renew_id:
+                self.after_cancel(self._share_renew_id)
+                self._share_renew_id = None
+        if action in ("open", "close"):
+            self._write_config_key(SHARE_OPEN_KEY, [list(m) for m in self._share_open_list],
+                                   "open router ports")
+        if action == "close":
+            if self._share_result and "router" in self._share_result:
+                self._share_result = dict(
+                    self._share_result, router=("idle", "Closed again - the server stopped."),
+                    server=("idle", "Not running."))
+        elif not result.get("crash"):
+            self._share_result = result
+        self._render_share_report()
+        self._update_share_copy_btn()
+        if self._share_pending:
+            pending, self._share_pending = self._share_pending, None
+            self._share_run(*pending)
+
+    def _share_schedule_renew(self):
+        if self._share_renew_id:
+            self.after_cancel(self._share_renew_id)
+        self._share_renew_id = self.after(UPNP_RENEW_MS, self._share_renew)
+
+    def _share_renew(self):
+        self._share_renew_id = None
+        if self._share_open_list and self._server_state in ("starting", "running"):
+            self._share_run("open", quiet=True)
+
+    def _share_allow_firewall(self):
+        title = "%s (Beta)" % self.SHARE_TITLE
+        params = self._share_params()
+        if params is None:
+            messagebox.showwarning(title, "GAMEPORT, QUERYPORT and RCONPORT must be port "
+                                          "numbers first.")
+            return
+        if not params["exe"]:
+            messagebox.showinfo(title, "Install the ARK server first - the rule is for its "
+                                       "ShooterGameServer.exe.")
+            return
+        udp = [p for p, proto in params["mappings"] if proto == "UDP"]
+        self._share_set_status("Waiting for the admin prompt…")
+        self._log("%s: asking Windows for admin permission to update the firewall..."
+                  % self.SHARE_TITLE)
+
+        def _work():
+            try:
+                ok, message = firewall_apply(params["exe"], udp, params["ap_exe"],
+                                             params["ap_port"])
+            except OSError as exc:
+                ok, message = False, str(exc)
+            self._call_on_ui(self._on_firewall_applied, ok, message)
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_firewall_applied(self, ok, message):
+        title = "%s (Beta)" % self.SHARE_TITLE
+        self._share_set_status("")
+        self._log("%s: firewall - %s" % (self.SHARE_TITLE, message))
+        if ok is None:
+            messagebox.showinfo(title, message)
+        elif not ok:
+            messagebox.showerror(title, "Windows Firewall wasn't changed:\n\n%s" % message)
+        self._share_run("check")
+
+    def _share_join_address(self):
+        public = (self._share_result or {}).get("public_ip")
+        params = self._share_params()
+        return "%s:%d" % (public, params["gameport"]) if public and params else ""
+
+    def _copy_text(self, text, what):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._log("Copied %s: %s" % (what, text))
+
+    def _share_copy_address(self):
+        address = self._share_join_address()
+        if address:
+            self._copy_text(address, "the address friends join")
+
+    def _update_share_copy_btn(self):
+        btn = getattr(self, "share_copy_btn", None)
+        if btn is None:
+            return
+        show = bool(self._share_open_list and self._share_join_address())
+        if show and not btn.winfo_manager():
+            btn.pack(side="left", padx=(12, 0))
+        elif not show and btn.winfo_manager():
+            btn.pack_forget()
+
+    def _render_share_report(self):
+        frame = self.share_report_frame
+        for child in frame.winfo_children():
+            child.destroy()
+        t = self.theme
+        result = self._share_result
+        if not result or "router" not in result:
+            ttk.Label(frame, foreground=t["subtle_fg"], wraplength=640, justify="left",
+                      text="Nothing checked yet. \"Check now\" looks at the firewall, your "
+                           "router and your connection.").pack(anchor="w")
+            return
+        rows, (verdict_state, verdict) = share_report_rows(result)
+        grid = ttk.Frame(frame)
+        grid.pack(fill="x")
+        grid.columnconfigure(2, weight=1)
+        for i, (state, title, detail) in enumerate(rows):
+            glyph, colour = self.SHARE_GLYPHS[state]
+            ttk.Label(grid, text=glyph, foreground=t[colour], font=("Segoe UI", 10, "bold")
+                      ).grid(row=i, column=0, sticky="nw", padx=(0, 6))
+            ttk.Label(grid, text=title).grid(row=i, column=1, sticky="nw", padx=(0, 10))
+            ttk.Label(grid, text=detail, foreground=t["subtle_fg"], wraplength=430,
+                      justify="left").grid(row=i, column=2, sticky="nw", pady=(0, 3))
+        glyph, colour = self.SHARE_GLYPHS[verdict_state]
+        ttk.Label(frame, text=verdict, foreground=t[colour], wraplength=640, justify="left"
+                  ).pack(anchor="w", pady=(4, 0))
+        self._render_share_addresses(frame, result)
+
+    def _render_share_addresses(self, frame, result):
+        t = self.theme
+        params = self._share_params() or {}
+        game, query = params.get("gameport", 7777), params.get("queryport", 27015)
+        public, lan = result.get("public_ip"), result.get("lan_ip")
+        connection = result.get("connection", ("idle", ""))[0]
+        box = ttk.Frame(frame)
+        box.pack(fill="x", pady=(8, 0))
+
+        _line = lambda label, value, tip: self._copy_row(box, label, value, tip)
+
+        if public and connection != "cgnat":
+            _line("Friends join:", "%s:%d" % (public, game),
+                  "Your public address and GAMEPORT - what friends type after  open  in "
+                  "ARK's console.")
+            ttk.Label(box, foreground=t["subtle_fg"], wraplength=640, justify="left",
+                      text="In Steam: View -> Game Servers -> Favorites -> Add a server -> "
+                           "%s:%d, then join from ARK's Favorites list. Or in ARK, press Tab "
+                           "and type:  open %s:%d" % (public, query, public, game)
+                      ).pack(anchor="w")
+        if lan:
+            _line("You, and anyone on your home network:", "open %s:%d" % (lan, game),
+                  "Your public address usually doesn't work from inside your own network - "
+                  "most routers can't loop back to themselves - so use this one here. "
+                  "(127.0.0.1 is known to fail for ARK.)")
+        if not result.get("igd") and lan:
+            udp = ", ".join(str(p) for p, proto in params.get("mappings", []) if proto == "UDP")
+            row = ttk.Frame(box)
+            row.pack(fill="x", pady=(6, 0))
+            ttk.Label(row, wraplength=640, justify="left",
+                      text="Forwarding by hand: on your router's page (often under Port "
+                           "Forwarding or Virtual Servers), forward UDP %s to %s, each to the "
+                           "same port, with the source left blank. Then reserve this PC's "
+                           "address in the router's DHCP settings, so the forwards still "
+                           "point here next week." % (udp, lan)).pack(anchor="w")
+            gateway = result.get("gateway")
+            if gateway:
+                self._link_label(row, "Open your router's page (http://%s)" % gateway,
+                                 lambda: webbrowser.open("http://%s" % gateway)
+                                 ).pack(anchor="w")
+        if not result.get("igd") or connection in ("cgnat", "double_nat"):
+            ttk.Label(box, foreground=t["status_info"], wraplength=640, justify="left",
+                      text="No luck with the router? Choose \"Use Tailscale\" above: it "
+                           "skips port forwarding entirely and works on any connection - the "
+                           "launcher sets it up.").pack(anchor="w", pady=(6, 0))
+
+    def _copy_row(self, parent, label, value, tip):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(2, 0))
+        ttk.Label(row, text=label).pack(side="left")
+        ttk.Label(row, text=value, font=("Consolas", 10)).pack(side="left", padx=6)
+        btn = ttk.Button(row, text="Copy", width=6,
+                         command=lambda: self._copy_text(value, label.rstrip(":")))
+        btn.pack(side="left")
+        Tooltip(btn, tip, wraplength=420)
+
+    # ------------------------------------------------ Tailscale (no ports) --- #
+    def _build_tailscale_block(self, parent):
+        self.ts_frame = ttk.Frame(parent)
+        self.ts_frame.pack(fill="x")
+        self._ts_busy = False
+        self._ts_info = None if tailscale_exe() else {
+            "installed": False, "state": "", "ip": "", "shields_up": False, "error": ""}
+        self._render_tailscale()
+        if self._ts_info is None:
+            self._ts_refresh()
+
+    def _ts_refresh(self):
+        if self._ts_busy:
+            return
+        self._ts_busy = True
+        threading.Thread(target=lambda: self._call_on_ui(self._on_ts_info, tailscale_state()),
+                         daemon=True).start()
+
+    def _on_ts_info(self, info):
+        self._ts_busy = False
+        self._ts_info = info
+        self._render_tailscale()
+
+    def _render_tailscale(self, status=""):
+        frame, t = self.ts_frame, self.theme
+        for child in frame.winfo_children():
+            child.destroy()
+        ttk.Label(frame, text="No port forwarding: Tailscale", font=("Segoe UI", 9, "bold")
+                  ).pack(anchor="w")
+
+        def para(text, colour="subtle_fg"):
+            ttk.Label(frame, text=text, foreground=t[colour], wraplength=640,
+                      justify="left").pack(anchor="w", pady=(2, 0))
+        buttons = ttk.Frame(frame)
+        info = self._ts_info
+        if info is None:
+            para("Checking Tailscale…")
+            return
+        params = self._share_params() or {}
+        game, query = params.get("gameport", 7777), params.get("queryport", 27015)
+        if not info["installed"]:
+            para("When the router ports can't work - carrier-grade NAT, double NAT, or a "
+                 "router without UPnP - Tailscale connects you and your friends directly "
+                 "instead, with no port forwarding, on any connection. It's free for "
+                 "personal use. You and each friend install it and sign in; the launcher "
+                 "sets up your side.")
+            btn = ttk.Button(buttons, text="Download and install Tailscale",
+                             command=self._ts_install)
+            Tooltip(btn, "Downloads Tailscale's official installer from pkgs.tailscale.com "
+                         "and runs it - only after Windows confirms it's signed by "
+                         "Tailscale Inc. The installer asks for admin permission and shows "
+                         "Tailscale's own terms.", wraplength=440)
+            btn.pack(side="left")
+        elif info["state"] != "Running":
+            para("Tailscale is installed, but %s. Sign in with a free account - Google, "
+                 "Microsoft, GitHub, Apple or email all work - and it turns on."
+                 % ("turned off" if info["state"] == "Stopped" else "not signed in"))
+            ttk.Button(buttons, text="Sign in to Tailscale" if info["state"] != "Stopped"
+                       else "Turn Tailscale on", command=self._ts_login).pack(side="left")
+        else:
+            para("Tailscale is on. This PC is %s on your Tailscale network." % info["ip"],
+                 "status_ok")
+            if info["shields_up"]:
+                para("Tailscale is blocking incoming connections (\"Allow incoming "
+                     "connections\" is off), so friends can't reach the server.",
+                     "status_fail")
+                ttk.Button(buttons, text="Allow incoming connections",
+                           command=self._ts_allow_incoming).pack(side="left", padx=(0, 6))
+            if info["ip"]:
+                self._copy_row(frame, "Friends join:", "open %s:%d" % (info["ip"], game),
+                               "What friends type in ARK's console (Tab) once they're on "
+                               "your Tailscale network.")
+            para("1. Share this PC with each friend: on Tailscale's page, open this PC's "
+                 "⋯ menu -> Share..., and send them the invite link. They can reach this "
+                 "PC and nothing else of yours.\n"
+                 "2. Each friend installs Tailscale, signs in, and opens your link.\n"
+                 "3. They join with the address above - or add %s:%d to Steam's Favorites.\n"
+                 "Also click \"Allow through Windows Firewall\" above once: Tailscale's "
+                 "adapter usually counts as a Public network." % (info["ip"] or "<your IP>",
+                                                                  query))
+            share = ttk.Button(buttons, text="Open Tailscale's sharing page",
+                               command=lambda: webbrowser.open(TAILSCALE_ADMIN_MACHINES_URL))
+            share.pack(side="left")
+            Tooltip(share, "Tailscale's admin page, where each machine has a Share... "
+                           "option. Sharing is the one step with no command the launcher "
+                           "could run for you.", wraplength=420)
+        if info.get("error"):
+            para("Couldn't read Tailscale's status: %s" % info["error"], "status_fail")
+        buttons.pack(anchor="w", pady=(6, 0))
+        self.ts_status = ttk.Label(buttons, text=status, foreground=t["subtle_fg"])
+        self.ts_status.pack(side="left", padx=8)
+        refresh = self._link_label(buttons, "Refresh", self._ts_refresh)
+        refresh.pack(side="left", padx=(4, 0))
+
+    def _ts_start(self, status, work):
+        """Run work() -> (ok, message) on a worker, with `status` showing meanwhile."""
+        self._ts_busy = True
+        self._render_tailscale(status)
+
+        def _run():
+            try:
+                ok, message = work()
+            except (OSError, subprocess.SubprocessError) as exc:
+                ok, message = False, str(exc)
+            self._call_on_ui(self._on_ts_done, ok, message)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_ts_done(self, ok, message):
+        self._ts_busy = False
+        self._log("Tailscale: %s" % message)
+        if ok is None:
+            messagebox.showinfo("Tailscale", message)
+        elif not ok:
+            messagebox.showerror("Tailscale", message)
+        self._ts_refresh()
+
+    def _ts_install(self):
+        if self._ts_busy or not messagebox.askyesno(
+                "Tailscale", "Download Tailscale's official installer (about 1.5 MB, from "
+                             "pkgs.tailscale.com) and run it?\n\nIt's only run if Windows "
+                             "confirms it's signed by Tailscale Inc. The installer asks for "
+                             "admin permission and shows Tailscale's own terms."):
+            return
+        self._ts_start("Downloading and installing Tailscale…", tailscale_install)
+
+    def _ts_login(self):
+        exe = tailscale_exe()
+        if self._ts_busy or not exe:
+            return
+        verb = "up" if (self._ts_info or {}).get("state") == "Stopped" else "login"
+        self._ts_start("Finish signing in in your browser…", lambda: tailscale_login(
+            exe, lambda url: self._call_on_ui(webbrowser.open, url), verb=verb))
+
+    def _ts_allow_incoming(self):
+        exe = tailscale_exe()
+        if self._ts_busy or not exe:
+            return
+
+        def work():
+            out = _run_quiet([exe, "set", "--shields-up=false"])
+            if out.returncode == 0:
+                return True, "Incoming connections allowed."
+            return False, (out.stderr or out.stdout).strip() or "tailscale set failed."
+        self._ts_start("Allowing incoming connections…", work)
+
+    def _share_keep_on_close(self):
+        """Closing the launcher while friends play: nobody is left to renew the router
+        ports, and they'd lapse mid-game - so they're made permanent. The next launch
+        removes them once it finds the server stopped."""
+        if (not getattr(self, "_share_open_list", None)
+                or self._server_state not in ("starting", "running")):
+            return
+        igd = upnp_discover(timeout=1.5)
+        if not igd:
+            return
+        lan = local_ip_toward(urllib.parse.urlsplit(igd[0]).hostname)
+        for port, proto in self._share_open_list:
+            try:
+                upnp_add_port(igd, port, proto, lan, lease=0)
+            except (UpnpError, OSError, http.client.HTTPException):
+                pass
+        self._log("%s: the server is still running, so its router ports stay open until "
+                  "the launcher next sees it stopped." % self.SHARE_TITLE)
+
+    def _show_guide_section(self, title):
+        """Switch to the Launcher guide with this section open and scrolled into view."""
+        self.notebook.select(self.tab_instructions)
+        txt = self._active_instructions_text()
+        idx = txt.search(title, "1.0", "end")
+        if not idx:
+            return
+        section_vars = txt._instr_vars[0]
+        for tag in txt.tag_names(idx):
+            if tag in section_vars:
+                section_vars[tag].set(False)
+        txt.see("end")
+        txt.see(idx)
+
+    # ------------------------------------------------------- Install tab --------- #
+    def _apply_install_tab_setting(self):
+        """Hide or show Install Server/Api/Plugin per Settings -> "Show Install tab"."""
+        try:
+            if self.install_tab_visible_var.get():
+                self.notebook.add(self.tab_install)
+            else:
+                if self.notebook.select() == str(self.tab_install):
+                    self.notebook.select(self.tab_wizard)
+                self.notebook.hide(self.tab_install)
+        except tk.TclError:
+            pass
+
+    def _on_install_tab_toggled(self):
+        self._write_config_key(INSTALL_TAB_SHOWN_KEY, self.install_tab_visible_var.get(),
+                               "Install tab visibility")
+        self._apply_install_tab_setting()
+
+    def _show_install_tab(self, select=True):
+        """Bring the Install tab back for this session and (by default) switch to it.
+        A visit, not a preference: the setting is left alone, so it's hidden again next
+        launch. Every route to the installers goes through here - Get Started's install
+        steps (incl. Reinstall / Update on finished ones and Show console while one
+        runs), Setup Status's "Install / repair", the header's "next step" chip, and
+        the update dialog's install buttons."""
+        try:
+            self.notebook.add(self.tab_install)     # restores it in its own place
+            if select:
+                self.notebook.select(self.tab_install)
+        except tk.TclError:
+            pass
+
+    def _update_mods_tab_visibility(self):
+        """Mods exists only once there's a server to put mods in - the same
+        _mods_gate_state rule as its gate banner, so the tab and its contents can't
+        disagree. hide()/add() keep its place in the tab order. Search skips hidden tabs
+        and "reopen on last tab" falls back to the default for one (see
+        _select_tab_by_text); the Get Started links to it are dropped while it's hidden."""
+        if not hasattr(self, "tab_mods"):
+            return
+        ok = self._mods_gate_state()[0]
+        try:
+            hidden = self.notebook.tab(self.tab_mods, "state") == "hidden"
+            if ok and hidden:
+                self.notebook.add(self.tab_mods)
+            elif not ok and not hidden:
+                if self.notebook.select() == str(self.tab_mods):
+                    self.notebook.select(self.tab_wizard)
+                self.notebook.hide(self.tab_mods)
+        except tk.TclError:
+            pass
 
     def _on_tab_changed(self, _event=None):
         # Leaving the tab the easter-egg track started on kills it, permanently.
@@ -10356,8 +14803,8 @@ class ArkAPLauncher(tk.Tk):
             # rewritten GameUserSettings.ini since this halo was last worked out. Cheaper
             # here than re-reading both ini files on every keystroke in every field.
             self._update_stacks_dirty()
-        elif current == str(self.tab_status):
-            self._refresh_setup_status()
+        elif current == str(self.tab_wizard):
+            self._refresh_setup_status()   # redraws Get Started too
         elif current == str(self.tab_settings):
             self._update_profile_status()
         elif current == str(self.tab_mods):
@@ -10668,8 +15115,33 @@ class ArkAPLauncher(tk.Tk):
         tab_chk.pack(anchor="w", pady=(4, 0))
         Tooltip(tab_chk,
                 "When on, the launcher opens on whichever tab you were last looking at. "
-                "When off (the default) it always opens on Configuration. Either way, a "
-                "brand-new install still opens on Instructions the first time.",
+                "When off (the default) it opens on the first tab - Get Started (or "
+                "Setup Status, once the setup steps are hidden).",
+                wraplength=420)
+
+        self.wizard_visible_var = tk.BooleanVar(
+            value=not self._read_settings().get(WIZARD_HIDDEN_KEY))
+        wiz_chk = ttk.Checkbutton(
+            gen, text="Show the Get Started steps", variable=self.wizard_visible_var,
+            command=lambda: self._set_wizard_hidden(not self.wizard_visible_var.get()))
+        wiz_chk.pack(anchor="w", pady=(4, 0))
+
+        self.install_tab_visible_var = tk.BooleanVar(
+            value=bool(self._read_settings().get(INSTALL_TAB_SHOWN_KEY)))
+        inst_chk = ttk.Checkbutton(
+            gen, text="Show Install tab", variable=self.install_tab_visible_var,
+            command=self._on_install_tab_toggled)
+        inst_chk.pack(anchor="w", pady=(4, 0))
+        Tooltip(inst_chk,
+                "The Install Server/Api/Plugin tab: the three installers and the SteamCMD "
+                "console. Hidden by default because Get Started runs the installs - it "
+                "still appears on its own while an install is running, and Get Started's "
+                "install steps and Setup Status's \"Install / repair\" link bring it back "
+                "any time.", wraplength=420)
+        Tooltip(wiz_chk,
+                "The step-by-step setup list. Hide it once you're set up and the tab "
+                "becomes plain Setup Status - every step's settings stay on their own "
+                "tabs, and the checks keep running.",
                 wraplength=420)
 
         # --- Scan intensity. The SAME StringVar the Configuration tab's combobox uses,
@@ -11030,6 +15502,14 @@ class ArkAPLauncher(tk.Tk):
         self.instructions_mode_btn = ttk.Button(toolbar, text="Full Guide",
                                                  command=self._toggle_instructions_mode)
         self.instructions_mode_btn.pack(side="right")
+        popout_btn = ttk.Button(toolbar, text=LEGACY_GUIDE_LABEL,
+                                command=self._open_instructions_popout)
+        popout_btn.pack(side="right", padx=(0, 6))
+        Tooltip(popout_btn,
+                "The complete old guide in a window of its own, to keep beside the "
+                "launcher while you work. It also holds the \"%s\" walkthrough that this "
+                "tab no longer carries - the Get Started tab does that now. Sections "
+                "the two share fold together." % SETUP_SECTION_TITLE)
         Tooltip(self.instructions_mode_btn,
                 "Quick Guide is the short version. Full Guide has every detail and "
                 "caveat. Switching keeps each guide's own collapsed/expanded sections.")
@@ -11050,6 +15530,34 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Pro tip: everything here collapses and expands. Click the box "
                        "beside a header, or use the Expand all / Collapse all buttons."),
 
+            ("h1", JOIN_GUIDE_TITLE),
+            ("bullet", "Only joining someone else's ARK server? You don't need a server, "
+                       "ArkApi, the ArkAP plugin or any of this launcher's setup - the host "
+                       "runs all of that. You only need your own ARK: Survival Evolved "
+                       "game, set up like this:"),
+            ("bullet", "Set it to the %s branch: in Steam, right-click ARK: Survival "
+                       "Evolved -> Properties -> Betas, and pick %s. The host's server "
+                       "runs that version, and your game has to match it."
+                       % (ARK_BETA_BRANCH, ARK_BETA_BRANCH)),
+            ("bullet", "Turn BattlEye off: Properties -> Launch Options, add -NoBattlEye."),
+            ("bullet", "Ask the host for their address, and the server password if they "
+                       "set one."),
+            ("bullet", "Join: in Steam, View -> Game Servers -> Favorites -> Add a server, "
+                       "and enter the host's address with the query port (for example "
+                       "203.0.113.5:27015). Then in ARK, Join ARK and set the session filter "
+                       "to Favorites. Or in ARK, press Tab to open the console and type  "
+                       "open <address>:<game port>  (for example  open 203.0.113.5:7777)."),
+            ("bullet", "On the same home network as the host? Use their local address "
+                       "instead - their launcher shows it. Joining by the public address "
+                       "from inside the same network usually fails."),
+            ("bullet", "If the host uses Tailscale: install Tailscale (tailscale.com/"
+                       "download), sign in, and open the share link the host sends you. "
+                       "Then join with the 100.x address they give you, the same way."),
+            ("bullet", "Archipelago needs nothing from you either. Everyone on the ARK "
+                       "server can share the host's slot - you all receive the same items - "
+                       "or the host can give you a slot of your own."),
+            ("bullet", "Hosting, and friends can't get in? See \"%s\"." % SHARE_GUIDE_TITLE),
+
             ("h1", "Start here - install in this order"),
             ("bullet", "The three installs below must happen in order: the ARK server "
                        "first, then ArkServerApi into it, then the ArkAP plugin into "
@@ -11065,6 +15573,10 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "   You can install the server anywhere you like - it doesn't have "
                        "to be a special location. A short path near the top of a drive, "
                        "like C:\\ark\\, keeps things simple and avoids very long paths."),
+            ("bullet", "   SERVER_ROOT should be an empty (or not yet created) folder of its "
+                       "own - never your ARK: Survival Evolved game folder. Nothing needs to "
+                       "be there beforehand: until the server is installed, the header shows "
+                       "\"next step: Install ARK Server\" rather than a reminder to save."),
             ("bullet", "   If it fails with exit code 8, just click Install again - it "
                        "usually works on the second try."),
             ("bullet", "   When it finishes, the cluster folders (CLUSTERDIR / SAVESROOT / "
@@ -11133,7 +15645,8 @@ class ArkAPLauncher(tk.Tk):
                        "- for servers extracted somewhere odd - and can be slow, "
                        "the launcher stays usable while scanning."),
 
-            ("bullet", "5. Setup Status tab -> click Re-check and confirm everything shows "
+            ("bullet", "5. Get Started tab -> \"Setup Status\" (top right) opens the full "
+                       "check list. Click Re-check and confirm everything shows "
                        "a checkmark before going further (the connector.ini row is only a "
                        "yellow \"i\", not an X - it's just the optional standalone "
                        "connector fallback, ignore it unless you're using that instead of "
@@ -11244,8 +15757,9 @@ class ArkAPLauncher(tk.Tk):
                        "/send ARCHIPELAGONAME Engram: Compass - within a few seconds it "
                        "should unlock in your engrams. If not, uh oh "),
 
-            ("bullet", "Any issues: check the Debug Log tab first, then the Discord or "
-                       "GitHub to search for or report them."),
+            ("bullet", "Any issues: check the Debug Log tab first, then the Discord "
+                       "(%s) or GitHub to search for or report them."
+                       % DISCORD_INVITE_URL),
 
             ("h1", "What each tab does"),
             ("bullet", "Listed in tab order, left to right."),
@@ -11262,8 +15776,9 @@ class ArkAPLauncher(tk.Tk):
                        "(downloads the latest ArkAP_Plugin.zip from GitHub and installs it "
                        "into ArkApi\\Plugins). \"Manual downloads\" at the bottom is only a "
                        "fallback if an automated download fails (or you want a specific "
-                       "older plugin version), plus the ArkConnector, which still needs "
-                       "downloading by hand."),
+                       "older plugin version), plus the optional standalone ArkConnector "
+                       "fallback, still a manual download - you don't need it to play, "
+                       "you connect in-game with /connect."),
             ("bullet", "Archipelago Setup - a built-in quick launcher for your own "
                        "Archipelago installation (the separate app that hosts the room and "
                        "builds the yaml), plus the Connector settings that used to live on "
@@ -11366,26 +15881,49 @@ class ArkAPLauncher(tk.Tk):
                        "pick ARK from its own game list. That's a limit of Archipelago, not "
                        "something this launcher is missing."),
             ("bullet", "Mods - download and activate Steam Workshop mods for the server "
-                       "(see the \"Mods (Steam Workshop)\" section below)."),
-            ("bullet", "Setup Status - a read-only checklist with hints for anything "
-                       "showing an X. It covers the three installs and the plugin mode, "
+                       "(see the \"Mods (Steam Workshop)\" section below). The tab "
+                       "appears once the ARK server is installed in SERVER_ROOT."),
+            ("bullet", "Setup Status (at the bottom of Get Started - the \"Setup Status\" "
+                       "button at the top of that tab opens it) - a read-only checklist, "
+                       "passing checks included, with hints for anything "
+                       "showing an X. It covers the three installs (including which Steam "
+                       "branch and build the ARK server is on) and the plugin mode, "
                        "the cluster folders, the .mod files in Content\\Mods, and the two "
                        "things that go quietly out of step as you work: whether your "
                        "Configuration fields have actually been written out to the server "
                        "scripts, and whether the Mods tab agrees with the ActiveMods line "
                        "the server really reads. Click Re-check after fixing something. It "
                        "also shows advisory rows (a yellow \"i\", not a red X) for things "
-                       "that are worth knowing but aren't broken - the BattlEye note, "
+                       "that are worth knowing but aren't broken - "
                        "connector.ini status (only relevant if you use the optional "
                        "standalone connector instead of the in-game integrated one), and "
                        "\"update available\" when a newer ArkServerApi or ArkAP plugin "
                        "release exists than the one you installed (with a link to the "
                        "release). None of these are failures, so they never show an X. "
-                       "These advisory rows are typically nothing to worry about."),
-            ("bullet", "   The Setup Status tab has a small coloured symbol next to its "
+                       "These advisory rows are typically nothing to worry about. A few "
+                       "checks that pass on every working install (BattlEye disabled, "
+                       "plugin mode \"ap\") are left off the tab while they pass, so it "
+                       "fits in one screenshot - they appear the moment one fails, and the "
+                       "diagnostics export always lists every check."),
+            ("bullet", "   Some red X rows can fix themselves: where the launcher "
+                       "knows the one correct answer, the row shows a small \"Fix this\" "
+                       "button under its hint. Pressing it always asks first, naming the "
+                       "exact old and new value of everything it will change, so nothing "
+                       "happens behind your back. A fix only ever changes the "
+                       "Configuration fields and creates folders - it never deletes "
+                       "anything and never moves your data, so if a fix would leave world "
+                       "saves behind at the old location it says so and lets you decide. "
+                       "Afterwards the fields are changed but NOT saved, exactly as if "
+                       "you had typed them, so press Save (the Save button lights up). "
+                       "Every fix is written to the launcher log with both values, so a "
+                       "diagnostics zip shows what was changed and when. Rows with no "
+                       "single right answer - anything under Program Files, for instance, "
+                       "where only you know where you want it - have no button and keep "
+                       "their hint, which you can still click to jump to the field."),
+            ("bullet", "   The Get Started tab has a small coloured symbol next to its "
                        "name in the tab bar, so you can see your overall status from any "
                        "tab without opening it: a green check = everything passes, a "
-                       "yellow \"i\" = no failures but at least one advisory (BattlEye, or "
+                       "yellow \"i\" = no failures but at least one advisory (for example "
                        "a newer component version), a red X = at least one hard failure. "
                        "It updates whenever the checks re-run. A yellow \"i\" is advisory "
                        "only, and is typically nothing to worry about."),
@@ -11512,8 +16050,18 @@ class ArkAPLauncher(tk.Tk):
                        "box. Very large logs - ShooterGame.log usually is - load only "
                        "their newest part, with a line at the top saying so, so switching "
                        "to one doesn't hang the app."),
-            ("bullet", "Instructions - this tab, with a Quick Guide and this Full Guide. "
-                       "Switch between them with the button in the top right."),
+            ("bullet", "The bar along the bottom (on every tab) - the server's status "
+                       "light (Stopped / Starting / Running), Run server and Stop server, "
+                       "Export diagnostics, and the Discord. Stop server saves the world "
+                       "over RCON before shutting down; only if RCON never answers does "
+                       "it offer to force-close, which loses anything since the last "
+                       "autosave."),
+            ("bullet", "Launcher guide - this tab, with a Quick Guide and this Full "
+                       "Guide. Switch between them with the button in the top right. The "
+                       "install walkthrough that used to open it now lives on the Get "
+                       "Started tab; \"Legacy Instructions\" (top right, or at the foot "
+                       "of Get Started) opens the complete old guide, walkthrough "
+                       "included, in its own window."),
 
             ("h1", "Saving, and what a highlighted Save button means"),
             ("bullet", "Save buttons light up in a yellow halo only while something on "
@@ -11536,7 +16084,7 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Two safety nets catch it if you forget. Run start_ase_server "
                        "compares every field against what is really in paths.cmd and "
                        "refuses to launch rather than starting the server on stale paths. "
-                       "And the Setup Status tab shows both cases as red X rows up front: "
+                       "And Setup Status shows both cases as red X rows up front: "
                        "\"Configuration is saved into the server scripts\" and \"Mods tab "
                        "matches ActiveMods on disk\"."),
 
@@ -11614,6 +16162,20 @@ class ArkAPLauncher(tk.Tk):
                        "Workshop ID; select it and rename it to something you'll "
                        "recognise. Display only, and it sticks across restarts and "
                        "profile loads. \"apworld ✓\" mods keep their real names."),
+            ("bullet", "Remove from list - deletes the selected mod's entry outright, "
+                       "for when unticking it isn't enough (a mistyped Add mod ID, a mod "
+                       "you're done with). It asks first, naming the mod, then asks "
+                       "separately whether to also delete its downloaded files - answer "
+                       "No there and the entry goes but the files stay, so re-adding the "
+                       "ID later finds it already installed. If the mod is active on the "
+                       "server it's taken out of ActiveMods as part of the removal, so "
+                       "you're never left with the server loading a mod this tab no "
+                       "longer lists (which is exactly the mismatch Setup Status flags "
+                       "and you'd have no row left to fix); restart the ARK server "
+                       "afterwards in that case. Removing an \"apworld ✓\" mod is "
+                       "temporary - the launcher puts every mod it supports back in the "
+                       "list, unticked, at startup, which is how you undo a removal you "
+                       "didn't mean."),
             ("bullet", "Copy IDs for YAML - copies your checked mods' IDs to the clipboard as "
                        "a comma-separated list, in the list's top-to-bottom order, ready to "
                        "paste into the plugin's YAML mod configuration. Only the "
@@ -11634,7 +16196,7 @@ class ArkAPLauncher(tk.Tk):
 
             ("h1", "Search (top left of the window)"),
             ("bullet", "Type a term and press Enter to search field labels, tooltips, "
-                       "button text, and this Instructions tab across every tab at once."),
+                       "button text, and this Launcher guide across every tab at once."),
             ("bullet", "Find Next / Find Prev cycle through all matches, switching tabs "
                        "automatically and centering the match on screen."),
 
@@ -11660,7 +16222,8 @@ class ArkAPLauncher(tk.Tk):
                        "if this launcher added one (backed up first), so a fresh seed "
                        "doesn't inherit the previous seed's dino randomization. Backups are "
                        "moved aside with a timestamp, never deleted. Use this when joining a "
-                       "new seed. Stop the ARK server (and the connector) first."),
+                       "new seed. Stop the ARK server first (and the standalone connector, if "
+                       "you use one)."),
             ("bullet", "   It no longer just says \"done\" and hopes. Every backup is "
                        "checked to confirm it actually received files (an empty one is "
                        "flagged, not counted), then it re-scans every live save location "
@@ -11834,6 +16397,52 @@ class ArkAPLauncher(tk.Tk):
                        "them. The apworld ships no engram data for this mod, so it is "
                        "excluded from \"Copy IDs for YAML\"."),
 
+            ("h1", SHARE_GUIDE_TITLE),
+            ("bullet", "Configuration -> Friends over the internet. Lets friends in other "
+                       "homes join your ARK server. It's in beta: every router is different "
+                       "and we can't test them all, so please tell us on the Discord whether "
+                       "it worked for you."),
+            ("bullet", "First, choose how friends reach you: open ports on your router "
+                       "(friends install nothing, but your router and connection must allow "
+                       "it), or Tailscale (works on any connection; you and each friend "
+                       "install it). They don't combine - the section shows only the one "
+                       "you pick, and you can switch any time."),
+            ("bullet", "Open ports: tick \"Open ports on my router for friends while the "
+                       "server runs\". When the server starts, the launcher asks your router (UPnP) to "
+                       "forward UDP GAMEPORT, GAMEPORT+1 and QUERYPORT to this PC - plus "
+                       "Archipelago's room port while you host the room here - and removes "
+                       "them when the server stops. GAMEPORT+1 is ARK's peer port: most "
+                       "guides forget it, and without it the server works but nobody can "
+                       "see it. RCONPORT is never opened: it carries your admin password."),
+            ("bullet", "Click \"Allow through Windows Firewall\" once. Windows asks for "
+                       "admin permission, once. It also removes any rule blocking the "
+                       "server, which Windows makes if its own \"Allow access\" popup was "
+                       "ever cancelled - a block beats every allow."),
+            ("bullet", "It won't open anything while ADMINPASS is blank or still "
+                       "changeme_admin: anyone who joins could type enablecheats with it and "
+                       "take over the server. A SERVERPASS is strongly recommended too."),
+            ("bullet", "Share the address the section shows. The launcher can't prove that "
+                       "friends can get in - testing from inside your own network is "
+                       "misleading - so the real test is a friend adding you in Steam's "
+                       "Favorites. If your server shows up there with its name and map, it "
+                       "works. You join with the local address it shows, not the public one."),
+            ("bullet", "If it says carrier-grade NAT or double NAT, or your router doesn't "
+                       "answer, switch to Tailscale instead - no port forwarding, works on any "
+                       "connection. The same section installs it (after checking it's "
+                       "signed by Tailscale Inc.), signs you in, and shows the address "
+                       "friends join. The one step it can't do for you: on Tailscale's page "
+                       "(\"Open Tailscale's sharing page\"), open this PC's menu -> Share... "
+                       "and send each friend the invite link. Each friend installs "
+                       "Tailscale, signs in and opens your link, then joins with  open "
+                       "<your Tailscale IP>:<GAMEPORT>. Still click \"Allow through Windows "
+                       "Firewall\" once."),
+            ("bullet", "Antivirus suites with their own firewall ignore Windows Firewall's "
+                       "rules - if yours has one, allow ShooterGameServer.exe in it too."),
+            ("bullet", "Keep the launcher open while friends play: it renews the router "
+                       "ports every 30 minutes, and they lapse within 2 hours without it. "
+                       "Closing the launcher while the server runs keeps them open until the "
+                       "launcher next sees the server stopped."),
+
             ("h1", "What the path fields feed"),
             ("bullet", "SERVER_ROOT / SAVESROOT / CLUSTERDIR / BACKUPROOT / CLUSTERID / "
                        "ADMINPASS / SERVERPASS all write into a single file, paths.cmd - "
@@ -11867,13 +16476,15 @@ class ArkAPLauncher(tk.Tk):
                        "file - everything else in the script is left untouched."),
 
             ("h1", "Reporting a problem (diagnostics & crash log)"),
-            ("bullet", "Export diagnostics - a button next to Save / Reload on the "
-                       "Configuration tab. It bundles everything someone helping you "
+            ("bullet", "Export diagnostics - a button in the bar along the bottom of "
+                       "the window, on every tab. It bundles everything someone helping you "
                        "would otherwise have to ask for, one question at a time, into a "
                        "single .zip. It saves to your Desktop by default (you pick where) "
                        "and opens the folder when it's done. Drag that zip straight into "
-                       "Discord or attach it to a GitHub issue - it's the fastest way to "
-                       "get diagnosed."),
+                       "the Archipelago Discord (%s - ARK: Survival Evolved has its own "
+                       "channel there) or attach it to a GitHub issue - it's the fastest "
+                       "way to get diagnosed."
+                       % DISCORD_INVITE_URL),
             ("bullet", "What's in the zip: a text summary of the Setup Status checks; a "
                        "versions file (launcher, ArkAP plugin, .apworld, the %s and "
                        "ArkServerApi in one place); your config; your Archipelago .yaml, "
@@ -11941,7 +16552,7 @@ class ArkAPLauncher(tk.Tk):
             ("h1", "Other Information"),
             ("bullet", "If you want to restart your world for a new Archipelago seed, "
                        "click \"Full reset for new seed\" under Quick Launch (stop the ARK "
-                       "server and the connector first)."),
+                       "server first, and the standalone connector if you use one)."),
             ("bullet", "If you randomized dinos, stop the ARK server and click \"Patch "
                        "Game.ini for randomized creatures\" under Quick Launch. It applies "
                        "the plugin's ipc\\game_ini_fragment.txt into your Game.ini for you "
@@ -11964,6 +16575,24 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Click the box beside a header to collapse or expand it. The Expand "
                        "all and Collapse all buttons do the whole guide."),
 
+            ("h1", JOIN_GUIDE_TITLE),
+            ("bullet", "Only joining someone else's ARK server? You don't need a server, "
+                       "ArkApi, the plugin or any setup in this launcher. The host does all "
+                       "of that."),
+            ("bullet", "Set your ARK game to the %s branch (Steam -> Properties -> "
+                       "Betas)." % ARK_BETA_BRANCH),
+            ("bullet", "Turn BattlEye off (Steam -> Properties -> Launch Options, add "
+                       "-NoBattlEye)."),
+            ("bullet", "Get the host's address and server password. In Steam, add the "
+                       "address with the query port to View -> Game Servers -> Favorites, "
+                       "then join from ARK's Favorites list. Or in ARK, press Tab and type  "
+                       "open <address>:<game port>."),
+            ("bullet", "On the host's home network? Use their local address instead."),
+            ("bullet", "Host uses Tailscale? Install Tailscale, sign in, open the share link "
+                       "they send, then join with their 100.x address."),
+            ("bullet", "Nothing to do for Archipelago. You can share the host's slot, or "
+                       "the host can give you your own."),
+
             ("h1", "Start here - install in this order"),
             ("bullet", "Do these steps in order. Each step needs the one before it."),
 
@@ -11971,6 +16600,8 @@ class ArkAPLauncher(tk.Tk):
                        "\"Install ARK Server\"."),
             ("bullet", "   You can install it anywhere. A short path near the top of a "
                        "drive, like C:\\ark\\, keeps things simple."),
+            ("bullet", "   Use an empty folder. Do not pick your ARK game folder. The "
+                       "server gets downloaded into it."),
             ("bullet", "   The download is about 18gb. Progress shows in the console box. "
                        "Wait for it to finish."),
             ("bullet", "   Set your ARK: Survival Evolved game to the preaquatica branch. "
@@ -11989,17 +16620,24 @@ class ArkAPLauncher(tk.Tk):
 
             ("bullet", "4. Open the Configuration tab. In the Paths group, click \"Scan for "
                        "paths\". Accept the paths it fills in. Click Save."),
-            ("bullet", "   SERVER_ROOT is the folder that contains ShooterGame."),
+            ("bullet", "   SERVER_ROOT is the folder you installed the server into in step "
+                       "1 - not your ARK game folder."),
             ("bullet", "   The scan shows its suggestions in a popup. Click a suggestion to "
                        "accept it. If one looks wrong, close the popup and use Browse to "
                        "set that path yourself."),
             ("bullet", "   The popup scrolls if the scan found a lot of folders. Use the "
                        "scrollbar or your mouse wheel."),
 
-            ("bullet", "5. Open the Setup Status tab. Click Re-check."),
+            ("bullet", "5. Open the Get Started tab and click \"Setup Status\" at the top "
+                       "right. Click Re-check."),
             ("bullet", "   Every row should show a green checkmark before you carry on."),
             ("bullet", "   A yellow \"i\" is advisory only and is typically nothing to "
                        "worry about. A red X tells you what to fix."),
+            ("bullet", "   Many rows can fix themselves - look for a \"Fix this\" "
+                       "button under the row (hover it to see what it does). Anything "
+                       "that changes or removes a file asks first, says exactly what "
+                       "will change, and backs up what it replaces. Press Save "
+                       "afterwards if it changed a path."),
             ("bullet", "   Come back here after any change. It also checks that your "
                        "settings were saved into the server scripts, and that your ticked "
                        "mods match what the server will really load."),
@@ -12083,7 +16721,10 @@ class ArkAPLauncher(tk.Tk):
             ("h1", "What each tab does"),
             ("bullet", "Configuration - all your settings, the Quick Launch buttons, and "
                        "Save."),
-            ("bullet", "Install Server/Api/Plugin - the three installers, in order."),
+            ("bullet", "Install Server/Api/Plugin - the three installers and the "
+                       "SteamCMD console. Hidden by default (Get Started runs the "
+                       "installs); it appears while an install runs, and Settings -> "
+                       "\"Show Install tab\" keeps it."),
             ("bullet", "Archipelago Setup - your Archipelago folder, your room details, and "
                        "buttons that open Archipelago's own tools."),
             ("bullet", "   It remembers every field between sessions, and they travel "
@@ -12091,9 +16732,11 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "   The \"PopTracker (tracker)\" group at the bottom is optional: it "
                        "sets up the PopTracker app and the ARK tracker pack, and opens the "
                        "tracker on the ARK map."),
-            ("bullet", "Mods - download and turn on Steam Workshop mods."),
-            ("bullet", "Setup Status - a checklist of your setup. Click Re-check after you "
-                       "fix something."),
+            ("bullet", "Mods - download and turn on Steam Workshop mods. Appears once the "
+                       "ARK server is installed."),
+            ("bullet", "Get Started - the setup steps in order, one button each, with "
+                       "Setup Status at the bottom: every check, for fixing things or "
+                       "screenshotting for help. Click Re-check after you fix something."),
             ("bullet", "Settings - the launcher's own options: dark mode, update checks on "
                        "startup, which tab it opens on, how hard the scan buttons look, "
                        "how often your settings are auto-snapshotted, and how many "
@@ -12126,8 +16769,12 @@ class ArkAPLauncher(tk.Tk):
                        "dropping older runs one whole run at a time when the app starts "
                        "(your most recent session is always kept). Change how long with "
                        "\"Days of log history to keep\" on the Settings tab."),
-            ("bullet", "Instructions - this tab. Use the button in the top right to switch "
-                       "to the Full Guide."),
+            ("bullet", "The bar along the bottom - server status, Run and Stop server "
+                       "(Stop saves the world first), Export diagnostics, Discord."),
+            ("bullet", "Launcher guide - this tab. Use the button in the top right to "
+                       "switch to the Full Guide. The setup steps are on the Get Started "
+                       "tab now; \"Legacy Instructions\" opens the old walkthrough in "
+                       "its own window if you want it."),
 
             ("h1", "Saving your changes"),
             ("bullet", "A Save button glows yellow while something on screen is unsaved."),
@@ -12165,6 +16812,15 @@ class ArkAPLauncher(tk.Tk):
                        "would stop your game generating. They still work on the server."),
             ("bullet", "Click \"Rename mod\" to give a mod you added yourself a name you "
                        "will recognise instead of a bare ID."),
+            ("bullet", "Click \"Remove from list\" to delete a mod's row completely, "
+                       "instead of just unticking it. It asks you first, and asks again "
+                       "whether to delete the downloaded files too - say No and the "
+                       "files stay on your disk."),
+            ("bullet", "Removing a mod that is running on the server also turns it off "
+                       "there. Restart the ARK server after that."),
+            ("bullet", "Mods tagged \"apworld ✓\" come back to the list, unticked, "
+                       "next time you start the launcher. That is how you get one back "
+                       "if you removed it by accident."),
 
             ("h1", "Search (top left of the window)"),
             ("bullet", "Type a word and press Enter."),
@@ -12275,6 +16931,21 @@ class ArkAPLauncher(tk.Tk):
                        "checks stop working, so the launcher does not let you change it. "
                        "Do not add this mod's ID to your yaml."),
 
+            ("h1", SHARE_GUIDE_TITLE),
+            ("bullet", "Configuration -> Friends over the internet lets friends in other "
+                       "homes join your server. It's in beta - please tell us on the Discord "
+                       "whether it worked."),
+            ("bullet", "Choose how friends reach you: open ports on your router, or "
+                       "Tailscale. Then click \"Allow through Windows Firewall\" once - "
+                       "both need it."),
+            ("bullet", "Set your own ADMINPASS first - it won't open anything while it's "
+                       "changeme_admin. A SERVERPASS is recommended too."),
+            ("bullet", "Share the address it shows. A friend adding you in Steam's "
+                       "Favorites is the real test. You join with the local address."),
+            ("bullet", "If it says carrier-grade NAT or your router doesn't answer, switch "
+                       "to Tailscale in the same section instead, and share this PC with your "
+                       "friends from Tailscale's page."),
+
             ("h1", "What the path fields feed"),
             ("bullet", "The path fields write into the launcher's .bat and .ini files for "
                        "you."),
@@ -12285,10 +16956,10 @@ class ArkAPLauncher(tk.Tk):
                        "PopTracker is, so the tracker pack goes in the right place."),
 
             ("h1", "Reporting a problem"),
-            ("bullet", "Click \"Export diagnostics\" next to Save on the Configuration "
-                       "tab."),
+            ("bullet", "Click \"Export diagnostics\" in the bar along the bottom of the "
+                       "window."),
             ("bullet", "It saves one .zip and opens the folder. Post that zip on Discord "
-                       "or attach it to a GitHub issue."),
+                       "(%s) or attach it to a GitHub issue." % DISCORD_INVITE_URL),
             ("bullet", "Your yaml is found by reading the name inside each file in your "
                        "Players folder and matching it to your slot, so what the file is "
                        "called does not matter."),
@@ -12305,7 +16976,8 @@ class ArkAPLauncher(tk.Tk):
 
             ("h1", "Other information"),
             ("bullet", "To start a new seed, click \"Full reset for new seed\" under Quick "
-                       "Launch. Stop the server and the connector first."),
+                       "Launch. Stop the server first (and the standalone connector, if you use "
+                       "one)."),
             ("bullet", "If you randomized dinos, stop the server. Click \"Patch Game.ini "
                        "for randomized creatures\" under Quick Launch. Restart the server."),
             ("bullet", "That button only works after you have connected to the server once "
@@ -12337,11 +17009,18 @@ class ArkAPLauncher(tk.Tk):
             ("bullet", "Setup Status shows a red X. Read the hint on that row and fix that "
                        "one thing."),
             ("bullet", "Still stuck. Click \"Export diagnostics\" and post the zip on "
-                       "Discord or GitHub."),
+                       "Discord (%s) or GitHub." % DISCORD_INVITE_URL),
         ]
 
-        self.instructions_text_quick = self._build_instruction_text(body, quick_content)
-        self.instructions_text_full = self._build_instruction_text(body, full_content)
+        # Two documents out of one source. The tab is reference material - what each
+        # tab does, the tips, the troubleshooting - while the setup walkthrough it used
+        # to open with is now the Get Started tab's job, and survives only in the Legacy
+        # Instructions window for when that tab doesn't get someone through.
+        self._instructions_content = {"quick": quick_content, "full": full_content}
+        self.instructions_text_quick = self._build_instruction_text(
+            body, _drop_sections(quick_content, LEGACY_ONLY_SECTIONS))
+        self.instructions_text_full = self._build_instruction_text(
+            body, _drop_sections(full_content, LEGACY_ONLY_SECTIONS))
         self._instructions_mode = "quick"
         self.instructions_text_quick._container.pack(fill="both", expand=True)
 
@@ -12358,13 +17037,22 @@ class ArkAPLauncher(tk.Tk):
         self.instructions_mode_btn.configure(
             text="Quick Guide" if self._instructions_mode == "full" else "Full Guide")
 
-    def _build_instruction_text(self, parent, content):
+    def _build_instruction_text(self, parent, content, shared=None):
         """Shared renderer for both guides. Returns the Text widget, with its own
         container frame (Text + Scrollbar) stashed as `_container` so the caller can
         pack/pack_forget the pair as a unit, and its three collapse-state maps stashed
         as `_instr_vars` so each guide keeps independent state (tags are per-widget, so
-        the names can repeat between the two guides)."""
+        the names can repeat between the two guides).
+
+        `shared` is another Text's `_instr_shared`: a {stable key -> var} map, keyed by
+        heading (and step title) rather than by position, so the pop-out guide stays in
+        step with the tab - tick a box in either and both fold - even though the two show
+        different sets of sections (the tab drops LEGACY_ONLY_SECTIONS). A section only
+        one of them has simply gets a var of its own."""
         container = ttk.Frame(parent)
+        traces = []   # (var, trace name) - removed when this Text goes (see below)
+        shared = {} if shared is None else shared
+        stable = {}   # stable key -> var, for the next Text built from this content
 
         txt = tk.Text(container, wrap="word", font=("Segoe UI", 9), borderwidth=0,
                        highlightthickness=0, padx=10, pady=8, cursor="arrow",
@@ -12412,8 +17100,10 @@ class ArkAPLauncher(tk.Tk):
         step_counter = 0
 
         for s, (h1_text, items) in enumerate(sections):
-            section_var = tk.BooleanVar(value=False)   # False = expanded
             mark_tag = "instr_sect_%d" % s             # marker only (no elide)
+            sect_key = "sect::%s" % h1_text
+            section_var = shared.get(sect_key) or tk.BooleanVar(value=False)  # False = open
+            stable[sect_key] = section_var
             body_tag_sect = "instr_sectbody_%d" % s    # elide = section collapsed
             section_vars[mark_tag] = section_var
 
@@ -12436,7 +17126,9 @@ class ArkAPLauncher(tk.Tk):
                     body_tag = "instr_step_body_%d" % step_counter
                     label_tag = "instr_step_label_%d" % step_counter
                     step_counter += 1
-                    step_var = tk.BooleanVar(value=False)
+                    step_key = "step::%s::%s" % (h1_text, step_lines[0][1][:40])
+                    step_var = shared.get(step_key) or tk.BooleanVar(value=False)
+                    stable[step_key] = step_var
                     step_vars[body_tag] = step_var
                     step_label_vars[label_tag] = step_var
 
@@ -12483,18 +17175,32 @@ class ArkAPLauncher(tk.Tk):
                 for stv, bt, lt in steps:
                     txt.tag_configure(bt, elide=collapsed or stv.get())
                     txt.tag_configure(lt, elide=collapsed or (not stv.get()))
-            section_var.trace_add("write", lambda *_a, f=_apply_section: f())
+            traces.append((section_var, section_var.trace_add(
+                "write", lambda *_a, f=_apply_section: f())))
 
             for stv, bt, lt in section_steps:
                 def _apply_step(*_a, sv=section_var, stv=stv, bt=bt, lt=lt):
                     collapsed = sv.get()
                     txt.tag_configure(bt, elide=collapsed or stv.get())
                     txt.tag_configure(lt, elide=collapsed or (not stv.get()))
-                stv.trace_add("write", _apply_step)
+                traces.append((stv, stv.trace_add("write", _apply_step)))
 
             _apply_section()  # set the initial (fully-expanded) elide state
 
         txt._instr_vars = (section_vars, step_vars, step_label_vars)
+        txt._instr_shared = stable
+
+        # Shared vars outlive a closed pop-out; their traces would then reconfigure a
+        # destroyed widget on the next tick in the tab and raise.
+        def _drop_traces(event):
+            if event.widget is txt:
+                for var, name in traces:
+                    try:
+                        var.trace_remove("write", name)
+                    except tk.TclError:
+                        pass
+                traces.clear()
+        txt.bind("<Destroy>", _drop_traces, add="+")
         txt.configure(state="disabled")
         return txt
 
@@ -12508,15 +17214,91 @@ class ArkAPLauncher(tk.Tk):
         for var in step_vars.values():
             var.set(collapsed)
 
+    def _instruction_texts(self):
+        """Every live guide Text: the tab's two, plus the pop-out's two while it's open."""
+        texts = [getattr(self, "instructions_text_quick", None),
+                 getattr(self, "instructions_text_full", None)]
+        win = getattr(self, "_instructions_popout", None)
+        if win is not None:
+            texts += [win.texts["quick"], win.texts["full"]]
+        return [t for t in texts if t is not None]
+
+    def _open_instructions_popout(self):
+        """The Legacy Instructions: the WHOLE guide, including the setup walkthrough the
+        tab no longer shows (LEGACY_ONLY_SECTIONS), in a window of its own. Built from the
+        same content with the tab's collapse vars (see `shared` in
+        _build_instruction_text), so a section both of them show folds in both. Quick/Full
+        is per window - the Full guide beside you and the Quick one in the tab is a
+        reasonable way to work. One window at a time."""
+        win = getattr(self, "_instructions_popout", None)
+        if win is not None:
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
+        win = self._themed_toplevel("ARKIpelago Launcher - %s" % LEGACY_GUIDE_LABEL,
+                                    resizable=True)
+        # A window of its own (taskbar entry, minimisable, can go behind the launcher),
+        # not a dialog pinned over it - the point is to sit beside the app.
+        win.wm_transient("")
+        self._instructions_popout = win
+
+        def _closed():
+            self._instructions_popout = None
+            win.destroy()
+        win.close = _closed
+        win.protocol("WM_DELETE_WINDOW", _closed)
+
+        toolbar = ttk.Frame(win, padding=(10, 8, 10, 4))
+        toolbar.pack(fill="x")
+        body = ttk.Frame(win, padding=(10, 0, 10, 8))
+        body.pack(fill="both", expand=True)
+        win.texts = {
+            "quick": self._build_instruction_text(
+                body, self._instructions_content["quick"],
+                shared=self.instructions_text_quick._instr_shared),
+            "full": self._build_instruction_text(
+                body, self._instructions_content["full"],
+                shared=self.instructions_text_full._instr_shared),
+        }
+        win.mode = self._instructions_mode
+
+        def _swap():
+            win.texts[win.mode]._container.pack_forget()
+            win.mode = "full" if win.mode == "quick" else "quick"
+            win.texts[win.mode]._container.pack(fill="both", expand=True)
+            mode_btn.configure(text="Quick Guide" if win.mode == "full" else "Full Guide")
+
+        ttk.Button(toolbar, text="Expand all", command=lambda: self._set_all_instructions(
+            False, win.texts[win.mode])).pack(side="left")
+        ttk.Button(toolbar, text="Collapse all", command=lambda: self._set_all_instructions(
+            True, win.texts[win.mode])).pack(side="left", padx=(6, 0))
+        mode_btn = ttk.Button(toolbar, command=_swap,
+                              text="Quick Guide" if win.mode == "full" else "Full Guide")
+        mode_btn.pack(side="right")
+        win.texts[win.mode]._container.pack(fill="both", expand=True)
+        self._tag_instruction_examples()
+
+        # Beside the launcher, not on top of it: to its right if the screen has room,
+        # else against the screen's right edge.
+        self.update_idletasks()
+        w, h = 560, max(self.winfo_height(), 500)
+        x = self.winfo_rootx() + self.winfo_width() + 8
+        if x + w > self.winfo_screenwidth():
+            x = max(0, self.winfo_screenwidth() - w)
+        win.geometry("%dx%d+%d+%d" % (w, h, x, max(0, self.winfo_rooty() - 30)))
+
     def _tag_instruction_examples(self):
         """Grey out the sample paths in the Instructions prose so they read as
         examples, not as paths this install actually uses - same colour as an
         empty field's placeholder. Re-run on theme toggle (see _retheme_widgets)
-        because a Text tag's colour is fixed at configure time."""
-        for txt in (getattr(self, "instructions_text_quick", None),
-                    getattr(self, "instructions_text_full", None)):
-            if txt is None:
-                continue
+        because a Text tag's colour is fixed at configure time.
+
+        Also makes the URLs written into that prose clickable - same pass, same reason
+        (a Text tag's colour and bindings are set at configure time, so both have to be
+        re-applied on a theme toggle)."""
+        for txt in self._instruction_texts():
+            self._tag_instruction_urls(txt)
             txt.tag_configure("example", foreground=self.theme["entry_placeholder_fg"])
             txt.tag_remove("example", "1.0", "end")
             # Longest snippet first: "C:\ARKServer" is a prefix of the nested-install
@@ -12530,6 +17312,34 @@ class ArkAPLauncher(tk.Tk):
                     end = "%s+%dc" % (pos, len(snippet))
                     txt.tag_add("example", pos, end)
                     idx = end
+
+    def _tag_instruction_urls(self, txt):
+        """Make every URL the guide prose spells out open in a browser on click. The text
+        keeps the URL visible rather than hiding it behind link text - people copy these
+        into a phone or another machine as often as they click them."""
+        txt.tag_configure("url", foreground=self.theme["link_fg"], underline=True)
+        txt.tag_remove("url", "1.0", "end")
+        for url in INSTRUCTION_LINK_URLS:
+            idx = "1.0"
+            while True:
+                pos = txt.search(url, idx, stopindex="end", exact=True, elide=True)
+                if not pos:
+                    break
+                end = "%s+%dc" % (pos, len(url))
+                txt.tag_add("url", pos, end)
+                idx = end
+        txt.tag_bind("url", "<Enter>", lambda _e, t=txt: t.configure(cursor="hand2"))
+        txt.tag_bind("url", "<Leave>", lambda _e, t=txt: t.configure(cursor="arrow"))
+        txt.tag_bind("url", "<Button-1>", lambda e, t=txt: self._open_tagged_url(t, e))
+
+    @staticmethod
+    def _open_tagged_url(txt, event):
+        """Open whichever URL was clicked - read back out of the text so one binding
+        serves every link in the guide."""
+        index = txt.index("@%d,%d" % (event.x, event.y))
+        span = txt.tag_prevrange("url", "%s+1c" % index)
+        if span:
+            webbrowser.open(txt.get(*span).strip())
 
     # ------------------------------------------------------------ settings --- #
     def _read_settings(self):
@@ -12582,7 +17392,8 @@ class ArkAPLauncher(tk.Tk):
         # and silently un-restore the banner.
         self._write_config_key(REMINDER_HIDE_KEY, False, "install reminder flag")
         self._hide_install_reminder = False
-        self._show_reminder_banner()
+        self._reminder_closed = False
+        self._update_reminder_banner()
         self._log("Restored %d hidden prompt(s)." % count)
         messagebox.showinfo(
             "Settings",
@@ -12645,7 +17456,9 @@ class ArkAPLauncher(tk.Tk):
         pack_forget() only unmaps it - the banner is still its parent's first child - so
         a plain pack() would put it back at the BOTTOM, under every field group. Packing
         it before the first other child restores its original position."""
-        if self.reminder_banner.winfo_ismapped():
+        # winfo_manager, not winfo_ismapped: on any other tab the banner is packed but
+        # unmapped, and re-packing it then would be a pointless re-layout.
+        if self.reminder_banner.winfo_manager():
             return
         others = [w for w in self.reminder_banner.master.winfo_children()
                   if w is not self.reminder_banner]
@@ -12658,9 +17471,27 @@ class ArkAPLauncher(tk.Tk):
             pass
 
     def _goto_install_tab(self):
-        self.notebook.select(self.tab_install)
+        self._show_install_tab()
+
+    def _update_reminder_banner(self):
+        """Show the "no server yet" banner only while it's true: no ARK server installed
+        in SERVER_ROOT (check_ark_server_installed - the same test Setup Status and the
+        Mods tab use), and the user hasn't closed it this session or hidden it for good.
+        Run from the same places as the Mods tab's visibility, so a server appearing
+        (install finished, SERVER_ROOT changed, auto-detect) makes it go away on its own."""
+        if not hasattr(self, "reminder_banner"):
+            return
+        want = (not self._hide_install_reminder and not self._reminder_closed
+                and not check_ark_server_installed(self.get("SERVER_ROOT"))[0])
+        if want:
+            self._show_reminder_banner()
+        elif self.reminder_banner.winfo_manager():
+            self.reminder_banner.pack_forget()
 
     def _dismiss_reminder(self):
+        """Close: gone for this session. It would otherwise come straight back on the next
+        status refresh, since the server still isn't there."""
+        self._reminder_closed = True
         self.reminder_banner.pack_forget()
 
     def _dismiss_reminder_forever(self):
@@ -12825,6 +17656,9 @@ class ArkAPLauncher(tk.Tk):
         # reminder next to the title instead of blending into it.
         style.configure("SaveHint.TLabel", background=t["warn_bg"],
                         foreground=t["warn_fg"])
+        # Get Started's text links - a style so the theme toggle repaints the ones
+        # built once (the footer) along with the ones rebuilt on every refresh.
+        style.configure("Link.TLabel", foreground=t["link_fg"])
         # The wash behind the whole chip (text + the Save button inside it). Configured
         # here with everything else so the light/dark toggle repaints it for free.
         style.configure("SaveHint.TFrame", background=t["warn_bg"])
@@ -12868,8 +17702,7 @@ class ArkAPLauncher(tk.Tk):
         # self.mods_log was missing from this list, so the Mods tab's output pane kept
         # the previous theme's colours - a white slab in dark mode.
         for widget in (self.log, self.install_log, self.mods_log, self.debug_log_text,
-                       self.instructions_text_quick, self.instructions_text_full,
-                       self.profile_notes_text):
+                       self.profile_notes_text, *self._instruction_texts()):
             try:
                 widget.configure(background=t["text_bg"], foreground=t["text_fg"],
                                   insertbackground=t["text_fg"])
@@ -12955,6 +17788,7 @@ class ArkAPLauncher(tk.Tk):
         # read colors from self.theme at build time, so re-running it is the
         # simplest correct fix rather than hunting down each child widget.
         self._refresh_setup_status()
+        self._render_server_state()     # the footer light's colour is per-theme
         # Mod rows are plain tk.Frame/tk.Label built from self.theme in _build_mod_row,
         # so they need the same treatment for the same reason - without this the whole
         # mod list keeps the old row backgrounds.
@@ -12986,6 +17820,7 @@ class ArkAPLauncher(tk.Tk):
         self.theme_toggle_btn.configure(text=self._theme_toggle_label())
         # The header button and the Settings-tab checkbox are two views of one state.
         self._sync_theme_setting()
+        self._raise_size_floors()     # dark mode needs more room than light
         if self._last_search_query:
             self._run_search(self._last_search_query)
 
@@ -13286,6 +18121,7 @@ class ArkAPLauncher(tk.Tk):
 
     def _on_app_close(self):
         self._stop_egg_music()
+        self._share_keep_on_close()
         self.destroy()
 
     def _load_window_icon(self):
@@ -13324,6 +18160,8 @@ class ArkAPLauncher(tk.Tk):
                                               title="Select file")
         if path:
             self.set(key, os.path.normpath(path))
+            if key == "SERVER_ROOT":
+                self._warn_server_root_location(self.get(key))
 
     def _clear_path_field(self, key):
         """The per-field "C" button: blanks just this one field back to its greyed
@@ -13545,7 +18383,11 @@ class ArkAPLauncher(tk.Tk):
         changed = {key for key, value in self._current_profile_snapshot().items()
                    if self._saved_values.get(key) != value}
         arch_dirty = bool(changed & ARCHIPELAGO_KEYS)
-        config_dirty = bool(changed - ARCHIPELAGO_KEYS)
+        # ...or the scripts on disk still hold older values than the fields do (set by
+        # _gather_setup_status from the same preflight Quick Launch refuses to start on).
+        # The Archipelago fields have no equivalent: they are written to the config JSON
+        # by this same Save and to nothing else, so there is no second copy to drift.
+        config_dirty = bool(changed - ARCHIPELAGO_KEYS) or self._config_disk_dirty
         self._set_halo(self.archipelago_save_btn_halo, arch_dirty)
         self._set_halo(self.save_btn_halo, config_dirty)
         self._fields_dirty = arch_dirty or config_dirty
@@ -13558,37 +18400,109 @@ class ArkAPLauncher(tk.Tk):
 
         Packed/unpacked rather than recoloured - it's a sentence, and a greyed-out one
         still reads as a nag. Nothing sits to its right in title_row (the header buttons
-        are packed side="right" on the row above), so it can't shift anything."""
-        want = self._fields_dirty or self._mods_dirty_flag or self._stacks_dirty_flag
+        are packed side="right" on the row above), so it can't shift anything.
+
+        Until the server is installed it points at Install ARK Server instead of Save. A
+        yellow "make sure to save!" the moment SERVER_ROOT was typed pulled people off the
+        install button, and saving then complained there was no server there - which read
+        as "an existing install is required" and sent them to their game folder. Hidden
+        altogether while an install runs; after it, the Save reminder is the right next
+        step (guide step 4)."""
+        # ponytail: stats SERVER_ROOT on every keystroke - trivial locally, slow while
+        # typing a UNC path. Debounce if network-share installs ever show up.
+        state = server_root_state(self.get("SERVER_ROOT"))
+        if self._install_thread is not None:
+            want = None
+        elif state in ("empty", "incomplete"):
+            want = "install"
+        elif self._fields_dirty or self._mods_dirty_flag or self._stacks_dirty_flag:
+            want = "save"
+        else:
+            want = None
         if want == self._save_hint_shown:
             return
-        if want:
-            self.save_hint_label.pack(side="left", padx=12)
-        else:
-            self.save_hint_label.pack_forget()
         self._save_hint_shown = want
+        if not want:
+            self.save_hint_label.pack_forget()
+            return
+        self._apply_save_hint_variant(want)
+        self.save_hint_label.pack(side="left", padx=12)
+
+    def _apply_save_hint_variant(self, want):
+        """Put one SAVE_HINT_VARIANTS wording into the chip. Separate from
+        _update_save_hint so _lock_initial_size can measure every wording before the
+        window is sized - the chip is 95px wider in its "install" wording, which is the
+        one a fresh install shows, and sizing to the other one clipped it."""
+        spec = SAVE_HINT_VARIANTS.get(want)
+        if spec is None:
+            return
+        text, btn_text, btn_width, command, tip = spec
+        self.save_hint_text.configure(text=text)
+        self.save_hint_btn.configure(text=btn_text, width=btn_width,
+                                     command=getattr(self, command))
+        self.save_hint_tip.text = tip
 
     def _on_save_hint_click(self):
-        """The header hint's own Save: writes every section that is currently unsaved,
-        so the shortcut works even when more than one is. Reuses the exact per-section
-        verdicts the hint is drawn from (_update_save_hint) rather than re-deriving
-        them - on_save covers the Configuration AND Archipelago Setup fields (one
-        config JSON, one write), which leaves the Mods list and the stack settings as the
-        separate ones. Each one clears its own halo, so the hint disappears on its own.
+        """The header chip's Save: every section that needs saving, through the same
+        routine as every other Save button (save_sections).
 
-        Increase stacks goes last because it's the only one that can put a dialog up (a
-        confirm, or the refusal if the ARK server is running) - the silent writes are all
-        done by then."""
-        if self._fields_dirty:
+        The verdicts are re-read from disk FIRST. The chip used to act on cached ones,
+        and one of them - "the scripts on disk lag the fields" (_config_disk_dirty) - was
+        only ever refreshed by a Setup Status redraw: the click saved, nothing re-read
+        the scripts, and the chip stayed lit as if the save had failed. (Get Started's
+        Save happened to redraw afterwards, which is why only it seemed to work.)
+
+        If, re-read, nothing is pending after all, the fields are saved anyway: a shown
+        chip is a promise, and a click on it must never quietly do nothing."""
+        self._refresh_save_verdicts()
+        fields, mods, stacks = self._fields_dirty, self._mods_dirty_flag, self._stacks_dirty_flag
+        if not (fields or mods or stacks):
+            fields = True
+        self.save_sections(fields=fields, mods=mods, stacks=stacks)
+
+    # ------------------------------------------------------------- saving ------- #
+    def save_sections(self, fields=False, mods=False, stacks=False):
+        """THE save routine. Every Save button ends up here, naming the section(s) it
+        owns: the header chip (whatever is pending), Configuration and Archipelago
+        Setup (fields - one config JSON and the scripts), Mods (ActiveMods), Increase
+        stacks' Apply (the two ini files), and Get Started's Save steps.
+
+        It writes those, then re-reads what's actually on disk (_refresh_save_verdicts)
+        before any halo, the header chip or Setup Status decides whether a Save is still
+        needed - so no Save path can leave a stale "unsaved" behind, which is the whole
+        bug this replaced. Increase stacks goes last: it's the only one that can put up
+        a dialog (a confirm, or the refusal while the server runs)."""
+        if fields:
             self.on_save()
-        if self._mods_dirty_flag:
+        if mods:
             self.on_mods_save()
-        if self._stacks_dirty_flag:
+        if stacks:
             self.apply_stack_settings()
+        self._refresh_save_verdicts()
+
+    def save_fields(self):
+        self.save_sections(fields=True)
+
+    def save_mods(self):
+        self.save_sections(mods=True)
+
+    def save_stacks(self):
+        self.save_sections(stacks=True)
+
+    def _refresh_save_verdicts(self):
+        """Every "does this need saving?" answer, re-read from disk now: the stack
+        settings against the two ini files, then (via the Setup Status pass) the scripts
+        against the fields and ActiveMods against the Mods list - which also relights
+        every halo, the header chip, Setup Status and Get Started from those answers."""
+        self._update_stacks_dirty()
+        self._refresh_setup_status()
 
     def _on_field_changed(self):
         self._update_profile_status()
         self._update_save_highlights()
+        self._update_mods_tab_visibility()
+        self._update_reminder_banner()
+        self._schedule_status_refresh()
 
     def on_save(self):
         self._clear_log()
@@ -13747,7 +18661,8 @@ class ArkAPLauncher(tk.Tk):
         toggle/reorder/add, and a stored profile sharing those dicts would quietly
         rewrite itself afterwards."""
         return {"stacks": self._stacks_settings(),
-                "mods": [dict(mod) for mod in self._mods]}
+                "mods": [dict(mod) for mod in self._mods],
+                AP_ROLE_KEY: self._role_state()}
 
     def _profile_record(self, notes=None):
         """One profile exactly as it is stored. Every write path goes through this, so a
@@ -14029,6 +18944,9 @@ class ArkAPLauncher(tk.Tk):
                 self._apply_profile_stacks(profile["stacks"])
             if isinstance(profile.get("mods"), list):
                 self._apply_profile_mods(profile["mods"])
+            if isinstance(profile.get(AP_ROLE_KEY), dict):
+                self.ap_role_var.set(str(profile[AP_ROLE_KEY].get("role") or ""))
+                self.ap_yaml_by_var.set(str(profile[AP_ROLE_KEY].get("yaml_by") or ""))
         notes = profile.get("notes", "")
         self.profile_notes_text.delete("1.0", "end")
         self.profile_notes_text.insert("1.0", notes)
@@ -14386,11 +19304,264 @@ class ArkAPLauncher(tk.Tk):
                 self._set_scan_busy(False)
         else:
             self._set_scan_busy(False)
+            # Worded for the usual case - nothing installed yet - rather than as a failure:
+            # "none found, enter it manually" read as "you need an existing install".
             self._set_scan_status(
-                "No ARK server install found automatically - enter SERVER_ROOT manually.")
-            self._log("Auto-detect: no ARK server install found in common locations.")
+                "No ARK server installed yet - that's normal. Set SERVER_ROOT to an empty "
+                "folder and use Install ARK Server.")
+            self._log("Auto-detect: no ARK server install found in common locations - "
+                      "expected before the install. Set SERVER_ROOT to an empty folder "
+                      "and use Install Server/Api/Plugin -> Install ARK Server.")
 
     # ------------------------------ SERVER_ROOT-scoped scan ("Scan for paths") - #
+    # -------------------------------------------- Setup Status fixes ------ #
+    # Every fix below keeps the same contract, which is what makes the button safe to
+    # press before reading the hint: it confirms first, naming the exact old and new
+    # value of everything it will touch; it only ever changes launcher fields and
+    # CREATES folders - nothing is deleted, nothing is moved, and where a change would
+    # leave data stranded at the old location the confirmation says so and lets the user
+    # decide; it leaves the result unsaved so the Save halo lights exactly as it does
+    # for a hand edit (auto-saving here would break the contract every other part of the
+    # app keeps); it logs both values so a later diagnostics export shows what changed;
+    # and it re-runs the checks so the row updates without a manual Re-check.
+    #
+    # A fix that cannot complete reports why and leaves the fields as they were, rather
+    # than applying the half of itself that would have worked.
+
+    def _fix_unavailable(self, title, why):
+        self._log("%s: not applied - %s" % (title, why))
+        messagebox.showerror(title, why)
+
+    def _fix_cluster_paths(self):
+        """"Cluster folders belong to a different ARK install" -> re-derive all three
+        from the current SERVER_ROOT, create them, and put them in the fields.
+
+        Re-derives which keys are wrong at click time (foreign_cluster_paths) instead of
+        trusting the row, then blanks just those so create_cluster_folders - the same
+        routine behind the "Create ServerCluster folders" button and the post-install
+        hook - refills them from default_cluster_paths(). A cluster field that is
+        already fine is left exactly as it is."""
+        title = "Fix cluster folders"
+        root = self.get("SERVER_ROOT")
+        if not root:
+            self._fix_unavailable(
+                title, "SERVER_ROOT is not set, so there is nothing to derive the "
+                       "cluster folders from. Set it on the Configuration tab first.")
+            return
+        planned = default_cluster_paths(root)
+        bad = foreign_cluster_paths(root, {k: self.get(k) for k in CROSS_CHECK_PATH_KEYS})
+        moves = [(key, self.get(key), planned.get(key, "")) for key, _v, _o in bad]
+        if not moves:
+            self._log("%s: nothing to do - the cluster paths already sit under %s."
+                      % (title, root))
+            self._refresh_setup_status()
+            return
+        if not all(new for _k, _old, new in moves):
+            self._fix_unavailable(
+                title, "Could not work out where these folders belong from "
+                       "SERVER_ROOT (%s)." % plain_path(root))
+            return
+
+        body = ("These cluster folders point into a different ARK install. Re-point "
+                "them at the one SERVER_ROOT names?\n\n%s\n\nSERVER_ROOT\n    %s\n\n"
+                "The new folders are created if they are not there yet. Nothing at the "
+                "old locations is moved, changed or deleted - any world saves and "
+                "cluster data already there STAY THERE, and the server starts with an "
+                "empty cluster until you copy them across yourself.\n\n"
+                "The fields change but are not saved - press Save afterwards."
+                % ("\n\n".join("%s\n    from  %s\n    to    %s"
+                               % (key, plain_path(old), plain_path(new))
+                               for key, old, new in moves),
+                   plain_path(root)))
+        if not messagebox.askyesno(title, body):
+            self._log("%s: cancelled." % title)
+            return
+
+        for key, _old, _new in moves:
+            self.set(key, "")
+        created, existing, failed, _filled = self.create_cluster_folders(root)
+        touched = {key for key, _o, _n in moves}
+        broke = [(key, why) for key, why in failed if key in touched]
+        for key, old, new in moves:
+            self._log("%s: %s\n    was %s\n    now %s" % (title, key, old, new))
+        for line in created:
+            self._log("  created  %s" % line)
+        for line in existing:
+            self._log("  existed  %s" % line)
+        if broke:
+            # Put back what we blanked: a field pointing at the old install is wrong,
+            # but an empty one loses the only record of where the data actually is.
+            broke_keys = {key for key, _why in broke}
+            for key, old, _new in moves:
+                if key in broke_keys:
+                    self.set(key, old)
+                    self._log("%s: %s could not be created - left at %s"
+                              % (title, key, old))
+            messagebox.showerror(
+                title,
+                "These folders could not be created, so those fields were left "
+                "pointing where they were:\n\n%s\n\nPick a location you can write to "
+                "(Browse next to each field on the Configuration tab), then try again."
+                % "\n".join("%s -> %s" % (k, w) for k, w in broke))
+            return
+        messagebox.showinfo(
+            title,
+            "Done. The cluster fields now point under SERVER_ROOT:\n\n%s\n\nPress Save "
+            "so the .bat scripts pick them up. Anything you want to keep from the old "
+            "location has to be copied across by hand - nothing was moved."
+            % "\n".join("%s -> %s" % (key, plain_path(new)) for key, _o, new in moves))
+
+    def _game_ini_fix_target(self):
+        """Where Game.ini belongs for the configured SERVER_ROOT, or "" without one."""
+        cfg = self._server_config_dir()
+        return os.path.join(cfg, "Game.ini") if cfg else ""
+
+    def _game_ini_fix_available(self):
+        """True when pointing game_ini at its proper place would actually change
+        something. Guards the button on both Game.ini rows: with the field already on
+        the right path (a client config copied INTO the server install, say) there is
+        nothing this fix can do, and offering a button that no-ops is worse than none."""
+        target = self._game_ini_fix_target()
+        if not target:
+            return False
+        current = self.get("game_ini")
+        return (os.path.normcase(os.path.normpath(current)) if current else "") \
+            != os.path.normcase(os.path.normpath(target))
+
+    def _fix_game_ini_path(self):
+        """Both Game.ini rows - outside SERVER_ROOT, and "that is a client config" ->
+        point the field at <SERVER_ROOT>\\ShooterGame\\Saved\\Config\\WindowsServer\\
+        Game.ini. One handler because the correct answer is the same either way.
+
+        A target that does not exist yet is still set rather than refused: ARK writes
+        that file the first time the server runs, and leaving the field aimed at the
+        wrong install until then is strictly worse than pointing at a file that is about
+        to appear."""
+        title = "Fix Game.ini path"
+        root = self.get("SERVER_ROOT")
+        if not root:
+            self._fix_unavailable(
+                title, "SERVER_ROOT is not set, so there is nowhere to point Game.ini. "
+                       "Set it on the Configuration tab first.")
+            return
+        target = self._game_ini_fix_target()
+        old = self.get("game_ini")
+        old_shown = plain_path(old) if old else "(not set - using %s)" % plain_path(
+            self._game_ini_path())
+        if not self._game_ini_fix_available():
+            self._log("%s: nothing to do - already %s." % (title, plain_path(target)))
+            self._refresh_setup_status()
+            return
+
+        exists = os.path.isfile(ext_path(target))
+        body = ("Point the Game.ini field at the one inside SERVER_ROOT?\n\n"
+                "    from  %s\n    to    %s\n\n%s\n\nThe file at the old path is not "
+                "changed, moved or deleted - anything the launcher wrote into it stays "
+                "there, and is worth undoing by hand if it was your game's own config."
+                "\n\nThe field changes but is not saved - press Save afterwards."
+                % (old_shown, plain_path(target),
+                   "That file is there already." if exists else
+                   "That file does not exist yet - ARK writes it the first time the "
+                   "server runs, and the launcher will use it from then on. Nothing is "
+                   "created now."))
+        if not messagebox.askyesno(title, body):
+            self._log("%s: cancelled." % title)
+            return
+        self.set("game_ini", target)
+        self._log("%s: game_ini\n    was %s\n    now %s%s"
+                  % (title, old_shown, target,
+                     "" if exists else "  (not on disk yet - ARK creates it on first run)"))
+        entry = self._entries.get("game_ini")
+        if entry is not None:
+            self._reveal_group_for_widget(entry)
+        self._refresh_setup_status()
+        messagebox.showinfo(
+            title,
+            "Done - Game.ini now points at:\n\n%s\n\n%sPress Save so the scripts pick "
+            "it up."
+            % (plain_path(target),
+               "" if exists else "It appears the first time the ARK server runs.\n\n"))
+
+    def _fix_server_branch(self):
+        """"ARK server is on the ... branch" (fail or advisory) -> Install ARK Server,
+        the only thing that runs app_update and the stated remedy either way: on a real
+        mismatch it re-installs the right branch/build, and on an unreadable manifest it
+        re-saves a fresh one SteamCMD can be trusted to have written. Switches to the
+        Install tab first so the run's progress and log are visible; on_install_server
+        already confirms SERVER_ROOT and guards against a second install running."""
+        self._show_install_tab()
+        self.on_install_server()
+
+    def _warn_server_root_location(self, root, confirm=False):
+        """Set-time guard for the wrong-folder mistakes Setup Status also flags, raised
+        where the path is CHOSEN rather than only where it's audited - an 18 GB download
+        landing somewhere it can never work costs a great deal more than a dialog, and
+        the drift below is a great deal easier to understand at the moment it appears
+        than three tabs away once everything has been saved against it.
+
+        Returns True to go ahead. With confirm=True (the Install button) the user has to
+        answer yes; everywhere else it's a plain heads-up that always returns True -
+        typing a path is not the point of no return, and refusing the value would trap
+        anyone mid-edit. Repeats are suppressed per path, so browsing to a folder and
+        then clicking away to another tab doesn't ask about the same folder twice."""
+        if not root:
+            return True
+        problems = []
+        if server_root_state(root) == "client":
+            problems.append(
+                "This is your ARK: Survival Evolved GAME install, not a dedicated server."
+                "\n\n%s\n\nThe launcher doesn't use an existing install. SERVER_ROOT "
+                "should be an empty folder of its own - E:\\ARKServer, say - and Install "
+                "ARK Server downloads the dedicated server into it. Left here, the server, "
+                "ArkApi and the plugin would all go into your game's files."
+                % plain_path(root))
+        in_pf, detail = check_path_in_program_files(root)
+        if in_pf:
+            problems.append(
+                "This folder is administrator-only.\n\n%s\n\nThe server writes its "
+                "saves, configs and logs inside SERVER_ROOT the whole time it runs. "
+                "Those writes fail here, so the server exits during startup - and the "
+                "download into it will usually fail the same way.\n\nUse an empty "
+                "folder you own instead, outside Steam and outside Program Files - "
+                "E:\\ARKServer, say." % detail)
+
+        # Pointing SERVER_ROOT at a different install leaves every other path field
+        # aimed at the old one, and each keeps working - against the wrong install. Asked
+        # as "are these still right?" rather than compared against the previous value: it
+        # needs no before/after state, and it catches the drift however it arrived, not
+        # only when this launcher was the thing that moved SERVER_ROOT.
+        stale = foreign_install_paths(root, {k: self.get(k)
+                                             for k in CROSS_CHECK_PATH_KEYS})
+        if stale:
+            problems.append(
+                "These paths still point into a different ARK install:\n\n%s\n\nThey "
+                "were set for the install SERVER_ROOT used to name. Left as they are, "
+                "the server writes its saves and cluster data into the other install "
+                "and the two worlds drift apart, with no error from either.\n\nFix: "
+                "\"Create %s folders\" resets the cluster paths under the new "
+                "SERVER_ROOT, and \"Scan for paths\" re-derives the rest. Copy any "
+                "saves you want to keep across by hand first - neither button moves "
+                "data."
+                % ("\n".join("    %-11s %s" % (key, plain_path(value))
+                              for key, value, _other in stale),
+                   CLUSTER_ROOT_DIRNAME))
+        if not problems:
+            return True
+        self._log("SERVER_ROOT warning for %s: %s"
+                  % (root, " | ".join(p.replace("\n", " ") for p in problems)))
+        # Each problem carries its own fix - they need different ones, and a single
+        # trailing "move it somewhere you own" was wrong advice for the drift case.
+        text = "\n\n".join(problems)
+        if confirm:
+            return messagebox.askyesno("SERVER_ROOT",
+                                       text + "\n\nInstall into this folder anyway?",
+                                       default="no")
+        key = os.path.normpath(root).lower()
+        if key != self._last_server_root_warning:
+            self._last_server_root_warning = key
+            messagebox.showwarning("SERVER_ROOT", text)
+        return True
+
     def _on_server_root_focus_out(self, _event=None):
         root = self.get("SERVER_ROOT")
         # Normalized both sides: _scoped_scan stores the normpath'd root, so comparing
@@ -14404,6 +19575,10 @@ class ArkAPLauncher(tk.Tk):
         # focus change must never silently kick off a minute-long walk. The
         # explicit "Scan for paths" button is what runs Thorough/Exhaustive.
         self._scoped_scan(level=SCAN_QUICK)
+        # After the scan, not before: it re-derives the other paths for the new root, so
+        # warning first would report drift that the very next line is about to fix. Quick
+        # runs synchronously, and focus-out only ever runs Quick.
+        self._warn_server_root_location(root)
 
     def _on_scan_button(self):
         """The single "Scan for paths" button: finds every Configuration path in one
@@ -14418,12 +19593,25 @@ class ArkAPLauncher(tk.Tk):
             self._log("Scan for paths: a scan is already running.")
             return
         level = self._current_scan_level()
-        root = self.get("SERVER_ROOT")
-        if root and os.path.isfile(os.path.join(os.path.normpath(root), ARK_EXE_RELPATH)):
+        root = os.path.normpath(self.get("SERVER_ROOT") or ".")
+        state = server_root_state(self.get("SERVER_ROOT") and root)
+        if state == "nested":
+            root = os.path.normpath(nested_server_root(root))
+            self._log("Scan for paths: the server is one folder down - SERVER_ROOT -> %s"
+                      % root)
+            self.set("SERVER_ROOT", root)
+            state = "installed"
+        if state == "installed":
             self._scoped_scan(level=level, manual=True)
             return
-        self._log("Scan for paths: SERVER_ROOT isn't set (or doesn't look right yet) - "
-                  "looking for the ARK server install first...")
+        if state != "unset":
+            # A folder the user chose. Searching the drives for some other install would
+            # override it (and could land on the game), and "found nothing" read as "an
+            # existing install is required".
+            self._note_server_root_state(root, state, explicit=True)
+            return
+        self._log("Scan for paths: SERVER_ROOT isn't set - looking for an ARK server "
+                  "install first...")
         self._pending_scan_level = level
         self._start_auto_detect()
 
@@ -14455,14 +19643,9 @@ class ArkAPLauncher(tk.Tk):
         root = os.path.normpath(root)
         self._last_scoped_scan_root = root
 
-        exe = os.path.join(root, ARK_EXE_RELPATH)
-        if not os.path.isfile(exe):
-            self._log("Scan for paths: SERVER_ROOT doesn't look right - expected:\n  %s" % exe)
-            messagebox.showwarning(
-                "ARKIpelago Launcher",
-                "SERVER_ROOT doesn't look right - ShooterGameServer.exe was not found at:\n\n"
-                "%s\n\nDouble check the path (it should be the folder that directly contains "
-                "'ShooterGame')." % exe)
+        state = server_root_state(root)
+        if state != "installed":
+            self._note_server_root_state(root, state)
             return
 
         if level == SCAN_QUICK:
@@ -14482,6 +19665,46 @@ class ArkAPLauncher(tk.Tk):
             target=self._scan_worker, args=(root, level), daemon=True)
         self._scan_thread.start()
         self.after(150, self._poll_scan_queue)
+
+    def _note_server_root_state(self, root, state, explicit=False):
+        """Say what SERVER_ROOT holds when it isn't a server install (yet).
+
+        "Nothing here yet" is the normal state before Install ARK Server, so it is never
+        worded as a problem, and leaving the field puts up no dialog for it: that dialog
+        used to say ShooterGameServer.exe was missing, and as a modal it could also eat
+        the very click on Install ARK Server the user was making. The header chip points
+        at the install instead (_update_save_hint). An explicit "Scan for paths" gets an
+        answer and an offer to go there."""
+        if state == "client":
+            # The set-time warning (_warn_server_root_location) carries the explanation.
+            self._set_scan_status("SERVER_ROOT is your ARK game install - see the warning.")
+            if explicit:
+                self._last_server_root_warning = None  # asked for, so say it again
+                self._warn_server_root_location(root)
+            return
+        if state == "nested":
+            nested = nested_server_root(root)
+            msg = ("SERVER_ROOT is one folder too high - the server is in:\n\n%s\n\n"
+                   "Point SERVER_ROOT there, or press \"Scan for paths\" and it's done for "
+                   "you." % plain_path(nested))
+            self._log(msg.replace("\n\n", " "))
+            self._set_scan_status("The server is one folder down - see the log.")
+            messagebox.showwarning("SERVER_ROOT", msg)
+            return
+        if state == "incomplete":
+            msg = ("An install into %s started but didn't finish. Next: Install "
+                   "Server/Api/Plugin tab -> Install ARK Server again - SteamCMD picks up "
+                   "where it stopped." % plain_path(root))
+            short = "Install not finished - next: Install ARK Server again."
+        else:
+            msg = ("Nothing is installed in %s yet - that's expected, the launcher "
+                   "downloads the server there. Next: Install Server/Api/Plugin tab -> "
+                   "Install ARK Server." % plain_path(root))
+            short = "Nothing installed in SERVER_ROOT yet - next: Install ARK Server."
+        self._log(msg)
+        self._set_scan_status(short)
+        if explicit and messagebox.askyesno("Scan for paths", msg + "\n\nGo there now?"):
+            self._goto_install_tab()
 
     def _scan_worker(self, root, level):
         q = self._scan_queue
@@ -14838,7 +20061,13 @@ class ArkAPLauncher(tk.Tk):
         if not server_root:
             messagebox.showwarning("ARKIpelago Launcher", "Set SERVER_ROOT first.")
             return
+        if not self._warn_server_root_location(server_root, confirm=True):
+            self._log("Install ARK Server: cancelled at the SERVER_ROOT warning.")
+            return
+        if not self._install_preflight(server_root):
+            return
 
+        self._install_saw_paused = False    # SteamCMD's "state is 0x202" - see _poll
         self.install_log.configure(state="normal")
         self.install_log.delete("1.0", "end")
         self.install_log.configure(state="disabled")
@@ -14857,7 +20086,54 @@ class ArkAPLauncher(tk.Tk):
         self._install_thread = threading.Thread(
             target=self._install_worker, args=(server_root,), daemon=True)
         self._install_thread.start()
+        self._update_save_hint()  # no chip while the download runs
         self.after(100, self._poll_install_queue)
+
+    def _install_preflight(self, server_root):
+        """The two things that make SteamCMD end in "state is 0x202" (update paused),
+        checked BEFORE a 20 GB job starts rather than explained after it fails: a server
+        from this SERVER_ROOT still running (it holds the DLLs SteamCMD must replace - a
+        crashed one sitting on its error dialog counts), and a drive without room.
+        Returns True to go ahead."""
+        title = "Install ARK Server"
+        ours = processes_under_root(server_processes(), server_root)
+        if ours:
+            listed = "\n".join("    PID %d  %s" % (pid, path or "(folder unknown)")
+                               for pid, path in ours)
+            self._log("%s: refused - a server from this SERVER_ROOT is running:\n%s"
+                      % (title, listed))
+            if messagebox.askyesno(
+                    title,
+                    "A ShooterGameServer.exe from this SERVER_ROOT is still running:\n\n%s"
+                    "\n\nSteamCMD can't replace files a running server holds open, so the "
+                    "install would stop part-way (\"state is 0x202\"). A server that "
+                    "crashed and is sitting on its error dialog counts too.\n\nStop it "
+                    "now, then start the install? (The world is saved first if the server "
+                    "still answers; if it doesn't, you'll be asked before anything is "
+                    "force-closed.)" % listed, icon="warning"):
+                self._stop_server(pids=[pid for pid, _p in ours], then=self.on_install_server)
+            return False
+
+        installed = check_ark_server_installed(server_root)[0]
+        need_gb = ARK_SERVER_UPDATE_NEEDS_GB if installed else ARK_SERVER_FRESH_NEEDS_GB
+        free = free_bytes_at(server_root)
+        if free is not None and free < need_gb * 1024 ** 3:
+            drive = os.path.splitdrive(os.path.abspath(server_root))[0] or server_root
+            self._log("%s: only %.1f GB free on %s (needs about %d GB)."
+                      % (title, free / 1024 ** 3, drive, need_gb))
+            if not messagebox.askyesno(
+                    title,
+                    "Only %.1f GB is free on %s. %s needs about %d GB there.\n\nWithout it "
+                    "SteamCMD stops part-way with \"state is 0x202\". Free up space, or "
+                    "choose a SERVER_ROOT on a drive with more room.\n\nStart the install "
+                    "anyway?"
+                    % (free / 1024 ** 3, drive,
+                       "Updating the server" if installed else
+                       "A fresh install (about %d GB, plus room to unpack)"
+                       % ARK_SERVER_INSTALL_GB, need_gb),
+                    icon="warning"):
+                return False
+        return True
 
     def on_cancel_install(self):
         self._install_cancelled = True
@@ -14914,7 +20190,7 @@ class ArkAPLauncher(tk.Tk):
         os.makedirs(d, exist_ok=True)
         q.put(("line", "steamcmd.exe not found - downloading from %s" % STEAMCMD_ZIP_URL))
         zip_path = os.path.join(d, "steamcmd.zip")
-        with urllib.request.urlopen(STEAMCMD_ZIP_URL, timeout=30) as resp:
+        with https_open(STEAMCMD_ZIP_URL, timeout=30) as resp:
             data = resp.read()
         with open(zip_path, "wb") as f:
             f.write(data)
@@ -15035,6 +20311,8 @@ class ArkAPLauncher(tk.Tk):
                 kind, payload = self._install_queue.get_nowait()
                 if kind == "line":
                     self._install_log(payload)
+                    if STEAMCMD_PAUSED_STATE in payload:
+                        self._install_saw_paused = True
                 elif kind == "done":
                     self._on_install_done(payload)
                     return
@@ -15047,6 +20325,7 @@ class ArkAPLauncher(tk.Tk):
         self.arkapi_install_btn.configure(state="normal")
         self.install_cancel_btn.configure(state="disabled")
         self._install_thread = None
+        self._update_save_hint()
         self.install_progress.stop()
         if success:
             self.install_status_var.set("Done")
@@ -15069,10 +20348,42 @@ class ArkAPLauncher(tk.Tk):
                 self._ensure_cluster_dirs(server_root)
                 self._scoped_scan(level=SCAN_QUICK)
             self._info_once(PROMPT_SERVER_INSTALL_DONE, "ARKIpelago Launcher",
-                            "ARK server install/update complete.")
+                            "ARK server install/update complete.\n\n%s"
+                            % self._next_setup_step())
         elif not self._install_cancelled:
-            messagebox.showerror("ARKIpelago Launcher",
-                                  "ARK server install failed. See the log for details.")
+            if getattr(self, "_install_saw_paused", False):
+                msg = self._paused_install_message()
+                self._install_log(msg)
+                messagebox.showerror("ARKIpelago Launcher", msg)
+            else:
+                messagebox.showerror("ARKIpelago Launcher",
+                                      "ARK server install failed. See the log for details.")
+
+    def _paused_install_message(self):
+        """What "state is 0x202" means, in words - with what's true right now (a server
+        still running here, the space left) put first where it applies."""
+        root = self.get("SERVER_ROOT")
+        running = processes_under_root(server_processes(), root)
+        free = free_bytes_at(root)
+        drive = os.path.splitdrive(os.path.abspath(root))[0] if root else ""
+        causes = [
+            ("A ShooterGameServer.exe from this SERVER_ROOT is still running%s and "
+             "holding the server's files open - a crashed one sitting on its error dialog "
+             "counts too. Stop it (Stop server at the bottom of the window, or Task "
+             "Manager), then Install again."
+             % (" right now (PID %s)" % ", ".join(str(p) for p, _x in running)
+                if running else "")),
+            ("The drive is out of space. A fresh install needs about %d GB free%s."
+             % (ARK_SERVER_FRESH_NEEDS_GB,
+                " - %s has %.1f GB" % (drive, free / 1024 ** 3) if free is not None
+                else "")),
+        ]
+        if not running and free is not None and free < ARK_SERVER_FRESH_NEEDS_GB * 1024 ** 3:
+            causes.reverse()
+        return ("SteamCMD stopped with \"state is %s\": Steam paused the update because it "
+                "couldn't finish it. That is almost always one of:\n\n  - %s\n\n  - %s"
+                "\n\n(SteamCMD's exit code 8 on its own only means \"failed\".)"
+                % (STEAMCMD_PAUSED_STATE, causes[0], causes[1]))
 
     def _on_create_cluster_folders(self):
         """Configuration tab button. Same work as the post-install hook, but explicit
@@ -15086,12 +20397,19 @@ class ArkAPLauncher(tk.Tk):
                 "(in a \"%s\" folder within your server install)." % CLUSTER_ROOT_DIRNAME)
             return
         planned = default_cluster_paths(server_root)
-        targets = {key: (self.get(key) or planned.get(key, ""))
+        # Snapshotted before anything changes: this doubles as the "from" side of the
+        # confirmation and of the log line, so the user sees - and a later diagnostics
+        # export records - what each field held before the fix ran.
+        before = {key: self.get(key) for key, _ in CLUSTER_PATH_SUBDIRS}
+        targets = {key: (before[key] or planned.get(key, ""))
                    for key, _ in CLUSTER_PATH_SUBDIRS}
         already = [k for k, p in targets.items() if p and os.path.isdir(p)]
-        detail = "\n".join("  %-11s %s%s" % (k, targets[k],
-                                             "   (already exists)" if k in already else "")
-                           for k, _ in CLUSTER_PATH_SUBDIRS)
+        detail = "\n\n".join(
+            "%s\n    from  %s\n    to    %s%s"
+            % (k, plain_path(before[k]) if before[k] else "(not set)",
+               plain_path(targets[k]),
+               "   (folder already there)" if k in already else "")
+            for k, _ in CLUSTER_PATH_SUBDIRS)
         if not messagebox.askyesno(
                 "Create ServerCluster folders",
                 "Create these folders and put them in the Configuration fields?\n\n%s\n\n"
@@ -15103,6 +20421,10 @@ class ArkAPLauncher(tk.Tk):
             return
         created, existing, failed, filled = self.create_cluster_folders(server_root)
         self._log("Create cluster folders:")
+        for key, _sub in CLUSTER_PATH_SUBDIRS:
+            if before[key] != self.get(key):
+                self._log("  %s\n    was %s\n    now %s"
+                          % (key, before[key] or "(not set)", self.get(key)))
         for line in created:
             self._log("  created  %s" % line)
         for line in existing:
@@ -15217,7 +20539,7 @@ class ArkAPLauncher(tk.Tk):
             ARKSERVERAPI_RELEASES_API,
             headers={"User-Agent": GITHUB_API_USER_AGENT,
                      "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with https_open(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         tag = data.get("tag_name") or "unknown"
         assets = data.get("assets") or []
@@ -15236,7 +20558,7 @@ class ArkAPLauncher(tk.Tk):
         downloaded = 0
         last_progress_emit = 0.0
         last_logged_decile = -1
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with https_open(req, timeout=30) as resp:
             total = int(resp.headers.get("Content-Length") or 0)
             with open(dest_path, "wb") as f:
                 while True:
@@ -15403,7 +20725,8 @@ class ArkAPLauncher(tk.Tk):
             self.install_status_var.set("Done")
             self._info_once(
                 PROMPT_ARKAPI_INSTALL_DONE, "ARKIpelago Launcher",
-                "ArkServerApi installed - version.dll and ArkApi\\ found in Win64\\.")
+                "ArkServerApi installed - version.dll and ArkApi\\ found in Win64\\.\n\n%s"
+                % self._next_setup_step())
         else:
             self.install_status_var.set("Failed")
             messagebox.showerror("ARKIpelago Launcher",
@@ -15426,7 +20749,7 @@ class ArkAPLauncher(tk.Tk):
             UPDATE_RELEASES_LIST_API,
             headers={"User-Agent": GITHUB_API_USER_AGENT,
                      "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with https_open(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data if isinstance(data, list) else []
 
@@ -15444,17 +20767,17 @@ class ArkAPLauncher(tk.Tk):
         .apworld, plus the advisory-only ArkApi). It drives BOTH the "!" badge / button
         highlight and the Setup Status advisory rows from the same fetches, so the two
         surfaces can never disagree and startup doesn't hit the same releases list twice.
-        Silent and non-blocking; anything unreachable is simply left out."""
+        Silent and non-blocking; anything unreachable is simply left out. A no-op
+        unless this is the real app (see network_checks in __init__)."""
+        if not self._network_checks:
+            return
         threading.Thread(target=self._component_version_check_worker, daemon=True).start()
 
     def _write_config_key_async(self, key, value, label):
         """_write_config_key from a worker thread. The config file is otherwise only ever
         written from the main thread, and two writers doing read-modify-write would lose
         one of the keys."""
-        try:
-            self.after(0, self._write_config_key, key, value, label)
-        except (tk.TclError, RuntimeError):
-            pass  # window closed mid-check - see _component_version_check_worker
+        self._call_on_ui(self._write_config_key, key, value, label)
 
     def _detect_component_versions(self, cfg, releases):
         """{component: (installed_version, present_on_disk)} for the plugin and .apworld,
@@ -15489,15 +20812,17 @@ class ArkAPLauncher(tk.Tk):
         # / SERVER_ROOT / ipc_dir is set, which is a different fix from "it isn't installed".
         out["plugin"] = (version, bool(dll_sha) if plugin_dir else None)
 
-        apworld = resolve_apworld_path(cfg.get)
+        ap_dir = found_install_dir(cfg.get(ARCHIPELAGO_DIR_KEY), ARCHIPELAGO_DIR_KEY)
+        apworld = resolve_apworld_path(lambda k: ap_dir if k == ARCHIPELAGO_DIR_KEY
+                                       else cfg.get(k))
         version = str(cfg.get(APWORLD_INSTALLED_VERSION_KEY, "") or "").strip()
         detected = apworld_version_from_disk(apworld, releases)
         if detected and detected != version:
             version = detected
             self._write_config_key_async(APWORLD_INSTALLED_VERSION_KEY, detected,
                                          "detected .apworld version")
-        # None when the Archipelago directory isn't set: _archipelago_dir deliberately
-        # refuses to assume C:\ProgramData\Archipelago, so neither does this.
+        # None when no Archipelago install is set or found at a standard location - an
+        # unverified C:\ProgramData\Archipelago is never assumed (found_install_dir).
         out["apworld"] = (version, os.path.isfile(apworld) if apworld else None)
         return out
 
@@ -15581,7 +20906,8 @@ class ArkAPLauncher(tk.Tk):
             rel = None
             errors.append(update_error_text(exc))
         if rel:
-            packs = poptracker_packs_dir(cfg.get(POPTRACKER_DIR_KEY))
+            packs = poptracker_packs_dir(
+                found_install_dir(cfg.get(POPTRACKER_DIR_KEY), POPTRACKER_DIR_KEY))
             pack_path, detected_version = installed_tracker_pack(packs) if packs else ("", "")
             recorded = str(cfg.get(TRACKER_PACK_INSTALLED_VERSION_KEY, "") or "").strip()
             if detected_version and detected_version != recorded:
@@ -15610,7 +20936,13 @@ class ArkAPLauncher(tk.Tk):
         recorded by our own installer. With no baseline there's nothing to compare against,
         so it stays silent rather than guessing (see _collect_update_statuses); the update
         dialog still lists the component either way."""
-        statuses, _errors = self._collect_update_statuses()
+        statuses, errors = self._collect_update_statuses()
+        # One line in the launcher log either way: this check is silent on screen, and
+        # "did it reach GitHub - and if not, why" is the first thing support asks. A
+        # certificate problem lands here as CertificateProblem's plain explanation.
+        launcher_log("Update check: %s" % (
+            "reached GitHub (%d component(s) checked)" % len(statuses) if statuses else
+            "failed - %s" % (errors[0] if errors else "no response")), "Updates")
         advisories = []
 
         # ArkApi is advisory-only: nothing in the "Check for Updates" dialog installs it,
@@ -15621,6 +20953,7 @@ class ArkAPLauncher(tk.Tk):
             latest = fetch_latest_release_tag(ARKSERVERAPI_RELEASES_API)
             if latest and _version_is_newer(latest, arkapi_installed):
                 advisories.append({
+                    "id": "update_arkapi",
                     "label": "ArkServerApi update available (advisory)",
                     "state": "info",
                     "detail": "Installed %s, latest release is %s. Being on an older "
@@ -15637,6 +20970,7 @@ class ArkAPLauncher(tk.Tk):
                 continue
             if st["installed"] and _version_is_newer(st["latest"], st["installed"]):
                 advisories.append({
+                    "id": "update_%s" % comp,
                     "label": "%s update available (advisory)" % st["label"],
                     "state": "info",
                     "detail": "Installed %s, latest release is %s. Being on an older "
@@ -15649,6 +20983,7 @@ class ArkAPLauncher(tk.Tk):
                 # Only the launcher gets a green "you're current" row - it's the one whose
                 # absence from this list would otherwise read as "the check didn't run".
                 advisories.append({
+                    "id": "launcher_current",
                     "label": "Launcher up to date",
                     "state": "ok",
                     "detail": "Running %s, the latest release." % APP_VERSION,
@@ -15658,12 +20993,21 @@ class ArkAPLauncher(tk.Tk):
         # The window can be gone by the time a slow fetch returns (the check outlives a
         # quick close, and now runs after every plugin/.apworld install too) - handing work
         # to a dead Tk interpreter raises on this thread and helps nobody.
-        try:
-            self.after(0, self._on_component_versions, statuses, advisories)
-        except (tk.TclError, RuntimeError):
-            pass
+        self._call_on_ui(self._on_component_versions, statuses, advisories)
 
     def _on_component_versions(self, statuses, advisories):
+        if self._update_retry_id:
+            self.after_cancel(self._update_retry_id)
+            self._update_retry_id = None
+        if statuses:
+            self._remember_latest(statuses)
+        else:
+            # GitHub didn't answer (almost always the shared rate limit). Don't let the
+            # badge go dark for the session: light it from the last check that did get
+            # through, and try again once the limit has had time to reset.
+            statuses = self._statuses_from_last_known()
+            self._update_retry_id = self.after(UPDATE_RETRY_MS,
+                                               self._start_component_version_check)
         self._update_status = statuses
         self._component_advisories = advisories
         # Silent check never acknowledges - it only reflects the current state, so anything
@@ -15672,6 +21016,29 @@ class ArkAPLauncher(tk.Tk):
         # Re-render the Setup Status rows and the tab-bar symbol with the new advisories,
         # whether or not that tab is currently open.
         self._refresh_setup_status()
+
+    def _remember_latest(self, statuses):
+        """Record each reachable component's latest version (merged, so a component
+        unreachable this time keeps its last answer)."""
+        known = self._read_settings().get(LAST_KNOWN_LATEST_KEY)
+        known = dict(known) if isinstance(known, dict) else {}
+        known.update({comp: st["latest"] for comp, st in statuses.items() if st.get("latest")})
+        self._write_config_key(LAST_KNOWN_LATEST_KEY, known, "last known release versions")
+
+    def _statuses_from_last_known(self):
+        """Just enough of a status per component for the badge: the last latest version
+        GitHub reported, against what's installed now (the same config keys the full
+        check compares - an update installed since then clears it)."""
+        cfg = self._read_settings()
+        known = cfg.get(LAST_KNOWN_LATEST_KEY)
+        if not isinstance(known, dict):
+            return {}
+        installed = {"launcher": APP_VERSION,
+                     "plugin": cfg.get(PLUGIN_INSTALLED_VERSION_KEY, ""),
+                     "apworld": cfg.get(APWORLD_INSTALLED_VERSION_KEY, ""),
+                     "trackerpack": cfg.get(TRACKER_PACK_INSTALLED_VERSION_KEY, "")}
+        return {comp: {"latest": str(latest), "installed": str(installed.get(comp) or "")}
+                for comp, latest in known.items() if comp in installed and latest}
 
     def _read_acknowledged_version(self, component):
         """Newest release of `component` the user has clicked 'Check for Updates' through
@@ -15725,10 +21092,7 @@ class ArkAPLauncher(tk.Tk):
 
     def _update_check_worker(self):
         statuses, errors = self._collect_update_statuses()
-        try:
-            self.after(0, self._on_update_check_done, statuses, errors)
-        except (tk.TclError, RuntimeError):
-            pass  # window closed mid-check - see _component_version_check_worker
+        self._call_on_ui(self._on_update_check_done, statuses, errors)
 
     def _on_update_check_done(self, statuses, errors):
         self._update_check_thread = None
@@ -15741,6 +21105,7 @@ class ArkAPLauncher(tk.Tk):
                                   "Could not check for updates:\n\n%s" % errors[0])
             return
         self._update_status = statuses
+        self._remember_latest(statuses)
         # The user clicked through to see these releases: acknowledge each component's
         # latest (persisted, per component), then recompute both cues. The highlight clears
         # (nothing is newer than what's acknowledged now); the "!" badge stays lit for
@@ -15753,8 +21118,9 @@ class ArkAPLauncher(tk.Tk):
             # Every component gets a line, including the ones whose version couldn't be
             # worked out - listing only what was measurable is what made this box say
             # "Launcher: 0.4.7" and nothing else on an install the launcher didn't build.
-            messagebox.showinfo("ARKIpelago Launcher",
-                                "You're up to date.\n\n%s" % format_update_rows(statuses))
+            # Same dialog as for an update, so the up-to-date answer carries the same
+            # per-component GitHub links (and the Discord) instead of a plain text box.
+            self._show_update_available_dialog(statuses, up_to_date=True)
             return
         self._show_update_available_dialog(statuses)
 
@@ -15805,25 +21171,29 @@ class ArkAPLauncher(tk.Tk):
         put their progress bar and log on their own tab, and firing them from a dialog that
         then vanishes would look like nothing happened."""
         win.destroy()
-        try:
-            self.notebook.select(tab)
-        except tk.TclError:
-            pass
+        if tab is self.tab_install:
+            self._show_install_tab()
+        else:
+            try:
+                self.notebook.select(tab)
+            except tk.TclError:
+                pass
         action()
 
-    def _show_update_available_dialog(self, statuses):
+    def _show_update_available_dialog(self, statuses, up_to_date=False):
         """One row per tracked component: installed vs latest, and its own action button.
         Every component in UPDATE_COMPONENTS gets a row even when its version couldn't be
         determined - "not detected" / "not installed" said out loud beats a component
         silently missing from the list, since a missing row is indistinguishable from "this
         launcher has no such feature" and leaves the user nothing to act on."""
-        win = self._themed_toplevel("Update available")
+        win = self._themed_toplevel("Up to date" if up_to_date else "Update available")
         win.grab_set()
 
         frame = ttk.Frame(win, padding=14)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="Updates are available.",
+        ttk.Label(frame, text=("Everything installed is up to date." if up_to_date
+                               else "Updates are available."),
                   font=(self._header_font_family or "Segoe UI", 11, "bold")
                   ).pack(anchor="w", pady=(0, 8))
 
@@ -15852,6 +21222,15 @@ class ArkAPLauncher(tk.Tk):
                       % (format_installed_version(st),
                          (st or {}).get("latest") or "unknown")).grid(row=row, column=1,
                                                                       sticky="w", pady=2)
+            # On every row, update or not: this dialog gets opened to check versions at
+            # least as often as to install something, and "where does this come from?"
+            # is the other question it should answer. Points at the specific release when
+            # the check found one, else at the repo's releases page.
+            url = (st or {}).get("url") or UPDATE_COMPONENT_PAGES[comp]
+            repo_link = self._link_label(grid, "GitHub",
+                                          lambda u=url: webbrowser.open(u))
+            repo_link.grid(row=row, column=3, sticky="e", padx=(12, 0), pady=2)
+            Tooltip(repo_link, url)
             if not st:
                 continue
             # An unknown installed version falls THROUGH to the action button rather than
@@ -15889,20 +21268,14 @@ class ArkAPLauncher(tk.Tk):
             notes.configure(state="disabled")
             notes.pack(fill="both", expand=True, pady=(2, 8))
 
-        for comp in UPDATE_COMPONENTS:
-            st = statuses.get(comp)
-            if not st or (st["installed"]
-                          and not _version_is_newer(st["latest"], st["installed"])):
-                continue
-            url = st["url"]
-            link = ttk.Label(frame, text="%s: %s" % (labels[comp], url),
-                              foreground=self.theme["status_info"], cursor="hand2")
-            link.pack(anchor="w")
-            link.bind("<Button-1>", lambda _e, u=url: webbrowser.open(u))
-
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(btn_row, text="Not Now", command=win.destroy).pack(side="right")
+        discord = self._link_label(btn_row, "Ask on Discord",
+                                   lambda: webbrowser.open(DISCORD_INVITE_URL))
+        discord.pack(side="left")
+        Tooltip(discord, DISCORD_INVITE_URL)
+        ttk.Button(btn_row, text="Close" if up_to_date else "Not Now",
+                   command=win.destroy).pack(side="right")
 
     def _confirm_and_start_update(self, dialog, data, asset, tag):
         if not getattr(sys, "frozen", False):
@@ -15963,7 +21336,7 @@ class ArkAPLauncher(tk.Tk):
         req = urllib.request.Request(url, headers={"User-Agent": GITHUB_API_USER_AGENT})
         downloaded = 0
         last_emit = 0.0
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with https_open(req, timeout=30) as resp:
             total = int(resp.headers.get("Content-Length") or expected_size or 0)
             with open(dest_path, "wb") as f:
                 while True:
@@ -16020,7 +21393,7 @@ class ArkAPLauncher(tk.Tk):
                 req = urllib.request.Request(
                     checksum_asset["browser_download_url"],
                     headers={"User-Agent": GITHUB_API_USER_AGENT})
-                with urllib.request.urlopen(req, timeout=20) as resp:
+                with https_open(req, timeout=20) as resp:
                     checksum_text = resp.read().decode("utf-8", errors="replace")
                 expected_hash = self._extract_sha256_for_file(checksum_text,
                                                                 asset.get("name", ""))
@@ -16367,9 +21740,8 @@ class ArkAPLauncher(tk.Tk):
         else:
             self._info_once(
                 PROMPT_PLUGIN_INSTALLED, "Install Plugin",
-                "ArkAP plugin installed (%d file(s)) to:\n\n%s\n\nRestart (or start) the "
-                "ARK dedicated server, then run the connector."
-                % (payload["copied"], payload["dst_arkap"]))
+                "ArkAP plugin installed (%d file(s)) to:\n\n%s\n\n%s"
+                % (payload["copied"], payload["dst_arkap"], self._next_setup_step()))
 
     def _copy_plugin_tree(self, src_arkap, dst_arkap):
         """Recursively copy src_arkap -> dst_arkap (merge, like the .bat's robocopy /E -
@@ -16414,7 +21786,7 @@ class ArkAPLauncher(tk.Tk):
         if self._any_install_running():
             messagebox.showinfo("ARKIpelago Launcher", "An install is already running.")
             return
-        self.notebook.select(self.tab_install)
+        self._show_install_tab()
 
         root = self.get("SERVER_ROOT")
         if not root:
@@ -17582,6 +22954,27 @@ class ArkAPLauncher(tk.Tk):
             "(both on the Install Server/Api/Plugin tab), then your config settings.\n\n"
             "Your old ArkApi folder is at:\n%s" % (summary, backup_path or "(none)"))
 
+    def _next_setup_step(self):
+        """The "what now" line for an install's completion message, worked out from disk
+        in guide order. A first setup is told its next step rather than reading "complete"
+        as "done" - the plugin popup used to say "start the server and connect" at step 3
+        of 9 - while an update of a finished setup isn't sent back through steps it did."""
+        if not check_arkapi_installed(self.get("SERVER_ROOT"))[0]:
+            return "Next: \"Install ArkServerApi\" on the Install Server/Api/Plugin tab."
+        if not check_plugin_installed(self._arkap_plugin_dir())[0]:
+            return ("Next: \"Install Plugin\" in the \"Install/update ArkAP Plugin\" box on "
+                    "the Install Server/Api/Plugin tab.")
+        missing, unsaved, absent = self._preflight_bat("start_ase_server.bat")
+        if missing or unsaved or absent:
+            return ("Next: Configuration tab -> \"Scan for paths\", then Save. After that, "
+                    "set up your Archipelago room on the Archipelago Setup tab - the server "
+                    "comes after both.")
+        if not (self.get("server") and self.get("slot")):
+            return ("Next: fill in your Archipelago room (server, slot, password) on the "
+                    "Archipelago Setup tab. Then start the server from Quick Launch.")
+        return ("Restart (or start) the ARK dedicated server, then connect in-game with "
+                "/connect.")
+
     def _preflight_bat(self, batname):
         """(missing, unsaved, absent_files) for everything script_requirements() says
         `batname` reads.
@@ -17646,6 +23039,7 @@ class ArkAPLauncher(tk.Tk):
         if batname == "start_ase_server.bat":
             # After the launch, never before - it must not delay the server starting.
             self._show_server_patience_popup()
+        return True
 
     def _show_server_patience_popup(self):
         """Non-blocking "it's starting, give it a minute" note. Goes through _info_once:
@@ -17910,10 +23304,17 @@ class ArkAPLauncher(tk.Tk):
 
         for tab_id in self.notebook.tabs():
             tab_frame = self.notebook.nametowidget(tab_id)
+            # A hidden tab (Mods before there's a server) isn't there to jump to.
+            if self.notebook.tab(tab_id, "state") == "hidden":
+                continue
             tab_text = self.notebook.tab(tab_id, "text")
             if tab_text and query_lower in tab_text.lower():
                 self._search_matches.append({"type": "tab_label", "tab": tab_frame})
-            for widget in self._iter_widgets(tab_frame):
+            # Get Started's steps repeat the other tabs' button names and are rebuilt on
+            # every refresh - matches there would only shadow the real controls. Its
+            # Setup Status list is searched like the old tab was; a match opens it.
+            scope = self.status_section if tab_frame is self.tab_wizard else tab_frame
+            for widget in self._iter_widgets(scope):
                 self._scan_widget_for_search(widget, query, query_lower, tab_frame)
 
         match_count = len(self._search_matches)
@@ -18099,6 +23500,23 @@ class ArkAPLauncher(tk.Tk):
             if isinstance(w, tk.Canvas):
                 return w
 
+    def _scroll_widget_to_top(self, widget, margin=6):
+        """Scroll its canvas so `widget`'s top edge sits at the top of the view - for a
+        whole section, where centring its middle would push its heading off-screen."""
+        canvas = self._find_ancestor_canvas(widget)
+        if canvas is None:
+            return
+        try:
+            canvas.update_idletasks()
+            bbox = canvas.bbox("all")
+            if not bbox or bbox[3] - bbox[1] <= 0:
+                return
+            top = (widget.winfo_rooty() - canvas.winfo_rooty() + canvas.canvasy(0)
+                   - bbox[1] - margin)
+            canvas.yview_moveto(max(0.0, min(1.0, top / (bbox[3] - bbox[1]))))
+        except tk.TclError:
+            pass
+
     def _center_widget_in_canvas(self, widget):
         canvas = self._find_ancestor_canvas(widget)
         if canvas is None:
@@ -18192,7 +23610,7 @@ def _report_startup_crash(exc_type, exc_value, exc_tb):
 
 if __name__ == "__main__":
     try:
-        ArkAPLauncher().mainloop()
+        ArkAPLauncher(network_checks=True).mainloop()
     except SystemExit:
         raise
     except BaseException:  # noqa: B036 - top-level catch-all is the whole point here

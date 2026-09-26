@@ -1,1 +1,4 @@
 pyinstaller>=6.0
+# Verifies HTTPS against the Windows certificate store (see HTTPS_CONTEXT in
+# arkap_launcher.py). Pinned: it decides what the launcher trusts for DLL downloads.
+truststore==0.10.4

@@ -14,8 +14,9 @@ that lets already-shipped onefile-era updaters cross over to the onedir format -
 APP_VERSION note and the assemble step below.
 
 What it does:
-  * Confirms PyInstaller is installed (pip install -r requirements-build.txt
-    if not).
+  * Confirms PyInstaller and truststore are installed (pip install -r
+    requirements-build.txt if not) - truststore is what makes the exe verify HTTPS
+    against the Windows certificate store, and building without it is refused.
   * Bundles assets/ (icon.ico, logo.png, FuturaNowHeadline.ttf,
     ARKipelagoArchColors.png and ASE_theme_a_little_loud.mp3 for the credits
     easter egg - the whole folder ships, so new assets need no change here) and
@@ -72,9 +73,15 @@ SCRIPTS_DIR = os.path.join(HERE, "scripts")
 DIST_DIR = os.path.join(HERE, "dist")
 
 # PyInstaller --name, which is also the shipped exe's filename. Renamed from the old
-# code-safe "ArkAPLauncher" purely for tidiness; safe because the self-replace updater
-# resolves the running exe via sys.executable (never by name) and _locate_staged_app
-# accepts either launcher exe name (see _KNOWN_LAUNCHER_EXE_NAMES).
+# code-safe "ArkAPLauncher"; _locate_staged_app accepts either name when reading an
+# extracted update (see _KNOWN_LAUNCHER_EXE_NAMES).
+#
+# Changing this ALONE is not enough and used to be a no-op for existing users: the update
+# helper installed the incoming exe at sys.executable's path, so an upgrade re-applied
+# whatever name the user was already running and the rename only ever reached fresh
+# downloads. The helper now installs under the STAGED exe's filename and deletes the old
+# one (see $newExe in _PS_UPDATE_TEMPLATE). Renaming here again will therefore carry
+# through to upgrades - and will break existing shortcuts, which the helper warns about.
 APP_NAME = "ARKipelago Launcher"
 
 # Windows forbids ':' in path names (NTFS reserves it for alternate data
@@ -136,6 +143,23 @@ def _check_pyinstaller():
         log("PyInstaller is not installed. Install it with:")
         log("    python -m pip install -r requirements-build.txt")
         sys.exit(1)
+
+
+def _check_truststore():
+    """Refuse to build without truststore. The launcher imports it inside a try (so a
+    bare source checkout still runs), which means a build machine without it would
+    produce an exe that quietly checks downloads against Python's narrower CA list -
+    and antivirus/managed-network users would be back to certificate errors. Not a
+    security hole (verification is on either way), but not something to ship by accident."""
+    try:
+        import truststore  # noqa: F401
+    except ImportError:
+        log("truststore is not installed - the exe would not trust the Windows "
+            "certificate store. Install it with:")
+        log("    python -m pip install -r requirements-build.txt")
+        sys.exit(1)
+    log("truststore %s found - downloads will verify against the Windows certificate "
+        "store." % truststore.__version__)
 
 
 def _is_running(image_name):
@@ -220,6 +244,7 @@ def main():
     bridge = "--bridge" in sys.argv
     _start_build_log("build.py %s" % ("--bridge (--onefile)" if bridge else "(--onedir)"))
     _check_pyinstaller()
+    _check_truststore()
 
     if not os.path.isfile(ENTRY_SCRIPT):
         fail("entry script not found: %s" % ENTRY_SCRIPT)
